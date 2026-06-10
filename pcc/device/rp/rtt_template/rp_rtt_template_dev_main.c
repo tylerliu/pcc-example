@@ -155,16 +155,30 @@ void doca_pcc_dev_user_algo(doca_pcc_dev_algo_ctxt_t *algo_ctxt,
 			    const doca_pcc_dev_attr_t *attr,
 			    doca_pcc_dev_results_t *results)
 {
+	static uint32_t event_count = 0;
 	uint32_t port_num = doca_pcc_dev_get_ev_attr(event).port_num;
+	uint32_t ev_type = doca_pcc_dev_get_ev_attr(event).ev_type;
 	uint32_t *param = doca_pcc_dev_get_algo_params(port_num, attr->algo_slot);
 	uint32_t *counter = doca_pcc_dev_get_counters(port_num, attr->algo_slot);
+
+	if (event_count < 10) {
+		doca_pcc_dev_printf("user_algo: ev_type=%u port=%u slot=%u count=%u\n",
+				    ev_type, port_num, attr->algo_slot, event_count);
+	}
+	event_count++;
 
 #ifdef DOCA_PCC_SAMPLE_TX_BYTES
 	thread0_calc_ports_utilization();
 #endif
 
 	switch (attr->algo_slot) {
-	case 0: {
+	case 0:
+	case 15: {
+		static uint32_t rtt_count = 0;
+		if (rtt_count < 5)
+			doca_pcc_dev_printf("rtt_template: slot=%u ev=%u rtt_count=%u\n",
+					    attr->algo_slot, ev_type, rtt_count);
+		rtt_count++;
 		rtt_template_algo(event, param, counter, algo_ctxt, results);
 		break;
 	}
@@ -212,6 +226,7 @@ void doca_pcc_dev_user_init(uint32_t *disable_event_bitmask)
 	}
 
 	doca_pcc_dev_printf("%s, disable_event_bitmask=0x%x\n", __func__, *disable_event_bitmask);
+	doca_pcc_dev_printf("DEBUG: user_init complete, waiting for events\n");
 	doca_pcc_dev_trace_flush();
 }
 
