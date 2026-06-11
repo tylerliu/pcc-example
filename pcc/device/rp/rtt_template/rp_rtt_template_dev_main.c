@@ -156,24 +156,34 @@ void doca_pcc_dev_user_algo(doca_pcc_dev_algo_ctxt_t *algo_ctxt,
 			    doca_pcc_dev_results_t *results)
 {
 	static uint32_t event_count = 0;
+	static uint32_t tx_count = 0;
+	static uint32_t rtt_count = 0;
+	static uint32_t last_print_ts = 0;
 	uint32_t port_num = doca_pcc_dev_get_ev_attr(event).port_num;
 	uint32_t ev_type = doca_pcc_dev_get_ev_attr(event).ev_type;
 	uint32_t *param = doca_pcc_dev_get_algo_params(port_num, attr->algo_slot);
 	uint32_t *counter = doca_pcc_dev_get_counters(port_num, attr->algo_slot);
 
-	if (event_count < 10) {
-		doca_pcc_dev_printf("user_algo: ev_type=%u port=%u slot=%u count=%u\n",
-				    ev_type, port_num, attr->algo_slot, event_count);
-	}
 	event_count++;
+	if (ev_type == DOCA_PCC_DEV_EVNT_ROCE_TX)
+		tx_count++;
+	else if (ev_type == DOCA_PCC_DEV_EVNT_RTT)
+		rtt_count++;
+
+	uint32_t now = doca_pcc_dev_get_timer_lo();
+	if (now - last_print_ts > 1000000) {
+		uint32_t qpn = doca_pcc_dev_get_flow_qpn(event);
+		doca_pcc_dev_printf("PCC: total=%u tx=%u rtt=%u slot=%u port=%u qpn=0x%x\n",
+				    event_count, tx_count, rtt_count, attr->algo_slot, port_num, qpn);
+		last_print_ts = now;
+	}
 
 #ifdef DOCA_PCC_SAMPLE_TX_BYTES
 	thread0_calc_ports_utilization();
 #endif
 
 	switch (attr->algo_slot) {
-	case 0:
-	case 15: {
+	case 0: {
 		static uint32_t rtt_count = 0;
 		if (rtt_count < 5)
 			doca_pcc_dev_printf("rtt_template: slot=%u ev=%u rtt_count=%u\n",
