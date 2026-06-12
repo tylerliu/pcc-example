@@ -28,6 +28,7 @@
 #include <doca_pcc_dev_algo_access.h>
 #include "pcc_common_dev.h"
 #include "rtt_template.h"
+#include "rtt_template_ctxt.h"
 
 #define DOCA_PCC_DEV_EVNT_ROCE_ACK_MASK (1 << DOCA_PCC_DEV_EVNT_ROCE_ACK)
 #define SAMPLER_THREAD_RANK (0)
@@ -173,8 +174,9 @@ void doca_pcc_dev_user_algo(doca_pcc_dev_algo_ctxt_t *algo_ctxt,
 	uint32_t now = doca_pcc_dev_get_timer_lo();
 	if (now - last_print_ts > 1000000) {
 		uint32_t qpn = doca_pcc_dev_get_flow_qpn(event);
-		doca_pcc_dev_printf("PCC: total=%u tx=%u rtt=%u slot=%u port=%u qpn=0x%x\n",
-				    event_count, tx_count, rtt_count, attr->algo_slot, port_num, qpn);
+		doca_pcc_dev_printf("PCC: total=%u tx=%u rtt=%u slot=%u port=%u qpn=0x%x rate=%u\n",
+				    event_count, tx_count, rtt_count, attr->algo_slot, port_num, qpn,
+				    ((cc_ctxt_rtt_template_t *)algo_ctxt)->cur_rate);
 		last_print_ts = now;
 	}
 
