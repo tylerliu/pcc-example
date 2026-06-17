@@ -33,6 +33,7 @@
 #define DOCA_PCC_DEV_EVNT_ROCE_ACK_MASK (1 << DOCA_PCC_DEV_EVNT_ROCE_ACK)
 #define SAMPLER_THREAD_RANK (0)
 #define COUNTERS_SAMPLE_WINDOW_IN_MICROSEC (10)
+#define EVENT_SUMMARY_FLOW_BUCKETS (256)
 
 /**< Counters IDs to configure and read from */
 uint32_t counter_ids[DOCA_PCC_DEV_MAX_NUM_PORTS] = {0};
@@ -156,28 +157,30 @@ void doca_pcc_dev_user_algo(doca_pcc_dev_algo_ctxt_t *algo_ctxt,
 			    const doca_pcc_dev_attr_t *attr,
 			    doca_pcc_dev_results_t *results)
 {
-	static uint32_t event_count = 0;
-	static uint32_t tx_count = 0;
-	static uint32_t rtt_count = 0;
-	static uint32_t last_print_ts = 0;
+	static uint32_t event_count[EVENT_SUMMARY_FLOW_BUCKETS] = {0};
+	static uint32_t tx_count[EVENT_SUMMARY_FLOW_BUCKETS] = {0};
+	static uint32_t rtt_count[EVENT_SUMMARY_FLOW_BUCKETS] = {0};
+	static uint32_t last_print_ts[EVENT_SUMMARY_FLOW_BUCKETS] = {0};
 	uint32_t port_num = doca_pcc_dev_get_ev_attr(event).port_num;
 	uint32_t ev_type = doca_pcc_dev_get_ev_attr(event).ev_type;
 	uint32_t *param = doca_pcc_dev_get_algo_params(port_num, attr->algo_slot);
 	uint32_t *counter = doca_pcc_dev_get_counters(port_num, attr->algo_slot);
+	uint32_t qpn = doca_pcc_dev_get_flow_qpn(event);
+	uint32_t flow_bucket = qpn % EVENT_SUMMARY_FLOW_BUCKETS;
 
-	event_count++;
+	event_count[flow_bucket]++;
 	if (ev_type == DOCA_PCC_DEV_EVNT_ROCE_TX)
-		tx_count++;
+		tx_count[flow_bucket]++;
 	else if (ev_type == DOCA_PCC_DEV_EVNT_RTT)
-		rtt_count++;
+		rtt_count[flow_bucket]++;
 
 	uint32_t now = doca_pcc_dev_get_timer_lo();
-	if (now - last_print_ts > 1000000) {
-		uint32_t qpn = doca_pcc_dev_get_flow_qpn(event);
-		doca_pcc_dev_printf("PCC: total=%u tx=%u rtt=%u slot=%u port=%u qpn=0x%x rate=%u\n",
-				    event_count, tx_count, rtt_count, attr->algo_slot, port_num, qpn,
+	if (now - last_print_ts[flow_bucket] > 1000000) {
+		doca_pcc_dev_printf("PCC: bucket=%u total=%u tx=%u rtt=%u slot=%u port=%u qpn=0x%x rate=%u\n",
+				    flow_bucket, event_count[flow_bucket], tx_count[flow_bucket],
+				    rtt_count[flow_bucket], attr->algo_slot, port_num, qpn,
 				    ((cc_ctxt_rtt_template_t *)algo_ctxt)->cur_rate);
-		last_print_ts = now;
+		last_print_ts[flow_bucket] = now;
 	}
 
 #ifdef DOCA_PCC_SAMPLE_TX_BYTES
