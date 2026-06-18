@@ -161,6 +161,7 @@ void doca_pcc_dev_user_algo(doca_pcc_dev_algo_ctxt_t *algo_ctxt,
 	static uint32_t tx_count[EVENT_SUMMARY_FLOW_BUCKETS] = {0};
 	static uint32_t rtt_count[EVENT_SUMMARY_FLOW_BUCKETS] = {0};
 	static uint32_t last_print_ts[EVENT_SUMMARY_FLOW_BUCKETS] = {0};
+	static uint32_t last_flush_ts = 0;
 	uint32_t port_num = doca_pcc_dev_get_ev_attr(event).port_num;
 	uint32_t ev_type = doca_pcc_dev_get_ev_attr(event).ev_type;
 	uint32_t *param = doca_pcc_dev_get_algo_params(port_num, attr->algo_slot);
@@ -176,11 +177,16 @@ void doca_pcc_dev_user_algo(doca_pcc_dev_algo_ctxt_t *algo_ctxt,
 
 	uint32_t now = doca_pcc_dev_get_timer_lo();
 	if (now - last_print_ts[flow_bucket] > 1000000) {
-		doca_pcc_dev_printf("PCC: bucket=%u total=%u tx=%u rtt=%u slot=%u port=%u qpn=0x%x rate=%u\n",
-				    flow_bucket, event_count[flow_bucket], tx_count[flow_bucket],
-				    rtt_count[flow_bucket], attr->algo_slot, port_num, qpn,
-				    ((cc_ctxt_rtt_template_t *)algo_ctxt)->cur_rate);
+		doca_pcc_dev_trace_5(6, flow_bucket, event_count[flow_bucket], tx_count[flow_bucket],
+				     rtt_count[flow_bucket], attr->algo_slot);
+		cc_ctxt_rtt_template_t *rtt_ctxt = (cc_ctxt_rtt_template_t *)algo_ctxt;
+		doca_pcc_dev_trace_5(7, qpn, rtt_ctxt->cur_rate, ev_type, rtt_ctxt->rtt, rtt_ctxt->min_rtt);
 		last_print_ts[flow_bucket] = now;
+	}
+
+	if (now - last_flush_ts > 1000000) {
+		doca_pcc_dev_trace_flush();
+		last_flush_ts = now;
 	}
 
 #ifdef DOCA_PCC_SAMPLE_TX_BYTES
@@ -191,8 +197,7 @@ void doca_pcc_dev_user_algo(doca_pcc_dev_algo_ctxt_t *algo_ctxt,
 	case 0: {
 		static uint32_t rtt_count = 0;
 		if (rtt_count < 5)
-			doca_pcc_dev_printf("rtt_template: slot=%u ev=%u rtt_count=%u\n",
-					    attr->algo_slot, ev_type, rtt_count);
+			doca_pcc_dev_trace_5(8, attr->algo_slot, ev_type, rtt_count, port_num, now);
 		rtt_count++;
 		rtt_template_algo(event, param, counter, algo_ctxt, results);
 		break;
@@ -240,8 +245,7 @@ void doca_pcc_dev_user_init(uint32_t *disable_event_bitmask)
 		*disable_event_bitmask |= (1 << DOCA_PCC_DEV_EVNT_ROCE_TX_FOR_ACK_NACK);
 	}
 
-	doca_pcc_dev_printf("%s, disable_event_bitmask=0x%x\n", __func__, *disable_event_bitmask);
-	doca_pcc_dev_printf("DEBUG: user_init complete, waiting for events\n");
+	doca_pcc_dev_trace_5(9, *disable_event_bitmask, 0, 0, 0, 0);
 	doca_pcc_dev_trace_flush();
 }
 
