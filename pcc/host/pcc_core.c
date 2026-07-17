@@ -43,10 +43,6 @@ static char *trace_message_formats[] = {
 	"format 3 - pcc_np dev: thread_idx = %#lx, cnt_recv_packet = %#lx, cnt_sent_packet = %#lx, cnt_user_func_err = %#lx. end %u\n",
 	"format 4 - pcc_np dev: thread_idx = %#lx, rq = %#lx, rq_pi = %#lx, rqcq = %#lx, rqcq_ci = %#lx\n",
 	"format 5 - pcc_np dev: thread_idx = %#lx, sq = %#lx, sq_pi = %#lx, sqcq = %#lx. end %u\n",
-	"format 6 - PCC events: bucket = %#lx, total = %#lx, tx events = %#lx, rtt events = %#lx, algo slot = %#lx\n",
-	"format 7 - PCC event flow: qpn = %#lx, rate = %#lx, event type = %#lx, rtt ns = %#lx, min rtt ns = %#lx\n",
-	"format 8 - rtt_template event: algo slot = %#lx, event type = %#lx, rtt count = %#lx, port num = %#lx, timestamp = %#lx\n",
-	"format 9 - user init complete: disable event bitmask = %#lx. end %u\n",
 	NULL};
 
 /* Default PCC RP threads */
