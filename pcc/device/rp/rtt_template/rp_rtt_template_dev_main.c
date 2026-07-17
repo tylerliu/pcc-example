@@ -29,6 +29,7 @@
 #include "pcc_common_dev.h"
 #include "rtt_template.h"
 #include "rtt_template_ctxt.h"
+#include "pcc_rate_report.h"
 
 #define DOCA_PCC_DEV_EVNT_ROCE_ACK_MASK (1 << DOCA_PCC_DEV_EVNT_ROCE_ACK)
 #define SAMPLER_THREAD_RANK (0)
@@ -180,12 +181,15 @@ void doca_pcc_dev_user_algo(doca_pcc_dev_algo_ctxt_t *algo_ctxt,
 				    flow_bucket, event_count[flow_bucket], tx_count[flow_bucket],
 				    rtt_count[flow_bucket], attr->algo_slot, port_num, qpn,
 				    ((cc_ctxt_rtt_template_t *)algo_ctxt)->cur_rate);
+		doca_pcc_dev_trace_flush();
 		last_print_ts[flow_bucket] = now;
 	}
 
 #ifdef DOCA_PCC_SAMPLE_TX_BYTES
 	thread0_calc_ports_utilization();
 #endif
+
+	uint32_t prev_rate = ((cc_ctxt_rtt_template_t *)algo_ctxt)->cur_rate;
 
 	switch (attr->algo_slot) {
 	case 0: {
@@ -204,6 +208,11 @@ void doca_pcc_dev_user_algo(doca_pcc_dev_algo_ctxt_t *algo_ctxt,
 		break;
 	}
 	};
+
+	/* Report per-flow rate to host whenever rate changes */
+	if (results->rate != prev_rate)
+		doca_pcc_dev_trace_5(PCC_RATE_REPORT_FORMAT_ID, qpn, results->rate,
+				     ev_type, ((cc_ctxt_rtt_template_t *)algo_ctxt)->rtt, now);
 }
 
 /*

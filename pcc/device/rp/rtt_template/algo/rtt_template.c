@@ -240,35 +240,6 @@ static inline void rtt_template_handle_roce_tx(doca_pcc_dev_event_t *event,
 					       cc_ctxt_rtt_template_t *ccctx,
 					       doca_pcc_dev_results_t *results)
 {
-	uint8_t rtt_req = 0;
-	uint32_t rtt_meas_psn = ccctx->rtt_meas_psn;
-	uint32_t timestamp = doca_pcc_dev_get_timestamp(event);
-	doca_pcc_dev_event_general_attr_t ev_attr = doca_pcc_dev_get_ev_attr(event);
-
-	if (unlikely((ev_attr.flags & DOCA_PCC_DEV_TX_FLAG_RTT_REQ_SENT) && (rtt_meas_psn == 0))) {
-		ccctx->rtt_meas_psn = 1;
-		ccctx->rtt_req_to_rtt_sent = 0;
-		ccctx->start_delay = timestamp;
-	} else {
-		/* Calculate rtt_till_now */
-		uint32_t rtt_till_now = (timestamp - ccctx->start_delay);
-
-		if (unlikely(ccctx->start_delay > timestamp))
-			rtt_till_now += UINT32_MAX;
-		/* Abort RTT request flow - for cases event or packet was dropped */
-		if (rtt_meas_psn == 0) {
-			rtt_till_now = 0;
-			ccctx->rtt_req_to_rtt_sent += 1;
-		}
-		if (unlikely((rtt_till_now > ((uint32_t)ABORT_TIME << ccctx->abort_cnt)) ||
-			     (ccctx->rtt_req_to_rtt_sent > 2))) {
-			rtt_req = 1;
-			if (rtt_till_now > ((uint32_t)ABORT_TIME << ccctx->abort_cnt))
-				ccctx->abort_cnt += 1;
-			ccctx->rtt_req_to_rtt_sent = 1;
-		}
-	}
-
 	/* Pure-ECN: gated additive increase (recover when CNPs stop) */
 	{ static uint32_t g_tx_inc = 0;
 	  if ((++g_tx_inc % 1000) == 0) {
@@ -278,7 +249,7 @@ static inline void rtt_template_handle_roce_tx(doca_pcc_dev_event_t *event,
 	/* Update results buffer and context */
 	ccctx->cur_rate = cur_rate;
 	results->rate = cur_rate;
-	results->rtt_req = rtt_req;
+	results->rtt_req = 0; /* Pure-ECN: disable all RTT probing */
 }
 
 /*
@@ -352,7 +323,7 @@ static inline void rtt_template_handle_roce_rtt(doca_pcc_dev_event_t *event,
 	ccctx->rtt_req_to_rtt_sent = 1;
 	ccctx->cur_rate = cur_rate;
 	results->rate = cur_rate;
-	results->rtt_req = 1;
+	results->rtt_req = 0; /* Pure-ECN: no continuous RTT probing needed */
 }
 
 /*
@@ -436,7 +407,7 @@ static inline void rtt_template_handle_new_flow(doca_pcc_dev_event_t *event,
 	ccctx->flags.was_nack = 0;
 	ccctx->min_rtt = INITIAL_MIN_RTT;
 	results->rate = param[RTT_TEMPLATE_NEW_FLOW_RATE];
-	results->rtt_req = 1;
+	results->rtt_req = 0; /* Pure-ECN: no RTT probing needed */
 }
 
 void rtt_template_algo(doca_pcc_dev_event_t *event,

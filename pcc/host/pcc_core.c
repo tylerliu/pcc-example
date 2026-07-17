@@ -30,8 +30,10 @@
 #include <ctype.h>
 
 #include <doca_argp.h>
+#include <libflexio/flexio.h>
 
 #include "pcc_core.h"
+#include "../common/device/pcc_rate_report.h"
 
 /*
  * Formats of the trace message to be printed from the device
@@ -43,7 +45,84 @@ static char *trace_message_formats[] = {
 	"format 3 - pcc_np dev: thread_idx = %#lx, cnt_recv_packet = %#lx, cnt_sent_packet = %#lx, cnt_user_func_err = %#lx. end %u\n",
 	"format 4 - pcc_np dev: thread_idx = %#lx, rq = %#lx, rq_pi = %#lx, rqcq = %#lx, rqcq_ci = %#lx\n",
 	"format 5 - pcc_np dev: thread_idx = %#lx, sq = %#lx, sq_pi = %#lx, sqcq = %#lx. end %u\n",
+	"RATE_REPORT: qpn=%#lx rate=%#lx ev_type=%#lx rtt=%#lx ts=%#lx\n",
 	NULL};
+
+/*
+ * Per-flow rate tracking for rate reports from device
+ */
+#define MAX_TRACKED_FLOWS 256
+
+struct flow_rate_entry {
+	uint32_t qpn;
+	uint64_t rate_sum;
+	uint32_t count;
+	uint32_t last_rate;
+};
+
+static struct flow_rate_entry flow_rate_table[MAX_TRACKED_FLOWS];
+static uint32_t flow_rate_table_size = 0;
+static uint64_t last_rate_print_ts = 0;
+
+static struct flow_rate_entry *find_or_create_flow(uint32_t qpn)
+{
+	for (uint32_t i = 0; i < flow_rate_table_size; i++) {
+		if (flow_rate_table[i].qpn == qpn)
+			return &flow_rate_table[i];
+	}
+	if (flow_rate_table_size < MAX_TRACKED_FLOWS) {
+		struct flow_rate_entry *entry = &flow_rate_table[flow_rate_table_size++];
+		entry->qpn = qpn;
+		entry->rate_sum = 0;
+		entry->count = 0;
+		entry->last_rate = 0;
+		return entry;
+	}
+	return NULL;
+}
+
+/*
+ * Trace handler callback - receives binary trace reports from the DPA.
+ * Filters for rate report format and updates per-flow average rate.
+ */
+static int rate_report_trace_handler(void *ctx, struct doca_pcc_bin_report *reps, int reps_size)
+{
+	(void)ctx;
+	struct msg_bin_report *reports = (struct msg_bin_report *)reps;
+
+	for (int i = 0; i < reps_size; i++) {
+		if (reports[i].msg_number != PCC_RATE_REPORT_FORMAT_ID)
+			continue;
+
+		uint32_t qpn = (uint32_t)reports[i].args[0];
+		uint32_t rate = (uint32_t)reports[i].args[1];
+
+		struct flow_rate_entry *entry = find_or_create_flow(qpn);
+		if (entry) {
+			entry->rate_sum += rate;
+			entry->count++;
+			entry->last_rate = rate;
+		}
+	}
+
+	/* Print per-flow average rates every ~5 seconds (based on wall clock) */
+	uint64_t now_us = reports[0].timestamp;
+	if (now_us - last_rate_print_ts > 5000000) {
+		printf("\n--- Per-flow average rates ---\n");
+		for (uint32_t i = 0; i < flow_rate_table_size; i++) {
+			struct flow_rate_entry *e = &flow_rate_table[i];
+			if (e->count > 0) {
+				uint32_t avg = (uint32_t)(e->rate_sum / e->count);
+				printf("  QPN 0x%x: avg_rate=%u last_rate=%u updates=%u\n",
+				       e->qpn, avg, e->last_rate, e->count);
+			}
+		}
+		printf("---\n\n");
+		last_rate_print_ts = now_us;
+	}
+
+	return 0;
+}
 
 /* Default PCC RP threads */
 const uint32_t default_pcc_rp_threads_list[PCC_RP_THREADS_NUM_DEFAULT_VALUE] = {
@@ -468,6 +547,13 @@ doca_error_t pcc_init(struct pcc_config *cfg, struct pcc_resources *resources)
 	result = doca_pcc_set_trace_message(resources->doca_pcc, trace_message_formats);
 	if (result != DOCA_SUCCESS) {
 		PRINT_ERROR("Error: Failed to set trace message for DOCA PCC\n");
+		goto destroy_pcc;
+	}
+
+	/* Register trace handler for per-flow rate reports */
+	result = doca_pcc_register_trace_handler(resources->doca_pcc, rate_report_trace_handler, NULL);
+	if (result != DOCA_SUCCESS) {
+		PRINT_ERROR("Error: Failed to register trace handler for rate reports\n");
 		goto destroy_pcc;
 	}
 
