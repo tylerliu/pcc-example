@@ -35,6 +35,11 @@
 #define SAMPLER_THREAD_RANK (0)
 #define COUNTERS_SAMPLE_WINDOW_IN_MICROSEC (10)
 #define EVENT_SUMMARY_FLOW_BUCKETS (256)
+#define PCC_TRACE_MAX_WORKERS (1024)
+#define PCC_TRACE_FLUSH_INTERVAL_US (1000000)
+#define PCC_RATE_REPORT_CONTEXT_QPN_INDEX (0)
+#define PCC_RATE_REPORT_CONTEXT_MAGIC_INDEX (1)
+#define PCC_RATE_REPORT_CONTEXT_MAGIC (0x52505451U) /* "RPTQ" */
 
 /**< Counters IDs to configure and read from */
 uint32_t counter_ids[DOCA_PCC_DEV_MAX_NUM_PORTS] = {0};
@@ -181,7 +186,6 @@ void doca_pcc_dev_user_algo(doca_pcc_dev_algo_ctxt_t *algo_ctxt,
 				    flow_bucket, event_count[flow_bucket], tx_count[flow_bucket],
 				    rtt_count[flow_bucket], attr->algo_slot, port_num, qpn,
 				    ((cc_ctxt_rtt_template_t *)algo_ctxt)->cur_rate);
-		doca_pcc_dev_trace_flush();
 		last_print_ts[flow_bucket] = now;
 	}
 
@@ -189,7 +193,21 @@ void doca_pcc_dev_user_algo(doca_pcc_dev_algo_ctxt_t *algo_ctxt,
 	thread0_calc_ports_utilization();
 #endif
 
-	uint32_t prev_rate = ((cc_ctxt_rtt_template_t *)algo_ctxt)->cur_rate;
+	/*
+	 * PCC may clone an existing algorithm context into a new flow. Keep an
+	 * owner-QPN tag in this template's reserved context words: a clone inherits
+	 * the previous owner's tag, which differs from the current event's QPN.
+	 */
+	cc_ctxt_rtt_template_t *rtt_ctxt = (cc_ctxt_rtt_template_t *)algo_ctxt;
+	uint32_t first_observed_flow = 0;
+	if (attr->algo_slot == 0 &&
+	    (rtt_ctxt->reserved[PCC_RATE_REPORT_CONTEXT_MAGIC_INDEX] != PCC_RATE_REPORT_CONTEXT_MAGIC ||
+	     rtt_ctxt->reserved[PCC_RATE_REPORT_CONTEXT_QPN_INDEX] != qpn)) {
+		rtt_ctxt->reserved[PCC_RATE_REPORT_CONTEXT_QPN_INDEX] = qpn;
+		rtt_ctxt->reserved[PCC_RATE_REPORT_CONTEXT_MAGIC_INDEX] = PCC_RATE_REPORT_CONTEXT_MAGIC;
+		first_observed_flow = 1;
+	}
+	uint32_t prev_rate = rtt_ctxt->cur_rate;
 
 	switch (attr->algo_slot) {
 	case 0: {
@@ -209,10 +227,34 @@ void doca_pcc_dev_user_algo(doca_pcc_dev_algo_ctxt_t *algo_ctxt,
 	}
 	};
 
-	/* Report per-flow rate to host whenever rate changes */
-	if (results->rate != prev_rate)
+	/* Report a flow's first observed slot-0 event and every later rate change. */
+	if (first_observed_flow || prev_rate == 0 || results->rate != prev_rate) {
+		/*
+		 * Trace buffers are worker-local. Flush the startup report immediately so
+		 * each QP's initial rate reaches the host even when its worker receives
+		 * no later PCC event. Subsequent changes use the per-worker cadence below.
+		 */
+		uint32_t is_startup_report = first_observed_flow || prev_rate == 0;
 		doca_pcc_dev_trace_5(PCC_RATE_REPORT_FORMAT_ID, qpn, results->rate,
-				     ev_type, ((cc_ctxt_rtt_template_t *)algo_ctxt)->rtt, now);
+				     ev_type, rtt_ctxt->rtt, now);
+		if (is_startup_report)
+			doca_pcc_dev_trace_flush();
+	}
+
+	/*
+	 * Do not share this state across PCC workers: each worker has its own trace
+	 * buffer. A shared timestamp can suppress another worker's required flush.
+	 */
+	{
+		static uint32_t last_flush_ts[PCC_TRACE_MAX_WORKERS] = {0};
+		unsigned int worker = doca_pcc_dev_thread_rank();
+
+		if (worker < PCC_TRACE_MAX_WORKERS &&
+		    now - last_flush_ts[worker] > PCC_TRACE_FLUSH_INTERVAL_US) {
+			doca_pcc_dev_trace_flush();
+			last_flush_ts[worker] = now;
+		}
+	}
 }
 
 /*

@@ -30,7 +30,6 @@
 #include <ctype.h>
 
 #include <doca_argp.h>
-#include <libflexio/flexio.h>
 
 #include "pcc_core.h"
 #include "../common/device/pcc_rate_report.h"
@@ -62,7 +61,9 @@ struct flow_rate_entry {
 
 static struct flow_rate_entry flow_rate_table[MAX_TRACKED_FLOWS];
 static uint32_t flow_rate_table_size = 0;
-static uint64_t last_rate_print_ts = 0;
+static uint32_t last_rate_print_ts = 0;
+static uint64_t rate_reports_total = 0;
+static uint64_t rate_reports_since_print = 0;
 
 static struct flow_rate_entry *find_or_create_flow(uint32_t qpn)
 {
@@ -82,13 +83,32 @@ static struct flow_rate_entry *find_or_create_flow(uint32_t qpn)
 }
 
 /*
+ * doca_pcc_bin_report is intentionally opaque. PCC uses a 64-byte record:
+ * metadata at offset 8, an internal timestamp at offset 16, and the five
+ * arguments of doca_pcc_dev_trace_5 at offset 24. This is distinct from the
+ * similarly sized FlexIO msg_bin_report, whose args begin at offset 16.
+ */
+struct pcc_trace_report {
+	uint32_t msg_number;
+	uint32_t seq_number;
+	uint64_t metadata;
+	uint64_t internal_timestamp;
+	uint64_t args[5];
+};
+
+/*
  * Trace handler callback - receives binary trace reports from the DPA.
  * Filters for rate report format and updates per-flow average rate.
  */
 static int rate_report_trace_handler(void *ctx, struct doca_pcc_bin_report *reps, int reps_size)
 {
 	(void)ctx;
-	struct msg_bin_report *reports = (struct msg_bin_report *)reps;
+	struct pcc_trace_report *reports = (struct pcc_trace_report *)reps;
+	uint32_t latest_report_ts = 0;
+	bool received_rate_report = false;
+
+	if (reps_size <= 0)
+		return 0;
 
 	for (int i = 0; i < reps_size; i++) {
 		if (reports[i].msg_number != PCC_RATE_REPORT_FORMAT_ID)
@@ -96,29 +116,36 @@ static int rate_report_trace_handler(void *ctx, struct doca_pcc_bin_report *reps
 
 		uint32_t qpn = (uint32_t)reports[i].args[0];
 		uint32_t rate = (uint32_t)reports[i].args[1];
-
 		struct flow_rate_entry *entry = find_or_create_flow(qpn);
+
 		if (entry) {
 			entry->rate_sum += rate;
 			entry->count++;
 			entry->last_rate = rate;
 		}
+		latest_report_ts = (uint32_t)reports[i].args[4];
+		received_rate_report = true;
+		rate_reports_total++;
+		rate_reports_since_print++;
 	}
 
-	/* Print per-flow average rates every ~5 seconds (based on wall clock) */
-	uint64_t now_us = reports[0].timestamp;
-	if (now_us - last_rate_print_ts > 5000000) {
-		printf("\n--- Per-flow average rates ---\n");
+	/* Print cumulative per-flow averages once per second, only after rate events. */
+	if (received_rate_report &&
+	    (last_rate_print_ts == 0 || (uint32_t)(latest_report_ts - last_rate_print_ts) >= 1000000)) {
+		printf("--- Per-flow rate averages (received=%llu total=%llu) ---\n",
+		       (unsigned long long)rate_reports_since_print,
+		       (unsigned long long)rate_reports_total);
 		for (uint32_t i = 0; i < flow_rate_table_size; i++) {
 			struct flow_rate_entry *e = &flow_rate_table[i];
-			if (e->count > 0) {
-				uint32_t avg = (uint32_t)(e->rate_sum / e->count);
-				printf("  QPN 0x%x: avg_rate=%u last_rate=%u updates=%u\n",
-				       e->qpn, avg, e->last_rate, e->count);
-			}
+			uint32_t avg = (uint32_t)(e->rate_sum / e->count);
+
+			printf("  QPN 0x%x: avg_rate=%u last_rate=%u updates=%u\n",
+			       e->qpn, avg, e->last_rate, e->count);
 		}
-		printf("---\n\n");
-		last_rate_print_ts = now_us;
+		printf("---\n");
+		fflush(stdout);
+		last_rate_print_ts = latest_report_ts;
+		rate_reports_since_print = 0;
 	}
 
 	return 0;
