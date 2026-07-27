@@ -1,25 +1,15 @@
-project('peer_sim', 'c', default_options: ['c_std=gnu11'])
+project('peer_sim', 'c', default_options: ['c_std=gnu11', 'warning_level=2'])
 
-arch = host_machine.cpu_family()
-multiarch = arch == 'aarch64' ? 'aarch64-linux-gnu' : 'x86_64-linux-gnu'
-dpdk_pc_dir = '/opt/mellanox/dpdk/lib' / multiarch / 'pkgconfig'
+# peer_sim is built independently on each endpoint:
+#   CX7: peer_sim --server ...
+#   BF3: peer_sim --client ...
+# The workload uses standard RDMA CM on both sides so mlx5 ECE negotiation
+# selects the PCC algorithm slot for the BF3 sender QPs.
+rdmacm_dep = dependency('librdmacm', required: true)
+ibverbs_dep = dependency('libibverbs', required: true)
 
-# Resolve libdpdk flags via pkg-config manually so we control PKG_CONFIG_PATH
-pkg_config = find_program('pkg-config', required: true)
-
-dpdk_cflags = run_command(pkg_config, '--cflags', 'libdpdk',
-  env: {'PKG_CONFIG_PATH': dpdk_pc_dir}, check: true).stdout().strip().split()
-dpdk_libs   = run_command(pkg_config, '--libs',   'libdpdk',
-  env: {'PKG_CONFIG_PATH': dpdk_pc_dir}, check: true).stdout().strip().split()
-
-dpdk  = declare_dependency(compile_args: dpdk_cflags, link_args: dpdk_libs)
-
-sources = files(
-  'main.c',
-  'reflector.c',
-)
-
-executable('peer_sim', sources,
-  dependencies: [dpdk],
-  install: false,
+executable('peer_sim',
+	'peer_sim.c',
+	dependencies: [rdmacm_dep, ibverbs_dep],
+	install: false,
 )
