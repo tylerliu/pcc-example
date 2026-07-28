@@ -99,3 +99,34 @@ ninja
 ```
 
 The DPA archive is regenerated during Meson setup through `pcc/build_device_code.sh` / `dpacc`.
+
+## Embedded `peer_sim` sender
+
+For the BF3 sender experiment, the PCC executable can run the `peer_sim` client in the **same host process**. Enable it with `--peer-sim-client-args`, whose value is a quoted, whitespace-delimited `peer_sim --client` argument list:
+
+```bash
+./build/pcc/doca_pcc --device mlx5_0 \
+  --peer-sim-client-args '--client \
+    --local0 172.16.1.2 --peer0 172.16.1.20 \
+    --local1 172.16.2.2 --peer1 172.16.2.20'
+```
+
+The CX7 receiver remains the standalone passive target:
+
+```bash
+./peer_sim/build/peer_sim --server \
+  --local0 172.16.1.20 --local1 172.16.2.20
+```
+
+There is no rate file, polling IPC, or manual QPN-to-path configuration. After the two BF3 QPs are connected, the sender records their QPNs in two internal slots. Each PCC format-6 trace report directly calls the sender bridge; if its QPN matches a slot, it performs a relaxed atomic update of that path's raw FXP20 rate. The sender's existing single-loop DRR scheduler reads these slots every `--weight-period-ms` (200 ms by default). An older complete rate is acceptable; zero means no rate has arrived yet, so the scheduler retains its current weights until both paths have reported.
+
+The established-QP logs show the two client QPNs. The existing host-side per-QPN PCC summary remains printed at most once per DPA-timer second, and is the primary visibility point for the trace-to-sender handoff:
+
+```text
+--- Per-flow rate averages (received=... total=...) ---
+  QPN 0x63f: avg_rate=1048576 last_rate=1048576 updates=...
+  QPN 0x640: avg_rate=786432 last_rate=786432 updates=...
+---
+```
+
+This adds no per-path sender workers. The RDMA writes and both logical paths remain in the proven one-thread DRR loop; PCC trace delivery only provides its rate inputs through an internal function call.

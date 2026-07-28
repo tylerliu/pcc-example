@@ -29,6 +29,8 @@
 #include <stdio.h>
 #include <ctype.h>
 
+#include "peer_sim.h"
+
 #include <doca_argp.h>
 
 #include "pcc_core.h"
@@ -102,52 +104,54 @@ struct pcc_trace_report {
  */
 static int rate_report_trace_handler(void *ctx, struct doca_pcc_bin_report *reps, int reps_size)
 {
-	(void)ctx;
 	struct pcc_trace_report *reports = (struct pcc_trace_report *)reps;
 	uint32_t latest_report_ts = 0;
 	bool received_rate_report = false;
 
+	(void)ctx;
 	if (reps_size <= 0)
 		return 0;
 
 	for (int i = 0; i < reps_size; i++) {
+		uint32_t qpn;
+		uint32_t rate;
+		struct flow_rate_entry *entry;
+
 		if (reports[i].msg_number != PCC_RATE_REPORT_FORMAT_ID)
 			continue;
-
-		uint32_t qpn = (uint32_t)reports[i].args[0];
-		uint32_t rate = (uint32_t)reports[i].args[1];
-		struct flow_rate_entry *entry = find_or_create_flow(qpn);
-
-		if (entry) {
+		qpn = (uint32_t)reports[i].args[0];
+		rate = (uint32_t)reports[i].args[1];
+		entry = find_or_create_flow(qpn);
+		if (entry != NULL) {
 			entry->rate_sum += rate;
 			entry->count++;
 			entry->last_rate = rate;
 		}
+		peer_sim_update_pcc_rate(qpn, rate);
 		latest_report_ts = (uint32_t)reports[i].args[4];
 		received_rate_report = true;
 		rate_reports_total++;
 		rate_reports_since_print++;
 	}
 
-	/* Print cumulative per-flow averages once per second, only after rate events. */
+	/* Keep the existing host-side once-per-second per-QPN report. */
 	if (received_rate_report &&
 	    (last_rate_print_ts == 0 || (uint32_t)(latest_report_ts - last_rate_print_ts) >= 1000000)) {
 		printf("--- Per-flow rate averages (received=%llu total=%llu) ---\n",
 		       (unsigned long long)rate_reports_since_print,
 		       (unsigned long long)rate_reports_total);
 		for (uint32_t i = 0; i < flow_rate_table_size; i++) {
-			struct flow_rate_entry *e = &flow_rate_table[i];
-			uint32_t avg = (uint32_t)(e->rate_sum / e->count);
+			const struct flow_rate_entry *entry = &flow_rate_table[i];
+			uint32_t avg = (uint32_t)(entry->rate_sum / entry->count);
 
 			printf("  QPN 0x%x: avg_rate=%u last_rate=%u updates=%u\n",
-			       e->qpn, avg, e->last_rate, e->count);
+			       entry->qpn, avg, entry->last_rate, entry->count);
 		}
 		printf("---\n");
 		fflush(stdout);
 		last_rate_print_ts = latest_report_ts;
 		rate_reports_since_print = 0;
 	}
-
 	return 0;
 }
 
@@ -940,11 +944,29 @@ static doca_error_t coredump_file_callback(void *param, void *config)
 }
 
 /*
+ * ARGP Callback - Handle embedded BF3 peer_sim client arguments.
+ */
+static doca_error_t peer_sim_client_args_callback(void *param, void *config)
+{
+	struct pcc_config *pcc_cfg = (struct pcc_config *)config;
+	const char *args = (char *)param;
+	size_t args_len = strnlen(args, MAX_ARG_SIZE);
+
+	if (args_len == 0 || args_len == MAX_ARG_SIZE) {
+		PRINT_ERROR("Error: peer_sim client arguments must be nonempty and no longer than %d characters\n",
+			    MAX_USER_ARG_SIZE);
+		return DOCA_ERROR_INVALID_VALUE;
+	}
+	strncpy(pcc_cfg->peer_sim_client_args, args, args_len + 1);
+	return DOCA_SUCCESS;
+}
+
+/*
  * ARGP Callback - Handles DPA resources file path parameter
  *
- * @param [in]: Input parameter
- * @config [in/out]: Program configuration context
- * @return: DOCA_SUCCESS on success and DOCA_ERROR otherwise
+ * @param[in] param Input parameter
+ * @param[in,out] config Program configuration context
+ * @return DOCA_SUCCESS on success and DOCA_ERROR otherwise
  */
 static doca_error_t dpa_resources_file_callback(void *param, void *config)
 {
@@ -1010,6 +1032,7 @@ doca_error_t register_pcc_params(void)
 	struct doca_argp_param *gns_ignore_mask_param;
 	struct doca_argp_param *gns_ignore_value_param;
 	struct doca_argp_param *coredump_file_param;
+	struct doca_argp_param *peer_sim_client_args_param;
 	struct doca_argp_param *dpa_resources_file;
 	struct doca_argp_param *dpa_application_key;
 
@@ -1227,6 +1250,25 @@ doca_error_t register_pcc_params(void)
 	doca_argp_param_set_callback(coredump_file_param, coredump_file_callback);
 	doca_argp_param_set_type(coredump_file_param, DOCA_ARGP_TYPE_STRING);
 	result = doca_argp_register_param(coredump_file_param);
+	if (result != DOCA_SUCCESS) {
+		PRINT_ERROR("Error: Failed to register program param: %s\n", doca_error_get_descr(result));
+		return result;
+	}
+
+	/* Create and register embedded peer_sim client arguments parameter */
+	result = doca_argp_param_create(&peer_sim_client_args_param);
+	if (result != DOCA_SUCCESS) {
+		PRINT_ERROR("Error: Failed to create ARGP param: %s\n", doca_error_get_descr(result));
+		return result;
+	}
+	doca_argp_param_set_long_name(peer_sim_client_args_param, "peer-sim-client-args");
+	doca_argp_param_set_arguments(peer_sim_client_args_param, "<path>");
+	doca_argp_param_set_description(
+		peer_sim_client_args_param,
+		"Run peer_sim client in this PCC host process; pass its quoted client arguments (optional).");
+	doca_argp_param_set_callback(peer_sim_client_args_param, peer_sim_client_args_callback);
+	doca_argp_param_set_type(peer_sim_client_args_param, DOCA_ARGP_TYPE_STRING);
+	result = doca_argp_register_param(peer_sim_client_args_param);
 	if (result != DOCA_SUCCESS) {
 		PRINT_ERROR("Error: Failed to register program param: %s\n", doca_error_get_descr(result));
 		return result;

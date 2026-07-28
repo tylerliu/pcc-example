@@ -136,6 +136,7 @@ struct pcc_config {
 	uint8_t gns_ignore_value;			 /* IFA2 GNS ignore value */
 	uint8_t gns_ignore_mask;			 /* IFA2 GNS ignore mask */
 	char coredump_file[MAX_ARG_SIZE];		 /* Coredump file pathname */
+	char peer_sim_client_args[MAX_ARG_SIZE]; /* Optional embedded BF3 peer_sim client arguments */
 	char dpa_resources_file[MAX_ARG_SIZE];		 /* DPA resources yaml file path */
 	char dpa_application_key[MAX_ARG_SIZE];		 /* DPA application file name */
 };

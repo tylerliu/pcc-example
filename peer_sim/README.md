@@ -121,18 +121,24 @@ The path rate is based on successful RC RDMA-write completions. Compare this out
 
 ## Dynamic DRR weights
 
-DRR begins at 50/50. The client can optionally poll a file containing two positive PCC FXP20 rates:
-
-```text
-<path0-fxp20-rate> <path1-fxp20-rate>
-```
+DRR begins at 50/50. In the PCC experiment, BF3 runs the sender inside the PCC host executable; there is no rate file or external IPC. Start PCC with a quoted `peer_sim --client` argument list:
 
 ```bash
-printf '1048576 1048576\n' > /run/peer_sim-rates
-./build/peer_sim --client ... --rate-file /run/peer_sim-rates
+./build/pcc/doca_pcc --device mlx5_0 \
+  --peer-sim-client-args '--client \
+    --local0 172.16.1.2 --peer0 172.16.1.20 \
+    --local1 172.16.2.2 --peer1 172.16.2.20'
 ```
 
-The scheduler applies a 5% minimum probe share, 95% maximum share, and a 10-percentage-point-per-update slew limit. The existing PCC trace host does not yet publish this file automatically; that exporter is the next integration step.
+After both client QPs connect, the sender registers their QPNs in two internal rate slots. Each PCC format-6 trace callback directly updates the matching slot with its FXP20 rate through a relaxed atomic store. The single-loop sender reads those slots every `--weight-period-ms` (default 200 ms), so an older complete rate is harmless. It retains its current DRR weights until both paths have positive rates; no manual QPN-to-path mapping is needed.
+
+The PCC host keeps its once-per-second per-QPN rate summary. Compare its QPNs with the sender's `RDMA-CM established` QPN logs and per-path throughput. The scheduler applies a 5% minimum probe share, 95% maximum share, and a 10-percentage-point-per-update slew limit. Its DRR round quantum is at least 20 writes, so a 5% path receives at least one complete write credit per round even when `--post-batch` is small. Per-path deficits are capped at one queue depth to prevent a stalled path from accumulating an unbounded catch-up burst.
+
+This is an **admission** guarantee, not a physical-throughput override: PCC still paces each QP in hardware. If CE drives one PCC rate below 5% of the other rate, completed bytes on that path can remain below 5% even though DRR continues to admit its minimum probe work. Use the sender's assigned/completed totals and PCC's per-QPN rate summary to distinguish that PCC pacing outcome from a scheduler bug.
+
+## Shutdown
+
+`Ctrl-C` sets the shared stop flag on either endpoint. RDMA-CM waits and passive-target sleeps are polled in 100 ms intervals, so connection setup and the receiver do not remain blocked in an indefinite wait. During signal shutdown the client does not wait for remote `DISCONNECTED` acknowledgements before releasing its RDMA resources.
 
 ## Expected ECN experiment
 

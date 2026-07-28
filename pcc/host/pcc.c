@@ -26,6 +26,9 @@
 #include <stdlib.h>
 #include <signal.h>
 #include <stdbool.h>
+#include <string.h>
+
+#include "peer_sim.h"
 
 #include <doca_argp.h>
 #include <doca_dev.h>
@@ -61,6 +64,41 @@ static void sigint_handler(int dummy)
 	(void)dummy;
 	host_stop = true;
 	signal(SIGINT, SIG_DFL);
+}
+
+#define PEER_SIM_MAX_ARGS 32
+
+/* Split the single quoted PCC option into peer_sim argv entries. IPs and numeric
+ * peer_sim options contain no whitespace, so shell quoting is intentionally not
+ * interpreted here. */
+static int run_embedded_peer_sim(const char *arguments)
+{
+	char *copy;
+	char *save = NULL;
+	char *token;
+	char *argv[PEER_SIM_MAX_ARGS + 1];
+	int argc = 1;
+	int result;
+
+	copy = strdup(arguments);
+	if (copy == NULL) {
+		PRINT_ERROR("Error: Failed to allocate embedded peer_sim arguments\n");
+		return EXIT_FAILURE;
+	}
+	argv[0] = "peer_sim";
+	for (token = strtok_r(copy, " \t", &save); token != NULL;
+	     token = strtok_r(NULL, " \t", &save)) {
+		if (argc == PEER_SIM_MAX_ARGS) {
+			PRINT_ERROR("Error: Too many embedded peer_sim arguments\n");
+			free(copy);
+			return EXIT_FAILURE;
+		}
+		argv[argc++] = token;
+	}
+	argv[argc] = NULL;
+	result = peer_sim_main(argc, argv);
+	free(copy);
+	return result;
 }
 
 /*
@@ -168,6 +206,14 @@ int main(int argc, char **argv)
 	result = pcc_mailbox_send(&cfg, &resources);
 	if (result != DOCA_SUCCESS) {
 		PRINT_ERROR("Error: Failed to send mailbox request\n");
+		goto destroy_pcc;
+	}
+
+	if (cfg.peer_sim_client_args[0] != '\0') {
+		PRINT_INFO("Info: Starting embedded BF3 peer_sim sender with direct PCC trace feedback\n");
+		exit_status = run_embedded_peer_sim(cfg.peer_sim_client_args);
+		if (exit_status != EXIT_SUCCESS)
+			PRINT_ERROR("Error: Embedded peer_sim sender failed\n");
 		goto destroy_pcc;
 	}
 

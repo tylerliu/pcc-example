@@ -12,15 +12,19 @@
 #include <errno.h>
 #include <getopt.h>
 #include <inttypes.h>
+#include <poll.h>
 #include <rdma/rdma_cma.h>
 #include <signal.h>
 #include <stdbool.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+
+#include "peer_sim.h"
 
 #define PEER_PATHS 2
 #define PEER_MAGIC UINT64_C(0x5043434452523031) /* "PCCDRR01" */
@@ -42,6 +46,8 @@
 #define MAX_POST_BATCH 64
 #define CONTROL_WR_ID UINT64_MAX
 #define CONNECT_TIMEOUT_MS 5000
+#define CM_EVENT_POLL_MS 100
+#define MIN_PROBE_QUANTUM_FACTOR 20
 
 struct peer_chunk_header {
 	uint64_t magic;
@@ -83,7 +89,6 @@ struct peer_config {
 	uint32_t depth;
 	uint32_t post_batch;
 	uint32_t weight_period_ms;
-	char rate_file[4096];
 };
 
 struct path_ctx {
@@ -114,6 +119,24 @@ struct path_ctx {
 };
 
 static volatile sig_atomic_t stop_requested;
+static _Atomic uint32_t tracked_pcc_qpns[PEER_PATHS];
+static _Atomic uint32_t tracked_pcc_rates[PEER_PATHS];
+
+void peer_sim_track_pcc_qpns(uint32_t path0_qpn, uint32_t path1_qpn)
+{
+	atomic_store_explicit(&tracked_pcc_rates[0], 0, memory_order_relaxed);
+	atomic_store_explicit(&tracked_pcc_rates[1], 0, memory_order_relaxed);
+	atomic_store_explicit(&tracked_pcc_qpns[0], path0_qpn, memory_order_relaxed);
+	atomic_store_explicit(&tracked_pcc_qpns[1], path1_qpn, memory_order_relaxed);
+}
+
+void peer_sim_update_pcc_rate(uint32_t qpn, uint32_t rate)
+{
+	if (qpn == atomic_load_explicit(&tracked_pcc_qpns[0], memory_order_relaxed))
+		atomic_store_explicit(&tracked_pcc_rates[0], rate, memory_order_relaxed);
+	if (qpn == atomic_load_explicit(&tracked_pcc_qpns[1], memory_order_relaxed))
+		atomic_store_explicit(&tracked_pcc_rates[1], rate, memory_order_relaxed);
+}
 
 static void on_signal(int signal_number)
 {
@@ -144,8 +167,7 @@ static void usage(const char *program)
 		"  --chunk-size <bytes>     Payload bytes per chunk (default %u)\n"
 		"  --depth <count>          Per-QP send/receive depth (default %u)\n"
 		"  --post-batch <count>     Linked RDMA writes per post (default %u; max %u)\n"
-		"  --rate-file <path>       Optional file containing '<rate0> <rate1>'\n"
-		"  --weight-period-ms <ms>  Poll period for --rate-file (default %u)\n"
+		"  --weight-period-ms <ms>  In-process PCC rate refresh period (default %u)\n"
 		"  --help                    Show this help\n",
 		program, program, DEFAULT_CM_PORT0, DEFAULT_CM_PORT1,
 		DEFAULT_CHUNKS, DEFAULT_PAYLOAD_SIZE, DEFAULT_DEPTH, DEFAULT_POST_BATCH,
@@ -216,7 +238,6 @@ static int parse_args(int argc, char **argv, struct peer_config *config)
 		OPT_CHUNK_SIZE,
 		OPT_DEPTH,
 		OPT_POST_BATCH,
-		OPT_RATE_FILE,
 		OPT_WEIGHT_PERIOD,
 	};
 	static const struct option options[] = {
@@ -232,7 +253,6 @@ static int parse_args(int argc, char **argv, struct peer_config *config)
 		{"chunk-size", required_argument, NULL, OPT_CHUNK_SIZE},
 		{"depth", required_argument, NULL, OPT_DEPTH},
 		{"post-batch", required_argument, NULL, OPT_POST_BATCH},
-		{"rate-file", required_argument, NULL, OPT_RATE_FILE},
 		{"weight-period-ms", required_argument, NULL, OPT_WEIGHT_PERIOD},
 		{"help", no_argument, NULL, 'h'},
 		{NULL, 0, NULL, 0},
@@ -301,13 +321,6 @@ static int parse_args(int argc, char **argv, struct peer_config *config)
 			    config->post_batch > MAX_POST_BATCH)
 				return -1;
 			break;
-		case OPT_RATE_FILE:
-			if (snprintf(config->rate_file, sizeof(config->rate_file), "%s", optarg) >=
-			    (int)sizeof(config->rate_file)) {
-				fprintf(stderr, "Rate file path is too long\n");
-				return -1;
-			}
-			break;
 		case OPT_WEIGHT_PERIOD:
 			if (parse_u32(optarg, &config->weight_period_ms) != 0 || config->weight_period_ms == 0)
 				return -1;
@@ -342,28 +355,47 @@ static int parse_args(int argc, char **argv, struct peer_config *config)
 static int wait_for_event(struct rdma_event_channel *channel, enum rdma_cm_event_type expected,
 			  struct rdma_cm_id **id_output)
 {
+	struct pollfd descriptor = {
+		.fd = channel->fd,
+		.events = POLLIN,
+	};
 	struct rdma_cm_event *event = NULL;
 	enum rdma_cm_event_type actual;
 	int status;
 
-	if (rdma_get_cm_event(channel, &event) != 0) {
-		perror("rdma_get_cm_event");
-		return -1;
+	while (!stop_requested) {
+		int poll_result = poll(&descriptor, 1, CM_EVENT_POLL_MS);
+
+		if (poll_result == 0)
+			continue;
+		if (poll_result < 0) {
+			if (errno == EINTR)
+				continue;
+			perror("poll RDMA-CM event channel");
+			return -1;
+		}
+		if (rdma_get_cm_event(channel, &event) != 0) {
+			if (errno == EAGAIN || errno == EINTR)
+				continue;
+			perror("rdma_get_cm_event");
+			return -1;
+		}
+		actual = event->event;
+		status = event->status;
+		if (id_output != NULL)
+			*id_output = event->id;
+		if (rdma_ack_cm_event(event) != 0) {
+			perror("rdma_ack_cm_event");
+			return -1;
+		}
+		if (actual != expected || status != 0) {
+			fprintf(stderr, "Unexpected RDMA-CM event: got %s status=%d, expected %s\n",
+				rdma_event_str(actual), status, rdma_event_str(expected));
+			return -1;
+		}
+		return 0;
 	}
-	actual = event->event;
-	status = event->status;
-	if (id_output != NULL)
-		*id_output = event->id;
-	if (rdma_ack_cm_event(event) != 0) {
-		perror("rdma_ack_cm_event");
-		return -1;
-	}
-	if (actual != expected || status != 0) {
-		fprintf(stderr, "Unexpected RDMA-CM event: got %s status=%d, expected %s\n",
-			rdma_event_str(actual), status, rdma_event_str(expected));
-		return -1;
-	}
-	return 0;
+	return -1;
 }
 
 static void log_ece(const struct path_ctx *path, const char *side)
@@ -669,40 +701,19 @@ static int prepare_server_listener(struct path_ctx *path, const struct peer_conf
 
 static int accept_server_path(struct path_ctx *path, const struct peer_config *config)
 {
-	struct rdma_cm_event *event = NULL;
 	struct rdma_conn_param parameter = {
 		.responder_resources = 1,
 		.initiator_depth = 1,
 		.rnr_retry_count = 7,
 	};
-	struct rdma_cm_id *id;
-	uint8_t private_data_len;
-
-	if (rdma_get_cm_event(path->channel, &event) != 0) {
-		perror("rdma_get_cm_event");
-		return -1;
-	}
-	if (event->event != RDMA_CM_EVENT_CONNECT_REQUEST || event->status != 0) {
-		fprintf(stderr, "server path %u: expected CONNECT_REQUEST, got %s status=%d\n",
-			path->path_id, rdma_event_str(event->event), event->status);
-		rdma_ack_cm_event(event);
-		return -1;
-	}
 
 	/*
-	 * mlx5 ECE may extend the connection-request private data. Do not parse
-	 * or impose a length on that provider-owned payload: this listener's
-	 * local IP and RDMA-CM service port already identify the requested path.
+	 * mlx5 ECE may extend connection-request private data. Do not parse it:
+	 * the listener's local IP and RDMA-CM service port identify the path.
 	 */
-	id = event->id;
-	private_data_len = event->param.conn.private_data_len;
-	if (rdma_ack_cm_event(event) != 0) {
-		perror("rdma_ack_cm_event");
+	if (wait_for_event(path->channel, RDMA_CM_EVENT_CONNECT_REQUEST, &path->id) != 0)
 		return -1;
-	}
-	printf("server path %u: accepted CONNECT_REQUEST with %u private-data bytes\n",
-	       path->path_id, private_data_len);
-	path->id = id;
+	printf("server path %u: accepted CONNECT_REQUEST\n", path->path_id);
 	if (setup_resources(path, config->depth, sizeof(struct peer_chunk_header) + config->payload_size, 0) != 0)
 		return -1;
 
@@ -833,37 +844,29 @@ static int poll_sender_completions(struct path_ctx *path)
 	return retired;
 }
 
-static void update_weights(const struct peer_config *config, uint64_t *last_update,
-			   double weights[PEER_PATHS])
+static void update_weights(const struct peer_config *config, double weights[PEER_PATHS])
 {
-	FILE *file;
-	double rate0, rate1, target, delta;
-	uint64_t now;
+	uint32_t path0_rate;
+	uint32_t path1_rate;
+	double target, delta;
 
-	if (config->rate_file[0] == '\0')
+	(void)config;
+	path0_rate = atomic_load_explicit(&tracked_pcc_rates[0], memory_order_relaxed);
+	path1_rate = atomic_load_explicit(&tracked_pcc_rates[1], memory_order_relaxed);
+	if (path0_rate == 0 || path1_rate == 0)
 		return;
-	now = monotonic_msec();
-	if (now - *last_update < config->weight_period_ms)
-		return;
-	*last_update = now;
-	file = fopen(config->rate_file, "r");
-	if (file == NULL)
-		return;
-	if (fscanf(file, "%lf %lf", &rate0, &rate1) == 2 && rate0 > 0.0 && rate1 > 0.0) {
-		target = rate0 / (rate0 + rate1);
-		if (target < MIN_PROBE_SHARE)
-			target = MIN_PROBE_SHARE;
-		if (target > MAX_PROBE_SHARE)
-			target = MAX_PROBE_SHARE;
-		delta = target - weights[0];
-		if (delta > MAX_WEIGHT_STEP)
-			delta = MAX_WEIGHT_STEP;
-		if (delta < -MAX_WEIGHT_STEP)
-			delta = -MAX_WEIGHT_STEP;
-		weights[0] += delta;
-		weights[1] = 1.0 - weights[0];
-	}
-	fclose(file);
+	target = (double)path0_rate / ((double)path0_rate + (double)path1_rate);
+	if (target < MIN_PROBE_SHARE)
+		target = MIN_PROBE_SHARE;
+	if (target > MAX_PROBE_SHARE)
+		target = MAX_PROBE_SHARE;
+	delta = target - weights[0];
+	if (delta > MAX_WEIGHT_STEP)
+		delta = MAX_WEIGHT_STEP;
+	if (delta < -MAX_WEIGHT_STEP)
+		delta = -MAX_WEIGHT_STEP;
+	weights[0] += delta;
+	weights[1] = 1.0 - weights[0];
 }
 
 static void report_throughput(const char *role, const struct path_ctx paths[PEER_PATHS], bool sender,
@@ -902,19 +905,34 @@ static int run_sender(struct path_ctx paths[PEER_PATHS], const struct peer_confi
 	uint64_t started = monotonic_msec();
 	uint64_t last_report = started;
 	uint64_t last_bytes[PEER_PATHS] = {0};
-	uint64_t quantum = (uint64_t)(sizeof(struct peer_chunk_header) + config->payload_size) *
-		config->post_batch * PEER_PATHS;
+	uint64_t wire_size = sizeof(struct peer_chunk_header) + config->payload_size;
+	uint64_t quantum = wire_size * config->post_batch * PEER_PATHS;
+	uint64_t minimum_probe_quantum = wire_size * MIN_PROBE_QUANTUM_FACTOR;
+	uint64_t maximum_deficit;
+
+	if (quantum < minimum_probe_quantum)
+		quantum = minimum_probe_quantum;
+	maximum_deficit = (uint64_t)config->depth * wire_size;
+	if (maximum_deficit < quantum)
+		maximum_deficit = quantum;
 
 	while ((!finite_run || completed < config->chunks) && !stop_requested) {
 		bool progress = false;
 		unsigned int path_index;
 
-		update_weights(config, &last_weight_update, weights);
+		if (monotonic_msec() - last_weight_update >= config->weight_period_ms) {
+			last_weight_update = monotonic_msec();
+			update_weights(config, weights);
+		}
 		for (path_index = 0; path_index < PEER_PATHS &&
 		     (!finite_run || posted < config->chunks); path_index++) {
 			struct path_ctx *path = &paths[path_index];
+			uint64_t credit = (uint64_t)(quantum * weights[path_index]);
 
-			deficits[path_index] += (uint64_t)(quantum * weights[path_index]);
+			if (credit >= maximum_deficit - deficits[path_index])
+				deficits[path_index] = maximum_deficit;
+			else
+				deficits[path_index] += credit;
 			while ((!finite_run || posted < config->chunks) &&
 			       deficits[path_index] >= path->wire_size && path->outstanding < path->depth) {
 				uint64_t remaining = finite_run ? config->chunks - posted : UINT64_MAX;
@@ -966,8 +984,12 @@ static int run_sender(struct path_ctx paths[PEER_PATHS], const struct peer_confi
 static int run_write_target(const struct path_ctx paths[PEER_PATHS])
 {
 	printf("receiver: RDMA write targets are active; bulk bytes are measured at the BF3 sender\n");
-	while (!stop_requested)
-		sleep(1);
+	while (!stop_requested) {
+		if (poll(NULL, 0, CM_EVENT_POLL_MS) < 0 && errno != EINTR) {
+			perror("poll receiver shutdown");
+			return -1;
+		}
+	}
 	for (unsigned int i = 0; i < PEER_PATHS; i++)
 		printf("receiver path %u: target addr=%#" PRIx64 " rkey=%#x size=%zu\n", i,
 		       (uint64_t)(uintptr_t)paths[i].buffer, paths[i].mr->rkey, paths[i].wire_size);
@@ -977,17 +999,24 @@ static int run_write_target(const struct path_ctx paths[PEER_PATHS])
 static void disconnect_client_paths(struct path_ctx paths[PEER_PATHS])
 {
 	for (unsigned int i = 0; i < PEER_PATHS; i++) {
-		if (paths[i].id != NULL && rdma_disconnect(paths[i].id) == 0)
+		if (paths[i].id == NULL)
+			continue;
+		if (rdma_disconnect(paths[i].id) != 0 && errno != ENOTCONN)
+			fprintf(stderr, "path %u: rdma_disconnect failed: %s\n", paths[i].path_id,
+				strerror(errno));
+		if (!stop_requested)
 			(void)wait_for_event(paths[i].channel, RDMA_CM_EVENT_DISCONNECTED, NULL);
 	}
 }
 
-int main(int argc, char **argv)
+int peer_sim_main(int argc, char **argv)
 {
 	struct peer_config config;
 	struct path_ctx paths[PEER_PATHS] = {0};
 	int result = EXIT_FAILURE;
 
+	stop_requested = 0;
+	optind = 1;
 	if (parse_args(argc, argv, &config) != 0) {
 		usage(argv[0]);
 		return EXIT_FAILURE;
@@ -1003,6 +1032,7 @@ int main(int argc, char **argv)
 		if (connect_client_path(&paths[0], &config) != 0 ||
 		    connect_client_path(&paths[1], &config) != 0)
 			goto cleanup;
+		peer_sim_track_pcc_qpns(paths[0].id->qp->qp_num, paths[1].id->qp->qp_num);
 		if (run_sender(paths, &config) != 0)
 			goto cleanup;
 		disconnect_client_paths(paths);
@@ -1024,3 +1054,10 @@ cleanup:
 		cleanup_path(&paths[i]);
 	return result;
 }
+
+#ifndef PEER_SIM_NO_MAIN
+int main(int argc, char **argv)
+{
+	return peer_sim_main(argc, argv);
+}
+#endif
