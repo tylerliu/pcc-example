@@ -29,6 +29,8 @@
 #include <doca_pcc.h>
 #include <doca_dev.h>
 #include <doca_error.h>
+#include <stdbool.h>
+#include <stdint.h>
 
 #define PCC_RP_THREADS_NUM_DEFAULT_VALUE \
 	(48 + 1) /* Default Number of PCC RP threads, the extra one is used for communication */
@@ -136,7 +138,8 @@ struct pcc_config {
 	uint8_t gns_ignore_value;			 /* IFA2 GNS ignore value */
 	uint8_t gns_ignore_mask;			 /* IFA2 GNS ignore mask */
 	char coredump_file[MAX_ARG_SIZE];		 /* Coredump file pathname */
-	char peer_sim_client_args[MAX_ARG_SIZE]; /* Optional embedded BF3 peer_sim client arguments */
+	bool steer_enable;			 /* Enable embedded DOCA Flow path steering */
+	uint32_t steer_sf_num;			 /* Receiver SF number for embedded steering */
 	char dpa_resources_file[MAX_ARG_SIZE];		 /* DPA resources yaml file path */
 	char dpa_application_key[MAX_ARG_SIZE];		 /* DPA application file name */
 };

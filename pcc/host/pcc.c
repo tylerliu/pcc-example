@@ -27,8 +27,9 @@
 #include <signal.h>
 #include <stdbool.h>
 #include <string.h>
+#include <unistd.h>
 
-#include "peer_sim.h"
+#include "steer.h"
 
 #include <doca_argp.h>
 #include <doca_dev.h>
@@ -66,38 +67,27 @@ static void sigint_handler(int dummy)
 	signal(SIGINT, SIG_DFL);
 }
 
-#define PEER_SIM_MAX_ARGS 32
-
-/* Split the single quoted PCC option into peer_sim argv entries. IPs and numeric
- * peer_sim options contain no whitespace, so shell quoting is intentionally not
- * interpreted here. */
-static int run_embedded_peer_sim(const char *arguments)
+/*
+ * Start the embedded DOCA Flow path-steering datapath in this process.
+ * EAL is initialized with a minimal argv (a dummy allowlist entry is appended by
+ * steer_eal_init); the real device is attached by the module via DOCA.
+ */
+static doca_error_t start_embedded_steering(char *prog_name, uint32_t sf_num)
 {
-	char *copy;
-	char *save = NULL;
-	char *token;
-	char *argv[PEER_SIM_MAX_ARGS + 1];
-	int argc = 1;
-	int result;
+	char *eal_argv[1] = {prog_name};
+	struct steer_opts sopts;
+	doca_error_t result;
 
-	copy = strdup(arguments);
-	if (copy == NULL) {
-		PRINT_ERROR("Error: Failed to allocate embedded peer_sim arguments\n");
-		return EXIT_FAILURE;
+	result = steer_eal_init(1, eal_argv);
+	if (result != DOCA_SUCCESS) {
+		PRINT_ERROR("Error: steer EAL init failed: %s\n", doca_error_get_descr(result));
+		return result;
 	}
-	argv[0] = "peer_sim";
-	for (token = strtok_r(copy, " \t", &save); token != NULL;
-	     token = strtok_r(NULL, " \t", &save)) {
-		if (argc == PEER_SIM_MAX_ARGS) {
-			PRINT_ERROR("Error: Too many embedded peer_sim arguments\n");
-			free(copy);
-			return EXIT_FAILURE;
-		}
-		argv[argc++] = token;
-	}
-	argv[argc] = NULL;
-	result = peer_sim_main(argc, argv);
-	free(copy);
+	steer_default_opts(&sopts);
+	sopts.sf_num = sf_num;
+	result = steer_start(&sopts);
+	if (result != DOCA_SUCCESS)
+		PRINT_ERROR("Error: steer_start failed: %s\n", doca_error_get_descr(result));
 	return result;
 }
 
@@ -209,12 +199,11 @@ int main(int argc, char **argv)
 		goto destroy_pcc;
 	}
 
-	if (cfg.peer_sim_client_args[0] != '\0') {
-		PRINT_INFO("Info: Starting embedded BF3 peer_sim sender with direct PCC trace feedback\n");
-		exit_status = run_embedded_peer_sim(cfg.peer_sim_client_args);
-		if (exit_status != EXIT_SUCCESS)
-			PRINT_ERROR("Error: Embedded peer_sim sender failed\n");
-		goto destroy_pcc;
+	if (cfg.steer_enable) {
+		result = start_embedded_steering(argv[0], cfg.steer_sf_num);
+		if (result != DOCA_SUCCESS)
+			goto destroy_pcc;
+		PRINT_INFO("Info: Embedded DOCA Flow steering active on SF %u\n", cfg.steer_sf_num);
 	}
 
 	host_stop = false;
@@ -246,15 +235,24 @@ int main(int argc, char **argv)
 		if (process_status == DOCA_PCC_PS_DEACTIVATED || process_status == DOCA_PCC_PS_ERROR)
 			break;
 
-		PRINT_INFO("Info: Waiting on DOCA PCC\n");
-		result = doca_pcc_wait(resources.doca_pcc, cfg.wait_time);
-		if (result != DOCA_SUCCESS) {
-			PRINT_ERROR("Error: Failed to wait PCC\n");
-			goto destroy_pcc;
+		if (cfg.steer_enable) {
+			/* Drive the embedded steering decision + counters ~1/s. */
+			steer_poll();
+			sleep(1);
+		} else {
+			PRINT_INFO("Info: Waiting on DOCA PCC\n");
+			result = doca_pcc_wait(resources.doca_pcc, cfg.wait_time);
+			if (result != DOCA_SUCCESS) {
+				PRINT_ERROR("Error: Failed to wait PCC\n");
+				goto destroy_pcc;
+			}
 		}
 	}
 
 	PRINT_INFO("Info: Finished waiting on DOCA PCC\n");
+
+	if (cfg.steer_enable)
+		steer_stop();
 
 	exit_status = EXIT_SUCCESS;
 

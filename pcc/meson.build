@@ -27,12 +27,20 @@ host_srcs = files([
 	'host/' + APP_NAME + '_core.c',
 ])
 
-rdmacm_dep = dependency('librdmacm', required: true)
-ibverbs_dep = dependency('libibverbs', required: true)
-peer_sim_sender = static_library('peer_sim_sender', '../peer_sim/peer_sim.c',
-	c_args : base_c_args + ['-DPEER_SIM_NO_MAIN'],
-	include_directories : [app_inc_dirs, '../peer_sim'],
-	dependencies : [rdmacm_dep, ibverbs_dep])
+# Embedded DOCA Flow path-steering module (shared with the standalone
+# doca-flow/doca_flow_steer binary). Runs inside this PCC host process; its
+# steer_update_pcc_rate() is driven by the PCC rate-report trace handler.
+steer_deps = [
+	dependency('libdpdk', required: true),
+	dependency('doca-flow', required: true),
+	dependency('doca-argp', required: true),
+	dependency('doca-dpdk-bridge', required: true),
+	dependency('doca-common', required: true),
+]
+steer_lib = static_library('steer', '../doca-flow/steer.c',
+	c_args : base_c_args,
+	include_directories : [app_inc_dirs, '../doca-flow'],
+	dependencies : steer_deps)
 
 device_code_build_script_name = 'build_device_code.sh'
 device_code_build_script = meson.current_source_dir() / device_code_build_script_name
@@ -78,9 +86,9 @@ pcc_np_switch_telemetry_app = meson.get_compiler('c').find_library(pcc_app_name,
 doca_pcc_test = executable(DOCA_PREFIX + APP_NAME,
 	host_srcs,
 	c_args : base_c_args,
-	include_directories: [app_inc_dirs, './host', '../peer_sim'],
+	include_directories: [app_inc_dirs, './host', '../doca-flow'],
 	install_dir : app_install_dir,
-	dependencies : [app_dependencies, rdmacm_dep, ibverbs_dep, pcc_rp_rtt_template_app, pcc_rp_switch_telemetry_app, pcc_np_switch_telemetry_app],
-	link_with : peer_sim_sender,
+	dependencies : [app_dependencies, steer_deps, pcc_rp_rtt_template_app, pcc_rp_switch_telemetry_app, pcc_np_switch_telemetry_app],
+	link_with : steer_lib,
 	install: install_apps
 )

@@ -29,7 +29,7 @@
 #include <stdio.h>
 #include <ctype.h>
 
-#include "peer_sim.h"
+#include "steer.h"
 
 #include <doca_argp.h>
 
@@ -127,7 +127,7 @@ static int rate_report_trace_handler(void *ctx, struct doca_pcc_bin_report *reps
 			entry->count++;
 			entry->last_rate = rate;
 		}
-		peer_sim_update_pcc_rate(qpn, rate);
+		steer_update_pcc_rate(qpn, rate);
 		latest_report_ts = (uint32_t)reports[i].args[4];
 		received_rate_report = true;
 		rate_reports_total++;
@@ -944,20 +944,19 @@ static doca_error_t coredump_file_callback(void *param, void *config)
 }
 
 /*
- * ARGP Callback - Handle embedded BF3 peer_sim client arguments.
+ * ARGP Callback - Enable embedded DOCA Flow path steering and set the receiver SF number.
  */
-static doca_error_t peer_sim_client_args_callback(void *param, void *config)
+static doca_error_t steer_sf_callback(void *param, void *config)
 {
 	struct pcc_config *pcc_cfg = (struct pcc_config *)config;
-	const char *args = (char *)param;
-	size_t args_len = strnlen(args, MAX_ARG_SIZE);
+	long v = atol((const char *)param);
 
-	if (args_len == 0 || args_len == MAX_ARG_SIZE) {
-		PRINT_ERROR("Error: peer_sim client arguments must be nonempty and no longer than %d characters\n",
-			    MAX_USER_ARG_SIZE);
+	if (v < 0 || v > UINT16_MAX) {
+		PRINT_ERROR("Error: --steer-sf must be in [0, %u]\n", UINT16_MAX);
 		return DOCA_ERROR_INVALID_VALUE;
 	}
-	strncpy(pcc_cfg->peer_sim_client_args, args, args_len + 1);
+	pcc_cfg->steer_enable = true;
+	pcc_cfg->steer_sf_num = (uint32_t)v;
 	return DOCA_SUCCESS;
 }
 
@@ -1032,7 +1031,7 @@ doca_error_t register_pcc_params(void)
 	struct doca_argp_param *gns_ignore_mask_param;
 	struct doca_argp_param *gns_ignore_value_param;
 	struct doca_argp_param *coredump_file_param;
-	struct doca_argp_param *peer_sim_client_args_param;
+	struct doca_argp_param *steer_sf_param;
 	struct doca_argp_param *dpa_resources_file;
 	struct doca_argp_param *dpa_application_key;
 
@@ -1255,20 +1254,20 @@ doca_error_t register_pcc_params(void)
 		return result;
 	}
 
-	/* Create and register embedded peer_sim client arguments parameter */
-	result = doca_argp_param_create(&peer_sim_client_args_param);
+	/* Create and register embedded steering enable + receiver SF number parameter */
+	result = doca_argp_param_create(&steer_sf_param);
 	if (result != DOCA_SUCCESS) {
 		PRINT_ERROR("Error: Failed to create ARGP param: %s\n", doca_error_get_descr(result));
 		return result;
 	}
-	doca_argp_param_set_long_name(peer_sim_client_args_param, "peer-sim-client-args");
-	doca_argp_param_set_arguments(peer_sim_client_args_param, "<path>");
+	doca_argp_param_set_long_name(steer_sf_param, "steer-sf");
+	doca_argp_param_set_arguments(steer_sf_param, "<sf-num>");
 	doca_argp_param_set_description(
-		peer_sim_client_args_param,
-		"Run peer_sim client in this PCC host process; pass its quoted client arguments (optional).");
-	doca_argp_param_set_callback(peer_sim_client_args_param, peer_sim_client_args_callback);
-	doca_argp_param_set_type(peer_sim_client_args_param, DOCA_ARGP_TYPE_STRING);
-	result = doca_argp_register_param(peer_sim_client_args_param);
+		steer_sf_param,
+		"Enable embedded DOCA Flow path steering on the given receiver SF number (optional).");
+	doca_argp_param_set_callback(steer_sf_param, steer_sf_callback);
+	doca_argp_param_set_type(steer_sf_param, DOCA_ARGP_TYPE_STRING);
+	result = doca_argp_register_param(steer_sf_param);
 	if (result != DOCA_SUCCESS) {
 		PRINT_ERROR("Error: Failed to register program param: %s\n", doca_error_get_descr(result));
 		return result;

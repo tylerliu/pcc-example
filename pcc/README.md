@@ -100,27 +100,42 @@ ninja
 
 The DPA archive is regenerated during Meson setup through `pcc/build_device_code.sh` / `dpacc`.
 
-## Embedded `peer_sim` sender
+## Embedded DOCA Flow path steering
 
-For the BF3 sender experiment, the PCC executable can run the `peer_sim` client in the **same host process**. Enable it with `--peer-sim-client-args`, whose value is a quoted, whitespace-delimited `peer_sim --client` argument list:
-
-```bash
-./build/pcc/doca_pcc --device mlx5_0 \
-  --peer-sim-client-args '--client \
-    --local0 172.16.1.2 --peer0 172.16.1.20 \
-    --local1 172.16.2.2 --peer1 172.16.2.20'
-```
-
-The CX7 receiver remains the standalone passive target:
+For the BF3 experiment, the PCC executable can run the **DOCA Flow path-steering
+module** (`../doca-flow/steer.c`) in the **same host process**. Enable it with
+`--steer-sf <N>`, the receiver SF number:
 
 ```bash
-./peer_sim/build/peer_sim --server \
-  --local0 172.16.1.20 --local1 172.16.2.20
+./build/pcc/doca_pcc --device mlx5_0 --steer-sf 0
 ```
 
-There is no rate file, polling IPC, or manual QPN-to-path configuration. After the two BF3 QPs are connected, the sender records their QPNs in two internal slots. Each PCC format-6 trace report directly calls the sender bridge; if its QPN matches a slot, it performs a relaxed atomic update of that path's raw FXP20 rate. The sender's existing single-loop DRR scheduler reads these slots every `--weight-period-ms` (200 ms by default). An older complete rate is acceptable; zero means no rate has arrived yet, so the scheduler retains its current weights until both paths have reported.
+Drive traffic with two RoCE QPs (e.g. `ib_write_bw -q 2 ... -R`); the two QPNs are
+consecutive, so their LSB parity identifies the two virtual paths.
 
-The established-QP logs show the two client QPNs. The existing host-side per-QPN PCC summary remains printed at most once per DPA-timer second, and is the primary visibility point for the trace-to-sender handoff:
+There is no rate file, polling IPC, or manual QPN-to-path configuration. Each PCC
+format-6 trace report calls `steer_update_pcc_rate(qpn, rate)` directly (a relaxed
+atomic store into the per-parity rate slot). Once per second the host loop calls
+`steer_poll()`, which — in AUTO mode — moves the more-congested parity onto the
+alternate virtual path by live-updating the `EGRESS_CLASSIFY` entries, and prints
+the per-path CE-mark / restore counters.
+
+> **Marker mechanism.** The alternate path is marked on the wire with an
+> ICRC-exempt **DSCP bit** (masked modify), *not* a UDP-port rewrite — rewriting the
+> RoCEv2 UDP port breaks ICRC and drops the moved flow. See
+> [`../doca-flow/README.md`](../doca-flow/README.md).
+
+> **Status — embedded path is WIP on DOCA 3.x.** The standalone `doca_flow_steer`
+> (run as two per-PF instances, `--role egress`/`--role ingress`) is
+> hardware-validated. The embedded path is not yet functional on 3.x: `steer_start()`
+> now requires a `doca_dev` + `doca_dev_rep`, and this host program does not yet open
+> and pass them. `--steer-sf` will report *"opts->dev and opts->dev_rep are
+> required"* until that wiring lands. Also note the sender's egress steering must run
+> on the **sender's** PF, which is a separate concern from where the PCC RP context
+> is opened.
+
+The existing host-side per-QPN PCC rate summary is still printed at most once per
+DPA-timer second and remains the primary visibility point for the trace feed:
 
 ```text
 --- Per-flow rate averages (received=... total=...) ---
@@ -129,4 +144,10 @@ The established-QP logs show the two client QPNs. The existing host-side per-QPN
 ---
 ```
 
-This adds no per-path sender workers. The RDMA writes and both logical paths remain in the proven one-thread DRR loop; PCC trace delivery only provides its rate inputs through an internal function call.
+The steering pipeline, options, and the DOCA 2.9/3.x compatibility notes are
+documented in [`../doca-flow/README.md`](../doca-flow/README.md). The same module
+also builds as a standalone `doca_flow_steer` binary there for testing.
+
+> The former `peer_sim` sender/DRR component has been removed; the sender is now
+> just a RoCE traffic generator (e.g. `ib_write_bw`), and DOCA Flow performs the
+> PCC-informed path steering.
