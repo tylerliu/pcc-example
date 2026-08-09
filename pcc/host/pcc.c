@@ -68,23 +68,41 @@ static void sigint_handler(int dummy)
 }
 
 /*
- * Start the embedded DOCA Flow path-steering datapath in this process.
- * EAL is initialized with a minimal argv (a dummy allowlist entry is appended by
- * steer_eal_init); the real device is attached by the module via DOCA.
+ * Start the embedded DOCA Flow path-steering datapath in this process, in the
+ * EGRESS role: this program runs on the sender (the PCC RP), so it sets the
+ * DSCP path marker on the moved QPN parity at SF-egress. The receiver-side
+ * ingress role (CE-mark + restore) runs as a separate doca_flow_steer instance
+ * on the receiver's PF. EAL is initialized with a minimal argv; the device and
+ * SF representor are opened by DOCA argp (-a/-r) and passed in via cfg.
  */
-static doca_error_t start_embedded_steering(char *prog_name, uint32_t sf_num)
+static doca_error_t start_embedded_steering(char *prog_name, const struct pcc_config *cfg)
 {
-	char *eal_argv[1] = {prog_name};
 	struct steer_opts sopts;
 	doca_error_t result;
 
-	result = steer_eal_init(1, eal_argv);
+	(void)prog_name; /* used only on the DOCA 2.9 EAL-init path below */
+	steer_default_opts(&sopts);
+	sopts.role = STEER_ROLE_EGRESS;
+	sopts.move_parity = cfg->steer_move_parity;
+	sopts.sf_num = cfg->steer_sf_num;
+#if DOCA_VERSION_MAJOR >= 3
+	sopts.dev = cfg->steer_dev;
+	sopts.dev_rep = cfg->steer_dev_rep;
+	sopts.devargs = cfg->steer_devargs;
+	if (sopts.dev == NULL || sopts.dev_rep == NULL) {
+		PRINT_ERROR("Error: embedded steering needs a sender SF representor; pass -r pci/<bdf>,<sf>\n");
+		return DOCA_ERROR_INVALID_VALUE;
+	}
+	/* EAL was already initialized in main() (before argp opened the -r device). */
+#else
+	char *eal_argv[1] = {prog_name};
+
+	result = steer_eal_init(1, eal_argv, steer_eal_prefix_for_role(sopts.role));
 	if (result != DOCA_SUCCESS) {
 		PRINT_ERROR("Error: steer EAL init failed: %s\n", doca_error_get_descr(result));
 		return result;
 	}
-	steer_default_opts(&sopts);
-	sopts.sf_num = sf_num;
+#endif
 	result = steer_start(&sopts);
 	if (result != DOCA_SUCCESS)
 		PRINT_ERROR("Error: steer_start failed: %s\n", doca_error_get_descr(result));
@@ -120,6 +138,7 @@ int main(int argc, char **argv)
 	cfg.gns = IFA2_GNS_DEFAULT_VALUE;
 	cfg.gns_ignore_value = IFA2_GNS_IGNORE_DEFAULT_VALUE;
 	cfg.gns_ignore_mask = IFA2_GNS_IGNORE_DEFAULT_MASK;
+	cfg.steer_move_parity = STEER_MOVE_AUTO; /* embedded steering default policy */
 	strcpy(cfg.coredump_file, PCC_COREDUMP_FILE_DEFAULT_PATH);
 	log_level = LOG_LEVEL_INFO;
 
@@ -146,6 +165,28 @@ int main(int argc, char **argv)
 	result = doca_log_backend_set_sdk_level(sdk_log, DOCA_LOG_LEVEL_ERROR);
 	if (result != DOCA_SUCCESS)
 		return EXIT_FAILURE;
+
+	/*
+	 * If embedded steering is requested (-r/--steer-rep), EAL must be up BEFORE
+	 * DOCA argp opens that device/representor, otherwise the later
+	 * doca_dpdk_port_probe_with_representors() fails with a "cmd_fd mismatch /
+	 * Probe again" error. Pre-scan argv and init EAL here; start_embedded_steering()
+	 * then only builds the pipeline. (Embedded steering is always the egress role.)
+	 */
+#if DOCA_VERSION_MAJOR >= 3
+	for (int i = 1; i < argc; i++) {
+		if (strcmp(argv[i], "-r") != 0 && strcmp(argv[i], "--steer-rep") != 0)
+			continue;
+		char *eal_argv[1] = {argv[0]};
+
+		result = steer_eal_init(1, eal_argv, steer_eal_prefix_for_role(STEER_ROLE_EGRESS));
+		if (result != DOCA_SUCCESS) {
+			PRINT_ERROR("Error: steer EAL init failed: %s\n", doca_error_get_descr(result));
+			return EXIT_FAILURE;
+		}
+		break;
+	}
+#endif
 
 	/* Initialize argparser */
 	result = doca_argp_init(NULL, &cfg);
@@ -200,10 +241,10 @@ int main(int argc, char **argv)
 	}
 
 	if (cfg.steer_enable) {
-		result = start_embedded_steering(argv[0], cfg.steer_sf_num);
+		result = start_embedded_steering(argv[0], &cfg);
 		if (result != DOCA_SUCCESS)
 			goto destroy_pcc;
-		PRINT_INFO("Info: Embedded DOCA Flow steering active on SF %u\n", cfg.steer_sf_num);
+		PRINT_INFO("Info: Embedded DOCA Flow egress steering active\n");
 	}
 
 	host_stop = false;

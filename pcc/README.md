@@ -102,37 +102,42 @@ The DPA archive is regenerated during Meson setup through `pcc/build_device_code
 
 ## Embedded DOCA Flow path steering
 
-For the BF3 experiment, the PCC executable can run the **DOCA Flow path-steering
-module** (`../doca-flow/steer.c`) in the **same host process**. Enable it with
-`--steer-sf <N>`, the receiver SF number:
+For the BF3 experiment, the PCC executable runs the **DOCA Flow path-steering
+module** (`../doca-flow/steer.c`) in the **same host process**, in the **egress
+role**: because the PCC RP runs on the sender, `doca_pcc` sets the DSCP path marker
+independently on each sender packet at SF egress. Enable it by passing the sender
+SF representor with `-r` (DOCA 3.x), which also opens the PF device and SF rep the
+steering datapath needs:
 
 ```bash
-./build/pcc/doca_pcc --device mlx5_0 --steer-sf 0
+# sender (PCC RP + embedded egress steering), PF1 / pf1sf0:
+sudo ./build/pcc/doca_pcc --device mlx5_1 -r pci/0000:03:00.1,pf1sf0 <PCC args...>
+
+# receiver side runs the ingress half as a separate standalone instance, PF0:
+sudo ./doca-flow/build/doca_flow_steer -r pci/0000:03:00.0,pf0sf0 --role ingress
 ```
 
-Drive traffic with two RoCE QPs (e.g. `ib_write_bw -q 2 ... -R`); the two QPNs are
-consecutive, so their LSB parity identifies the two virtual paths.
+(`--steer-sf <N>` remains for the DOCA 2.9 discovery path.) Drive traffic with two
+RoCE QPs (e.g. `ib_write_bw -q 2 ... -R`); the receiver hashes the complete destination QPN into one of two stable flow classes.
 
 There is no rate file, polling IPC, or manual QPN-to-path configuration. Each PCC
 format-6 trace report calls `steer_update_pcc_rate(qpn, rate)` directly (a relaxed
-atomic store into the per-parity rate slot). Once per second the host loop calls
-`steer_poll()`, which — in AUTO mode — moves the more-congested parity onto the
-alternate virtual path by live-updating the `EGRESS_CLASSIFY` entries, and prints
-the per-path CE-mark / restore counters.
+atomic store into the existing rate slots). Once per second `steer_poll()` prints
+the egress, QPN-hash, path-mark, and restore-class counters. The current random
+egress hash is fixed and is not live-updated by PCC rates.
 
-> **Marker mechanism.** The alternate path is marked on the wire with an
+> **Marker mechanism.** The the selected virtual path is marked on the wire with an
 > ICRC-exempt **DSCP bit** (masked modify), *not* a UDP-port rewrite — rewriting the
-> RoCEv2 UDP port breaks ICRC and drops the moved flow. See
+> RoCEv2 UDP port breaks ICRC and drops rewritten traffic. See
 > [`../doca-flow/README.md`](../doca-flow/README.md).
 
-> **Status — embedded path is WIP on DOCA 3.x.** The standalone `doca_flow_steer`
-> (run as two per-PF instances, `--role egress`/`--role ingress`) is
-> hardware-validated. The embedded path is not yet functional on 3.x: `steer_start()`
-> now requires a `doca_dev` + `doca_dev_rep`, and this host program does not yet open
-> and pass them. `--steer-sf` will report *"opts->dev and opts->dev_rep are
-> required"* until that wiring lands. Also note the sender's egress steering must run
-> on the **sender's** PF, which is a separate concern from where the PCC RP context
-> is opened.
+> **Status.** The standalone `doca_flow_steer` (two per-PF instances,
+> `--role egress`/`--role ingress`) is hardware-validated. The embedded egress path
+> (`-r`) is wired and builds, but **not yet run on hardware**. The main open risk is
+> **dual-open of the sender PF**: `doca_pcc` opens the PF for the PCC engine, and the
+> embedded steering then probes the same PF into DPDK via DOCA Flow — whether both
+> can coexist in one process is unverified. If the probe fails, the fallback is to
+> share a single `doca_dev` handle between the PCC context and the Flow datapath.
 
 The existing host-side per-QPN PCC rate summary is still printed at most once per
 DPA-timer second and remains the primary visibility point for the trace feed:

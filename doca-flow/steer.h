@@ -9,7 +9,7 @@
  * mode, adjusts which flow is steered onto the "moved" (UDP 4792) virtual path.
  *
  * Lifecycle (embedded):
- *   steer_eal_init(argc, argv);   // once, before other DPDK/EAL users
+ *   steer_eal_init(argc, argv, steer_eal_prefix_for_role(role)); // before other EAL users
  *   steer_start(&opts);           // build the pipeline
  *   ... per PCC trace: steer_update_pcc_rate(qpn, rate);
  *   ... periodically:  steer_poll();   // apply decision + log counters
@@ -59,7 +59,6 @@ struct steer_opts {
 	uint32_t sf_num;			      /* receiver SF number (DOCA 2.9 discovery only) */
 	int role;				      /* enum steer_role */
 	int move_parity;			      /* enum steer_move_parity */
-	doca_be32_t path_dst_ip[STEER_NB_PATHS];      /* per-path outer IPv4 dst (network order) */
 	double path_percent[STEER_NB_PATHS];	      /* per-path CE-mark percentage [0,100] */
 	double auto_ratio_threshold;		      /* AUTO: move parity p when rate[p] < rate[other]*thr */
 	/* DOCA 3.x device discovery: caller opens these (argp --device/--rep or DOCA APIs). */
@@ -72,11 +71,16 @@ struct steer_opts {
 void steer_default_opts(struct steer_opts *opts);
 
 /*
- * Initialize DPDK EAL for the steering datapath. Standalone uses
- * doca_argp_set_dpdk_program(steer_eal_init); an embedded caller invokes it
- * directly (once, before any other EAL user in the process).
+ * Initialize DPDK EAL for the steering datapath. `file_prefix` becomes the DPDK
+ * --file-prefix so this primary process does not collide with another DPDK
+ * primary on the host (e.g. the peer role's steering instance); pass
+ * steer_eal_prefix_for_role(role). Call once, before any other EAL user in the
+ * process.
  */
-doca_error_t steer_eal_init(int argc, char **argv);
+doca_error_t steer_eal_init(int argc, char **argv, const char *file_prefix);
+
+/* A stable, role-specific DPDK --file-prefix ("pcc-egress" / "pcc-ingress" / "pcc-steer"). */
+const char *steer_eal_prefix_for_role(int role);
 
 /* Build the eSwitch pipeline. EAL must already be initialized. */
 doca_error_t steer_start(const struct steer_opts *opts);

@@ -961,6 +961,68 @@ static doca_error_t steer_sf_callback(void *param, void *config)
 }
 
 /*
+ * ARGP Callback - embedded steering move policy: none|even|odd|all|auto.
+ * Default (unset) is AUTO. Does not by itself enable steering (-r does that).
+ */
+static doca_error_t steer_move_callback(void *param, void *config)
+{
+	struct pcc_config *pcc_cfg = (struct pcc_config *)config;
+	const char *s = (const char *)param;
+
+	if (strcmp(s, "none") == 0)
+		pcc_cfg->steer_move_parity = STEER_MOVE_NONE;
+	else if (strcmp(s, "even") == 0 || strcmp(s, "0") == 0)
+		pcc_cfg->steer_move_parity = STEER_MOVE_EVEN;
+	else if (strcmp(s, "odd") == 0 || strcmp(s, "1") == 0)
+		pcc_cfg->steer_move_parity = STEER_MOVE_ODD;
+	else if (strcmp(s, "all") == 0)
+		pcc_cfg->steer_move_parity = STEER_MOVE_ALL;
+	else if (strcmp(s, "auto") == 0)
+		pcc_cfg->steer_move_parity = STEER_MOVE_AUTO;
+	else {
+		PRINT_ERROR("Error: --steer-move must be none|even|odd|all|auto (got '%s')\n", s);
+		return DOCA_ERROR_INVALID_VALUE;
+	}
+	return DOCA_SUCCESS;
+}
+
+#if DOCA_VERSION_MAJOR >= 3
+/*
+ * ARGP Callback - PF device for embedded steering (DOCA 3.x, -a/--steer-dev).
+ * Also enables steering. Usually the same PF the PCC RP runs on.
+ */
+static doca_error_t steer_device_callback(void *param, void *config)
+{
+	struct pcc_config *pcc_cfg = (struct pcc_config *)config;
+	struct doca_argp_device_ctx *dev_ctx = (struct doca_argp_device_ctx *)param;
+
+	pcc_cfg->steer_enable = true;
+	pcc_cfg->steer_dev = dev_ctx->dev;
+	if (dev_ctx->devargs)
+		pcc_cfg->steer_devargs = dev_ctx->devargs;
+	return DOCA_SUCCESS;
+}
+
+/*
+ * ARGP Callback - sender SF representor for embedded steering (DOCA 3.x,
+ * -r/--steer-rep, e.g. "pci/0000:03:00.1,pf1sf0"). Enables steering and provides
+ * both the PF dev and the SF representor that steer_start() needs.
+ */
+static doca_error_t steer_rep_callback(void *param, void *config)
+{
+	struct pcc_config *pcc_cfg = (struct pcc_config *)config;
+	struct doca_argp_device_rep_ctx *rep_ctx = (struct doca_argp_device_rep_ctx *)param;
+
+	pcc_cfg->steer_enable = true;
+	pcc_cfg->steer_dev = rep_ctx->dev_ctx.dev;
+	pcc_cfg->steer_dev_rep = rep_ctx->dev_rep;
+	if (rep_ctx->dev_ctx.devargs)
+		pcc_cfg->steer_devargs = rep_ctx->dev_ctx.devargs;
+	return DOCA_SUCCESS;
+}
+#endif
+
+/*
  * ARGP Callback - Handles DPA resources file path parameter
  *
  * @param[in] param Input parameter
@@ -1272,6 +1334,73 @@ doca_error_t register_pcc_params(void)
 		PRINT_ERROR("Error: Failed to register program param: %s\n", doca_error_get_descr(result));
 		return result;
 	}
+
+	/* Embedded steering move policy (none|even|odd|all|auto). Default AUTO. */
+	struct doca_argp_param *steer_move_param;
+
+	result = doca_argp_param_create(&steer_move_param);
+	if (result != DOCA_SUCCESS) {
+		PRINT_ERROR("Error: Failed to create ARGP param: %s\n", doca_error_get_descr(result));
+		return result;
+	}
+	doca_argp_param_set_long_name(steer_move_param, "steer-move");
+	doca_argp_param_set_arguments(steer_move_param, "<none|even|odd|all|auto>");
+	doca_argp_param_set_description(
+		steer_move_param,
+		"Embedded steering move policy: none|even|odd|all|auto (optional, default auto).");
+	doca_argp_param_set_callback(steer_move_param, steer_move_callback);
+	doca_argp_param_set_type(steer_move_param, DOCA_ARGP_TYPE_STRING);
+	result = doca_argp_register_param(steer_move_param);
+	if (result != DOCA_SUCCESS) {
+		PRINT_ERROR("Error: Failed to register program param: %s\n", doca_error_get_descr(result));
+		return result;
+	}
+
+#if DOCA_VERSION_MAJOR >= 3
+	/* Create and register the sender SF representor param for embedded steering.
+	 * Opens the PF dev + SF rep that steer_start() needs (DOCA 3.x). */
+	struct doca_argp_param *steer_rep_param;
+
+	result = doca_argp_param_create(&steer_rep_param);
+	if (result != DOCA_SUCCESS) {
+		PRINT_ERROR("Error: Failed to create ARGP param: %s\n", doca_error_get_descr(result));
+		return result;
+	}
+	doca_argp_param_set_short_name(steer_rep_param, "r");
+	doca_argp_param_set_long_name(steer_rep_param, "steer-rep");
+	doca_argp_param_set_arguments(steer_rep_param, "<pci/bdf,sf>");
+	doca_argp_param_set_description(
+		steer_rep_param,
+		"Enable embedded DOCA Flow egress steering on the given sender SF representor, e.g. pci/0000:03:00.1,pf1sf0 (optional, DOCA 3.x).");
+	doca_argp_param_set_callback(steer_rep_param, steer_rep_callback);
+	doca_argp_param_set_type(steer_rep_param, DOCA_ARGP_TYPE_DEVICE_REP);
+	result = doca_argp_register_param(steer_rep_param);
+	if (result != DOCA_SUCCESS) {
+		PRINT_ERROR("Error: Failed to register program param: %s\n", doca_error_get_descr(result));
+		return result;
+	}
+
+	/* Optional explicit PF device for steering (defaults to the -r device). */
+	struct doca_argp_param *steer_dev_param;
+
+	result = doca_argp_param_create(&steer_dev_param);
+	if (result != DOCA_SUCCESS) {
+		PRINT_ERROR("Error: Failed to create ARGP param: %s\n", doca_error_get_descr(result));
+		return result;
+	}
+	doca_argp_param_set_short_name(steer_dev_param, "a");
+	doca_argp_param_set_long_name(steer_dev_param, "steer-dev");
+	doca_argp_param_set_arguments(steer_dev_param, "<pci/bdf>");
+	doca_argp_param_set_description(steer_dev_param,
+				       "Explicit PF device for embedded steering (optional, DOCA 3.x).");
+	doca_argp_param_set_callback(steer_dev_param, steer_device_callback);
+	doca_argp_param_set_type(steer_dev_param, DOCA_ARGP_TYPE_DEVICE);
+	result = doca_argp_register_param(steer_dev_param);
+	if (result != DOCA_SUCCESS) {
+		PRINT_ERROR("Error: Failed to register program param: %s\n", doca_error_get_descr(result));
+		return result;
+	}
+#endif
 
 	/* Create and register DPA resources file parameter */
 	result = doca_argp_param_create(&dpa_resources_file);

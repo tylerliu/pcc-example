@@ -90,24 +90,6 @@ static doca_error_t role_cb(void *param, void *config)
 	return DOCA_SUCCESS;
 }
 
-static doca_error_t p0ip_cb(void *param, void *config)
-{
-	struct steer_opts *o = config;
-
-	if (inet_pton(AF_INET, (const char *)param, &o->path_dst_ip[0]) != 1)
-		return DOCA_ERROR_INVALID_VALUE;
-	return DOCA_SUCCESS;
-}
-
-static doca_error_t p1ip_cb(void *param, void *config)
-{
-	struct steer_opts *o = config;
-
-	if (inet_pton(AF_INET, (const char *)param, &o->path_dst_ip[1]) != 1)
-		return DOCA_ERROR_INVALID_VALUE;
-	return DOCA_SUCCESS;
-}
-
 static doca_error_t p0pct_cb(void *param, void *config)
 {
 	struct steer_opts *o = config;
@@ -180,6 +162,8 @@ static void reg(const char *name, const char *desc, doca_argp_param_cb_t cb)
 	CRASH(doca_argp_register_param(pm), "argp_register_param");
 }
 
+static const char *g_eal_prefix = "pcc-steer";
+
 int main(int argc, char **argv)
 {
 	struct doca_log_backend *sdk_log;
@@ -193,12 +177,38 @@ int main(int argc, char **argv)
 	steer_default_opts(&opts);
 	opts.move_parity = STEER_MOVE_NONE; /* standalone default: static, no rewrite */
 
+	/*
+	 * Pre-scan --role for the DPDK --file-prefix. EAL itself is brought up by
+	 * doca_argp via doca_argp_set_dpdk_program(eal_cb) DURING doca_argp_start, so
+	 * the -r device/representor is opened DPDK-aware and the later probe does not
+	 * hit "cmd_fd mismatch / Probe again".
+	 */
+	int pre_role = STEER_ROLE_BOTH;
+
+	for (int i = 1; i + 1 < argc; i++) {
+		if (strcmp(argv[i], "--role") != 0)
+			continue;
+		const char *v = argv[i + 1];
+
+		if (!strcmp(v, "egress") || !strcmp(v, "sender"))
+			pre_role = STEER_ROLE_EGRESS;
+		else if (!strcmp(v, "ingress") || !strcmp(v, "receiver"))
+			pre_role = STEER_ROLE_INGRESS;
+		else
+			pre_role = STEER_ROLE_BOTH;
+		break;
+	}
+	g_eal_prefix = steer_eal_prefix_for_role(pre_role);
+
+	/* Init EAL independently (like doca_pcc) before argp opens the -r device.
+	 * No doca_argp_set_dpdk_program, so no "--" split is needed on the CLI. */
+	char *eal_argv[1] = {argv[0]};
+
+	CRASH(steer_eal_init(1, eal_argv, g_eal_prefix), "steer_eal_init");
+
 	CRASH(doca_argp_init("doca_flow_steer", &opts), "doca_argp_init");
-	doca_argp_set_dpdk_program(steer_eal_init);
 	reg("sf-num", "Receiver SF number (en3f0pf0sf<N>). Default: 0", sf_num_cb);
-	reg("move-parity", "QPN parity moved to the 4792 path: none|even|odd|auto. Default: none", move_cb);
-	reg("path0-ip", "Path 0 outer IPv4 dst. Default: 172.16.1.20", p0ip_cb);
-	reg("path1-ip", "Path 1 outer IPv4 dst. Default: 172.16.2.20", p1ip_cb);
+	reg("move-parity", "QPN parity moved to the other path: none|even|odd|all|auto. Default: none", move_cb);
 	reg("path0-percent", "Path 0 CE-mark percent [0,100]. Default: 100", p0pct_cb);
 	reg("path1-percent", "Path 1 CE-mark percent [0,100]. Default: 100", p1pct_cb);
 	reg("role", "Which half to build: egress (sender) | ingress (receiver) | both. Default: both", role_cb);
