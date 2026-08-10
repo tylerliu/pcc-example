@@ -53,6 +53,12 @@ The host filters format ID 6 records and tracks up to 256 QPNs. For every QPN it
 - number of received rate reports;
 - most recently received rate.
 
+On BF3, `doca_pcc_dev_get_flow_qpn()` is valid only for RoCE TX events. The
+device program caches that sender-local QPN in the per-flow algorithm context;
+CNP/ACK/NACK rate changes are attributed through the cached owner. Feedback
+events received before an owner TX event are not emitted as per-QPN reports.
+This avoids interpreting the feedback-event union as a TX QPN field.
+
 When a rate report arrives and at least one DPA-timer second has elapsed since the prior summary, the host prints a cumulative summary:
 
 ```text

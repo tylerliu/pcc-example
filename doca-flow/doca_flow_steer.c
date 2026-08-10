@@ -209,8 +209,8 @@ int main(int argc, char **argv)
 	CRASH(doca_argp_init("doca_flow_steer", &opts), "doca_argp_init");
 	reg("sf-num", "Receiver SF number (en3f0pf0sf<N>). Default: 0", sf_num_cb);
 	reg("move-parity", "QPN parity moved to the other path: none|even|odd|all|auto. Default: none", move_cb);
-	reg("path0-percent", "Path 0 CE-mark percent [0,100]. Default: 100", p0pct_cb);
-	reg("path1-percent", "Path 1 CE-mark percent [0,100]. Default: 100", p1pct_cb);
+	reg("path0-percent", "Path 0 intended all-traffic CE percent [0,100]; selected-class sampling is 2x, capped at 100. Default: 100", p0pct_cb);
+	reg("path1-percent", "Path 1 intended all-traffic CE percent [0,100]; selected-class sampling is 2x, capped at 100. Default: 100", p1pct_cb);
 	reg("role", "Which half to build: egress (sender) | ingress (receiver) | both. Default: both", role_cb);
 #if DOCA_VERSION_MAJOR >= 3
 	reg_dev("a", "device", "DOCA device, e.g. pci/0000:03:00.0,dv_flow_en=2", device_cb, DOCA_ARGP_TYPE_DEVICE);

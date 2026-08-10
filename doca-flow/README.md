@@ -3,10 +3,10 @@
 `doca_flow_steer` is the DOCA Flow half of the two-path PCC experiment. It runs on
 the **BF3 eSwitch** over a **p0↔p1 200G DAC loopback**. Sender packets are
 assigned per packet to one of two virtual paths using `parser_meta.random`; the
-selected path is carried in an **ICRC-exempt DSCP bit**. On ingress, traffic is
-CE-marked per path, then a stable full-24-bit-QPN hash assigns each flow to class
-0 or class 1. ECN is retained only when the QPN class equals the packet path; it
-is stripped otherwise. The DSCP marker is always cleared before SF delivery.
+selected path is carried in an **ICRC-exempt DSCP bit**. On ingress, the path is
+selected first and then processed by its own full-24-bit-QPN hash marker. Path 0
+marks only class 0 and path 1 marks only class 1. Unselected classes are never
+artificially marked. The DSCP marker is always cleared before SF delivery.
 Because the marker is a DSCP bit, both classes may share one receiver IP.
 
 ## Why a DSCP bit and not the UDP port
@@ -43,8 +43,9 @@ selected by `--role`:
                                    p0 ══ 200G DAC ══ p1   (loopback)
 
   ── receiver side (PF0, --role ingress) ─────────────────────────────────────
-  p0 wire ─ PORT_DEMUX ─ INGRESS_ROCE_CHECK ─ INGRESS_PATH_DEMUX ─ MARK/SAMPLE
-                                                       ─ INGRESS_QPN_HASH ─ RESTORE_CLASS0/1 ─ receiver SF
+  p0 wire ─ PORT_DEMUX ─ INGRESS_ROCE_CHECK ─ INGRESS_PATH_DEMUX
+                                      ├─ PATH0_QPN_HASH ─ class0 ─ SAMPLE/MARK ─ receiver SF
+                                      └─ PATH1_QPN_HASH ─ class1 ─ SAMPLE/MARK ─ receiver SF
   receiver SF egress (ACK/CNP) ─ PORT_DEMUX ─ DELIVER_WIRE (untouched)
 ```
 
@@ -62,17 +63,16 @@ case). Logical flow-port ids: **0 = PF uplink (wire), 1 = SF representor**.
 | `EGRESS_ROCE_CHECK` | egress | IPv4 RoCEv2, UDP dst 4791 | hit → `EGRESS_CLASSIFY`; miss → `DELIVER_WIRE` unchanged |
 | `EGRESS_CLASSIFY` | egress | `parser_meta.random` | two buckets write DSCP path 0/1; → `DELIVER_WIRE` |
 | `INGRESS_ROCE_CHECK` | ingress | IPv4 RoCEv2, UDP dst 4791 | hit → `INGRESS_PATH_DEMUX`; miss → `DELIVER_SF` unchanged |
-| `INGRESS_PATH_DEMUX` | ingress | DSCP path bit (`0x04`) | path 0/1 → its CE target; miss → `INGRESS_QPN_HASH` |
-| `RANDOM_SAMPLE_P{0,1}` | ingress | `parser_meta.random` mask | optional per-path sampling; hit → mark, miss → QPN hash |
-| `INGRESS_MARK` | ingress | DSCP path bit | masked ECN=CE write; → `INGRESS_QPN_HASH` |
-| `INGRESS_QPN_HASH` | ingress | IPv4/RoCEv2 selectors + full 24-bit BTH `dest_qp` | stable two-bucket flow classification; bucket n → `RESTORE_CLASSn` |
-| `INGRESS_RESTORE_CLASS{0,1}` | ingress | DSCP path bit only | class==path: clear marker and keep ECN; otherwise clear marker and strip ECN |
+| `INGRESS_PATH_DEMUX` | ingress | DSCP path bit (`0x04`) | path n → `PATHn_QPN_HASH`; miss → `INGRESS_CLEAR_PATH` |
+| `PATH{0,1}_QPN_HASH` | ingress | IPv4/RoCEv2 selectors + full 24-bit BTH `dest_qp` | class==path → sampling/marking; other class → `INGRESS_CLEAR_PATH` |
+| `RANDOM_SAMPLE_P{0,1}` | ingress | `parser_meta.random` mask | optional selected-class sampling; hit → path marker, miss → `INGRESS_CLEAR_PATH` |
+| `PATH{0,1}_CE_MARK` | ingress | selected class packets | set ECN=CE and clear DSCP path bit; → `DELIVER_SF` |
+| `INGRESS_CLEAR_PATH` | ingress | all IPv4 | preserve ECN, clear DSCP path bit; → `DELIVER_SF` |
 | `DELIVER_SF` / `DELIVER_WIRE` | all | all IPv4 (dscp wildcard) | forward to SF(1) / wire(0). On 3.x HWS a pipe's `fwd_miss` may not be a port, so port delivery goes through these `FWD_PIPE` targets. |
 
-**Measure per path, signal per QPN class.** Marking occurs before QPN hashing, so
-path counters measure the offered traffic on each virtual path. The full-QPN hash
-is stable per flow. Each restore-class pipe retains CE only for its selected path,
-preventing the other path from producing congestion feedback for that class.
+**Two independent ECN markers.** Path selection occurs before QPN hashing. Each
+path has an independent full-QPN hash pipe and only its matching class can enter
+that path marker. The other class bypasses marking and preserves existing ECN.
 
 ## Build
 
@@ -112,7 +112,7 @@ one host and need no `--`/`-a` on the CLI. See the tutorial's
 `setup_roce_loopback.sh` for the SF/loopback/namespace setup.
 
 ```bash
-# receiver side (PF0): mark by path, hash full QPN, keep/strip ECN by class
+# receiver side (PF0): choose path, run that paths QPN-class ECN marker
 sudo ./build/doca_flow_steer -r pci/0000:03:00.0,pf0sf0 --role ingress
 
 # sender side (PF1): randomly write DSCP path 0 or 1 per packet
@@ -125,25 +125,48 @@ sudo ./build/doca_flow_steer -r pci/0000:03:00.1,pf1sf0 --role egress
 | `-a pci/<bdf>[,...]` | optional explicit PF device | derived from `-r` |
 | `--role egress\|ingress\|both` | which half of the pipeline to build | both |
 | `--move-parity ...` | legacy option; ignored by the fixed random-hash egress pipe | auto |
-| `--path0-percent` / `--path1-percent` | per-path CE-mark percentage (rounded down to a power-of-two fraction; 0 and 100 exact) | 100 / 100 |
+| `--path0-percent` / `--path1-percent` | intended CE percentage over all path traffic; selected-class sampling uses `min(2x, 100%)`, then rounds down to a supported power-of-two fraction | 100 / 100 |
 | `--sf-num N` | receiver SF number (DOCA 2.9 discovery only) | 0 |
 
 The two virtual paths are distinguished purely by the DSCP path bit; both may
-share one receiver destination IP. The ingress instance prints per-path marking,
-full-QPN hash buckets, and all four class/path restore counters once per second.
+share one receiver destination IP. The ingress instance prints both paths
+full-QPN hash buckets, selected-class CE-mark counters, and the shared
+unmarked/path-bit-cleared counter once per second.
 
-## Hash and restore validation
+## Per-path ECN-marker validation
 
-Ingress uses regular `HASH` over all 24 destination-QPN bits. The hash template
-contains the IPv4 and RoCEv2 selectors but does not include UDP dst in the hash
-key. Hardware testing with 16 QPNs produced an approximately 50/50 bucket split.
-The earlier partial-QPN basic match and `IDENTITY` experiment have been removed;
-two DSCP-only restore-class pipes are selected directly by the QPN hash buckets.
+Ingress first demultiplexes on the DSCP path bit, then sends each path through
+its own regular `HASH` pipe over all 24 destination-QPN bits. Path 0 selects hash
+class 0 for optional sampling and CE marking; path 1 selects class 1. The other
+class and sampling misses bypass marking. Both outcomes clear only the private
+DSCP path bit before SF delivery, preserving any pre-existing ECN on unmarked
+packets. The hash templates contain the IPv4 and RoCEv2 selectors but do not
+include UDP dst in the hash key.
+
+Because only the matching QPN class, approximately half of each path, is
+eligible for new CE marking, its sampler runs at twice the configured intended
+all-traffic rate. The selected-class rate is capped at 100%, so intended rates
+above 50% cannot be fully realized by this class-selective design.
+
+For the next control-plane experiment, the egress role also creates an isolated
+`EGRESS_QPN_HASH_CALC` profile with the identical full-QPN selectors. It is not
+connected to packet forwarding. On the first PCC report for each QPN,
+`doca_flow_pipe_calc_hash()` logs the raw hash and `hash % 2` bucket. These values
+can be compared with receiver-side flow placement before they are used for ratio
+control.
+
+The egress diagnostic also retains the latest PCC rate for each observed QPN and
+prints a proposed 64-bucket path share once per host poll. QPNs at the full rate
+(`1 << 20`) are excluded from reduced-rate sums. If both groups have reduced
+flows, each path share is proportional to its group sum; if exactly one entire
+group is full-rate, it receives 61 of 64 buckets. This result is logging-only:
+the two-entry egress hash pipe and its 50/50 forwarding behavior are unchanged.
 
 ## Status
 
-- **Hardware-validated on DOCA 3.4:** random DSCP path assignment, per-path CE marking,
-  full-24-bit-QPN hashing across 16 QPs, and DSCP-only class restore construction.
+- **Previously hardware-validated on DOCA 3.4:** random DSCP path assignment and
+  full-24-bit-QPN hashing across 16 QPs. The new path-first, two-marker ingress
+  topology still requires hardware validation.
 - Standalone runs as two per-PF instances; the embedded `doca_pcc` path still needs
   `dev`/`dev_rep` provisioning (see below).
 - On teardown you may see `EGRESS_CLASSIFY entry remove completed with failure` —
