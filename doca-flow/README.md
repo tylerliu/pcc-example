@@ -134,14 +134,11 @@ full-QPN hash buckets, and all four class/path restore counters once per second.
 
 ## Hash and restore validation
 
-DOCA 3.4 rejects `IDENTITY` over the masked QPN LSB with “Number of fields in
-identity algo must be one”. The implementation therefore falls back to regular
-`HASH` over all 24 QPN bits. The hash template must contain the IPv4 and RoCEv2
-selectors but must not include UDP dst in the hash key. Hardware testing with 16
-QPNs produced an approximately 50/50 bucket split. The earlier basic-pipe
-`dest_qp[2] & 1` match was invalid on this path: only off-diagonal entries matched
-and the remaining packets missed. It has been removed in favor of two DSCP-only
-restore-class pipes selected directly by the QPN hash buckets.
+Ingress uses regular `HASH` over all 24 destination-QPN bits. The hash template
+contains the IPv4 and RoCEv2 selectors but does not include UDP dst in the hash
+key. Hardware testing with 16 QPNs produced an approximately 50/50 bucket split.
+The earlier partial-QPN basic match and `IDENTITY` experiment have been removed;
+two DSCP-only restore-class pipes are selected directly by the QPN hash buckets.
 
 ## Status
 

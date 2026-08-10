@@ -868,7 +868,7 @@ static void add_classify_entries(struct doca_flow_pipe *pipe, struct doca_flow_p
 }
 
 /* EGRESS_ROCE_CHECK (non-root): admit only IPv4 RoCEv2 on UDP 4791 to
- * the QP exemption/classification chain. All other SF-egress traffic bypasses
+ * the random path classifier. All other SF-egress traffic bypasses
  * the hash pipe and is delivered to the wire unchanged. */
 static struct doca_flow_pipe *create_roce_check_pipe(struct doca_flow_port *port, const char *name,
                                                      struct doca_flow_pipe *roce_target,
@@ -985,80 +985,60 @@ static void create_port_demux_pipe(struct doca_flow_port *port, struct doca_flow
 
 /* CLI parsing lives in the standalone main (doca_flow_steer.c). */
 
-/* Build an ingress QPN diagnostic hash in front of path demux. Try direct
- * mapping of the QPN LSB first; if DOCA rejects it, retry with the regular hash
- * over all 24 QPN bits. Both buckets forward unchanged to the existing chain. */
-static struct doca_flow_pipe *create_qpn_diag_pipe(struct doca_flow_port *port,
+/* Hash the complete 24-bit RoCE destination QPN into one of two stable
+ * classes. IPv4 and RoCEv2 are selectors for the BTH extraction profile; they
+ * are not additional policy fields. */
+static struct doca_flow_pipe *create_qpn_hash_pipe(struct doca_flow_port *port,
                                                    struct doca_flow_pipe *targets[NB_PATHS],
-                                                   struct doca_flow_pipe_entry *entries[NB_PATHS],
-                                                   bool *identity_lsb)
+                                                   struct doca_flow_pipe_entry *entries[NB_PATHS])
 {
-	struct doca_flow_pipe *pipe = NULL;
-	doca_error_t err = DOCA_ERROR_INVALID_VALUE;
+	struct doca_flow_match match_mask = {0};
+	struct doca_flow_monitor monitor = {.counter_type = DOCA_FLOW_RESOURCE_TYPE_NON_SHARED};
+	struct doca_flow_fwd fwd = {.type = DOCA_FLOW_FWD_CHANGEABLE};
+	struct doca_flow_pipe_cfg *cfg;
+	struct doca_flow_pipe *pipe;
+	doca_error_t err;
 
-	for (int attempt = 0; attempt < 2; attempt++) {
-		struct doca_flow_match match_mask = {0};
-		struct doca_flow_monitor monitor = {.counter_type = DOCA_FLOW_RESOURCE_TYPE_NON_SHARED};
-		struct doca_flow_fwd fwd = {.type = DOCA_FLOW_FWD_CHANGEABLE};
-		struct doca_flow_pipe_cfg *cfg;
-		uint32_t algo;
+	match_mask.outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;
+	match_mask.outer.l4_type_ext = DOCA_FLOW_L4_TYPE_EXT_ROCE_V2;
+	memset(match_mask.outer.roce_v2.bth.dest_qp, 0xFF,
+	       sizeof(match_mask.outer.roce_v2.bth.dest_qp));
 
-		if (attempt == 0) {
-			match_mask.outer.roce_v2.bth.dest_qp[2] = 0x01;
-			algo = DOCA_FLOW_PIPE_HASH_MAP_ALGORITHM_IDENTITY;
-		} else {
-			/* Unlike a basic-pipe predecessor, the hash extraction profile must
-			 * describe its own protocol context so HW exposes the BTH QPN. */
-			match_mask.outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;
-			match_mask.outer.l4_type_ext = DOCA_FLOW_L4_TYPE_EXT_ROCE_V2;
-			memset(match_mask.outer.roce_v2.bth.dest_qp, 0xFF,
-			       sizeof(match_mask.outer.roce_v2.bth.dest_qp));
-			algo = DOCA_FLOW_PIPE_HASH_MAP_ALGORITHM_HASH;
-		}
-
-		err = doca_flow_pipe_cfg_create(&cfg, port);
-		crash_if_unsuccessful(err, "pipe_cfg_create (QPN diagnostic)");
-		crash_if_unsuccessful(doca_flow_pipe_cfg_set_name(cfg, "INGRESS_QPN_HASH"),
-		                      "pipe_cfg_set_name (QPN diagnostic)");
-		crash_if_unsuccessful(doca_flow_pipe_cfg_set_type(cfg, DOCA_FLOW_PIPE_HASH),
-		                      "pipe_cfg_set_type (QPN diagnostic)");
-		crash_if_unsuccessful(doca_flow_pipe_cfg_set_domain(cfg, DOCA_FLOW_PIPE_DOMAIN_DEFAULT),
-		                      "pipe_cfg_set_domain (QPN diagnostic)");
-		crash_if_unsuccessful(doca_flow_pipe_cfg_set_is_root(cfg, false),
-		                      "pipe_cfg_set_is_root (QPN diagnostic)");
-		crash_if_unsuccessful(doca_flow_pipe_cfg_set_nr_entries(cfg, NB_PATHS),
-		                      "pipe_cfg_set_nr_entries (QPN diagnostic)");
-		crash_if_unsuccessful(doca_flow_pipe_cfg_set_hash_map_algorithm(cfg, algo),
-		                      "pipe_cfg_set_hash_map_algorithm (QPN diagnostic)");
-		crash_if_unsuccessful(doca_flow_pipe_cfg_set_match(cfg, NULL, &match_mask),
-		                      "pipe_cfg_set_match (QPN diagnostic)");
-		crash_if_unsuccessful(doca_flow_pipe_cfg_set_monitor(cfg, &monitor),
-		                      "pipe_cfg_set_monitor (QPN diagnostic)");
-
-		err = doca_flow_pipe_create(cfg, &fwd, NULL, &pipe);
-		doca_flow_pipe_cfg_destroy(cfg);
-		if (err == DOCA_SUCCESS) {
-			*identity_lsb = (attempt == 0);
-			break;
-		}
-		DOCA_LOG_WARN("QPN IDENTITY/LSB pipe rejected (%s); retrying full-QPN hash",
-		              doca_error_get_descr(err));
-	}
-	crash_if_unsuccessful(err, "pipe_create (QPN diagnostic fallback)");
+	err = doca_flow_pipe_cfg_create(&cfg, port);
+	crash_if_unsuccessful(err, "pipe_cfg_create (QPN hash)");
+	crash_if_unsuccessful(doca_flow_pipe_cfg_set_name(cfg, "INGRESS_QPN_HASH"),
+	                      "pipe_cfg_set_name (QPN hash)");
+	crash_if_unsuccessful(doca_flow_pipe_cfg_set_type(cfg, DOCA_FLOW_PIPE_HASH),
+	                      "pipe_cfg_set_type (QPN hash)");
+	crash_if_unsuccessful(doca_flow_pipe_cfg_set_domain(cfg, DOCA_FLOW_PIPE_DOMAIN_DEFAULT),
+	                      "pipe_cfg_set_domain (QPN hash)");
+	crash_if_unsuccessful(doca_flow_pipe_cfg_set_is_root(cfg, false),
+	                      "pipe_cfg_set_is_root (QPN hash)");
+	crash_if_unsuccessful(doca_flow_pipe_cfg_set_nr_entries(cfg, NB_PATHS),
+	                      "pipe_cfg_set_nr_entries (QPN hash)");
+	crash_if_unsuccessful(doca_flow_pipe_cfg_set_hash_map_algorithm(
+	                         cfg, DOCA_FLOW_PIPE_HASH_MAP_ALGORITHM_HASH),
+	                      "pipe_cfg_set_hash_map_algorithm (QPN hash)");
+	crash_if_unsuccessful(doca_flow_pipe_cfg_set_match(cfg, NULL, &match_mask),
+	                      "pipe_cfg_set_match (QPN hash)");
+	crash_if_unsuccessful(doca_flow_pipe_cfg_set_monitor(cfg, &monitor),
+	                      "pipe_cfg_set_monitor (QPN hash)");
+	err = doca_flow_pipe_create(cfg, &fwd, NULL, &pipe);
+	crash_if_unsuccessful(err, "pipe_create (QPN hash)");
+	doca_flow_pipe_cfg_destroy(cfg);
 
 	struct entry_batch_status status = {0};
 	for (uint32_t bucket = 0; bucket < NB_PATHS; bucket++) {
-		struct doca_flow_monitor monitor = {.counter_type = DOCA_FLOW_RESOURCE_TYPE_NON_SHARED};
+		struct doca_flow_monitor entry_monitor = {.counter_type = DOCA_FLOW_RESOURCE_TYPE_NON_SHARED};
 		struct doca_flow_fwd entry_fwd = {.type = DOCA_FLOW_FWD_PIPE, .next_pipe = targets[bucket]};
 		uint32_t flags = (bucket == 0) ? STEER_WAIT_FOR_BATCH : 0;
 
-		err = doca_flow_pipe_hash_add_entry(0, pipe, bucket, 0, NULL, &monitor, &entry_fwd, flags,
+		err = doca_flow_pipe_hash_add_entry(0, pipe, bucket, 0, NULL, &entry_monitor, &entry_fwd, flags,
 		                                    &status, &entries[bucket]);
 		crash_if_unsuccessful(err, "pipe_hash_add_entry (QPN bucket=%u)", bucket);
 	}
-	process_entries(port, &status, NB_PATHS, "QPN diagnostic entries");
-	DOCA_LOG_INFO("Ingress QPN diagnostic ready: %s",
-	              *identity_lsb ? "IDENTITY/LSB" : "HASH/full QPN");
+	process_entries(port, &status, NB_PATHS, "QPN hash entries");
+	DOCA_LOG_INFO("Ingress QPN hash ready: HASH/full QPN");
 	return pipe;
 }
 
@@ -1091,7 +1071,6 @@ struct steer_state {
 	struct doca_flow_pipe_entry *mark_entry[NB_PATHS];
 	struct doca_flow_pipe_entry *restore_entry[NB_PATHS * NB_PATHS]; /* [qpn_class*NB_PATHS + path] */
 	struct doca_flow_pipe_entry *qpn_hash_entry[NB_PATHS];
-	bool qpn_hash_identity_lsb;
 	_Atomic uint32_t rate[NB_PATHS]; /* per-parity PCC rate (FXP20) */
 	int applied_move;		 /* enum steer_move_parity currently programmed */
 };
@@ -1233,9 +1212,8 @@ doca_error_t steer_start(const struct steer_opts *opts)
 		}
 
 		struct doca_flow_pipe *qpn_hash =
-			create_qpn_diag_pipe(g_steer.port, restore_class,
-			                     g_steer.qpn_hash_entry,
-			                     &g_steer.qpn_hash_identity_lsb);
+			create_qpn_hash_pipe(g_steer.port, restore_class,
+			                     g_steer.qpn_hash_entry);
 		struct doca_flow_pipe *mark_pipe = create_mark_pipe(g_steer.port, qpn_hash);
 		add_mark_entries(mark_pipe, g_steer.port, &g_steer.opts, g_steer.mark_entry);
 
@@ -1300,8 +1278,7 @@ void steer_poll(void)
 	for (int bucket = 0; bucket < NB_PATHS; bucket++) {
 		if (g_steer.qpn_hash_entry[bucket] &&
 		    doca_flow_resource_query_entry(g_steer.qpn_hash_entry[bucket], &q) == DOCA_SUCCESS)
-			DOCA_LOG_INFO("ingress: QPN bucket%d (%s): %lu pkts", bucket,
-			              g_steer.qpn_hash_identity_lsb ? "IDENTITY/LSB" : "HASH/full",
+			DOCA_LOG_INFO("ingress: QPN bucket%d (HASH/full): %lu pkts", bucket,
 			              q.counter.total_pkts);
 	}
 
