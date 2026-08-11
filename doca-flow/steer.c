@@ -2,7 +2,7 @@
  *
  * Egress admits IPv4 RoCEv2/UDP 4791 and uses parser_meta.random to write a
  * two-way DSCP path marker. Ingress first demuxes by path, then runs one
- * full-QPN hash marker per path. Only class==path may be newly CE-marked; all
+ * learned exact-QPN marker per path. Only receiver-QPN LSB==path may be newly CE-marked; all
  * branches clear the private path marker before SF delivery.
  */
 
@@ -14,8 +14,12 @@
 #include "steer.h"
 #include <rte_byteorder.h>
 #include <rte_eal.h>
+#include <rte_ether.h>
 #include <rte_ethdev.h>
 #include <rte_flow.h>
+#include <rte_ip.h>
+#include <rte_mbuf.h>
+#include <rte_udp.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -31,10 +35,20 @@ DOCA_LOG_REGISTER(FLOW_STEER);
 #define NB_COUNTERS 16
 #define PCC_FULL_RATE (1u << 20)
 #define MAX_RATE_FLOWS 256u
+#define MAX_CM_CONNECTIONS 256u
+#define MAX_CNP_TRACKED_QPS 64u
 #define PATH_SHARE_BUCKETS 64u
 #define PATH_SHARE_MIN_BUCKETS 3u
 
 #define ROCE_UDP_PORT_NATIVE 4791
+#define QP1_QPN 1u
+#define QP1_CLONE_QUEUE 0u
+#define QP1_RX_BURST 32u
+#define QP1_RX_MAX_BURSTS 16u
+#define IB_MGMT_CLASS_CM 0x07u
+#define IB_CM_ATTR_REQ 0x0010u
+#define IB_CM_ATTR_REP 0x0013u
+#define ROCE_BTH_OPCODE_CNP 0x81u
 #define ROCE_UDP_PORT_MOVED 4792 /* legacy: UDP-port marker (breaks RoCEv2 ICRC; no longer used) */
 #define IP4_DSCP_ECN_CE 0x03	 /* ECN=11 (CE); set masked so DSCP is preserved */
 #define IP4_ECN_MASK 0x03	 /* the two ECN bits of the ToS byte */
@@ -180,6 +194,7 @@ doca_error_t steer_eal_init(int argc, char **argv, const char *file_prefix)
 }
 
 static uint32_t g_sf_num; /* used only on the DOCA 2.9 discovery path */
+static uint16_t g_dpdk_rx_port_id = UINT16_MAX;
 
 #if DOCA_VERSION_MAJOR >= 3
 
@@ -240,6 +255,7 @@ static void configure_and_start_dpdk_port(struct doca_dev *dev)
 	doca_error_t err = doca_dpdk_get_first_port_id(dev, &first_port_id);
 
 	crash_if_unsuccessful(err, "doca_dpdk_get_first_port_id");
+	g_dpdk_rx_port_id = first_port_id;
 
 	struct rte_mempool *mp = rte_pktmbuf_pool_create("mbuf_pool", 8192, 0, 0, RTE_MBUF_DEFAULT_BUF_SIZE,
 							 rte_eth_dev_socket_id(first_port_id));
@@ -633,7 +649,7 @@ static struct doca_flow_pipe *create_path_demux_pipe(struct doca_flow_port *port
 		crash_if_unsuccessful(err, "pipe_add_entry (path demux %d)", i);
 	}
 	process_entries(port, &status, NB_PATHS, "path demux entries");
-	DOCA_LOG_INFO("Path demux ready: path0->PATH0_QPN_HASH path1->PATH1_QPN_HASH by DSCP bit 0x%02x",
+	DOCA_LOG_INFO("Path demux ready: path0->PATH0_QPN_MATCH path1->PATH1_QPN_MATCH by DSCP bit 0x%02x",
 	              PATH_DSCP_MASK);
 	return pipe;
 }
@@ -776,6 +792,151 @@ static struct doca_flow_pipe *create_roce_check_pipe(struct doca_flow_port *port
 	DOCA_LOG_INFO("%s ready: IPv4 RoCEv2 UDP %u admitted; other traffic bypasses", name,
 	              ROCE_UDP_PORT_NATIVE);
 	return pipe;
+}
+
+/* Shared terminal software target for QP1 clones from both directions. */
+static struct doca_flow_pipe *create_qp1_rss_pipe(struct doca_flow_port *port, const char *name,
+						  uint16_t queue)
+{
+	struct doca_flow_match match = {0}, match_mask = {0}, entry_match = {0};
+	struct doca_flow_fwd fwd = {0};
+	struct doca_flow_pipe_cfg *cfg;
+	struct doca_flow_pipe *pipe;
+	struct doca_flow_pipe_entry *entry;
+	struct entry_batch_status status = {0};
+	uint16_t queues[1] = {queue};
+	doca_error_t err;
+
+	match.outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;
+	match.outer.ip4.dscp_ecn = 0xFF;
+	match_mask.outer.ip4.dscp_ecn = 0;
+	fwd.type = DOCA_FLOW_FWD_RSS;
+	fwd.rss_type = DOCA_FLOW_RESOURCE_TYPE_NON_SHARED;
+	fwd.rss.queues_array = queues;
+	fwd.rss.nr_queues = 1;
+	fwd.rss.inner_flags = DOCA_FLOW_RSS_IPV4 | DOCA_FLOW_RSS_UDP;
+
+	err = doca_flow_pipe_cfg_create(&cfg, port);
+	crash_if_unsuccessful(err, "pipe_cfg_create (%s)", name);
+	crash_if_unsuccessful(doca_flow_pipe_cfg_set_name(cfg, name), "pipe_cfg_set_name (%s)", name);
+	crash_if_unsuccessful(doca_flow_pipe_cfg_set_type(cfg, DOCA_FLOW_PIPE_BASIC), "pipe_cfg_set_type (%s)", name);
+	crash_if_unsuccessful(doca_flow_pipe_cfg_set_domain(cfg, DOCA_FLOW_PIPE_DOMAIN_DEFAULT), "pipe_cfg_set_domain (%s)", name);
+	crash_if_unsuccessful(doca_flow_pipe_cfg_set_is_root(cfg, false), "pipe_cfg_set_is_root (%s)", name);
+	crash_if_unsuccessful(doca_flow_pipe_cfg_set_nr_entries(cfg, 1), "pipe_cfg_set_nr_entries (%s)", name);
+	crash_if_unsuccessful(doca_flow_pipe_cfg_set_match(cfg, &match, &match_mask), "pipe_cfg_set_match (%s)", name);
+	err = doca_flow_pipe_create(cfg, &fwd, NULL, &pipe);
+	crash_if_unsuccessful(err, "pipe_create (%s)", name);
+	doca_flow_pipe_cfg_destroy(cfg);
+	err = steer_pipe_add_entry(0, pipe, &entry_match, 0, NULL, NULL, NULL, 0, &status, &entry);
+	crash_if_unsuccessful(err, "pipe_add_entry (%s)", name);
+	process_entries(port, &status, 1, name);
+	return pipe;
+}
+
+/* FLOODING hash duplicates every hit to the normal hardware path and to the
+ * shared RSS terminal. */
+static struct doca_flow_pipe *create_qp1_flood_pipe(struct doca_flow_port *port, const char *name,
+						    struct doca_flow_pipe *normal_target,
+						    struct doca_flow_pipe *rss_target)
+{
+	struct doca_flow_fwd fwd = {.type = DOCA_FLOW_FWD_PIPE, .next_pipe = NULL};
+	struct doca_flow_pipe_cfg *cfg;
+	struct doca_flow_pipe *pipe;
+	struct entry_batch_status status = {0};
+	doca_error_t err;
+
+	err = doca_flow_pipe_cfg_create(&cfg, port);
+	crash_if_unsuccessful(err, "pipe_cfg_create (%s)", name);
+	crash_if_unsuccessful(doca_flow_pipe_cfg_set_name(cfg, name), "pipe_cfg_set_name (%s)", name);
+	crash_if_unsuccessful(doca_flow_pipe_cfg_set_type(cfg, DOCA_FLOW_PIPE_HASH), "pipe_cfg_set_type (%s)", name);
+	crash_if_unsuccessful(doca_flow_pipe_cfg_set_domain(cfg, DOCA_FLOW_PIPE_DOMAIN_DEFAULT), "pipe_cfg_set_domain (%s)", name);
+	crash_if_unsuccessful(doca_flow_pipe_cfg_set_is_root(cfg, false), "pipe_cfg_set_is_root (%s)", name);
+	crash_if_unsuccessful(doca_flow_pipe_cfg_set_nr_entries(cfg, 2), "pipe_cfg_set_nr_entries (%s)", name);
+	crash_if_unsuccessful(doca_flow_pipe_cfg_set_hash_map_algorithm(cfg, DOCA_FLOW_PIPE_HASH_MAP_ALGORITHM_FLOODING),
+	                      "pipe_cfg_set_hash_map_algorithm (%s)", name);
+	err = doca_flow_pipe_create(cfg, &fwd, NULL, &pipe);
+	crash_if_unsuccessful(err, "pipe_create (%s)", name);
+	doca_flow_pipe_cfg_destroy(cfg);
+	for (uint32_t i = 0; i < 2; i++) {
+		struct doca_flow_fwd entry_fwd = {
+			.type = DOCA_FLOW_FWD_PIPE,
+			.next_pipe = i == 0 ? normal_target : rss_target,
+		};
+		struct doca_flow_pipe_entry *entry;
+		uint32_t flags = i == 0 ? STEER_WAIT_FOR_BATCH : 0;
+		err = doca_flow_pipe_hash_add_entry(0, pipe, i, 0, NULL, NULL, &entry_fwd, flags,
+		                                    &status, &entry);
+		crash_if_unsuccessful(err, "pipe_hash_add_entry (%s clone=%u)", name, i);
+	}
+	process_entries(port, &status, 2, name);
+	return pipe;
+}
+
+/* Match IPv4 RoCEv2 management packets addressed to QP1. Hits enter the
+ * flooding clone pipe; misses continue through the existing direction path. */
+static struct doca_flow_pipe *create_qp1_clone_check(struct doca_flow_port *port, const char *name,
+						      struct doca_flow_pipe *flood_target,
+						      struct doca_flow_pipe *miss_target)
+{
+	struct doca_flow_match match = {0}, match_mask = {0}, entry_match = {0};
+	struct doca_flow_fwd fwd = {
+		.type = DOCA_FLOW_FWD_HASH_PIPE,
+		.hash_pipe = {
+			.pipe = flood_target,
+			.algorithm = DOCA_FLOW_PIPE_HASH_MAP_ALGORITHM_FLOODING,
+		},
+	};
+	struct doca_flow_fwd fwd_miss = {.type = DOCA_FLOW_FWD_PIPE, .next_pipe = miss_target};
+	struct doca_flow_pipe_cfg *cfg;
+	struct doca_flow_pipe *pipe;
+	struct doca_flow_pipe_entry *entry;
+	struct entry_batch_status status = {0};
+	doca_error_t err;
+
+	match.outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;
+	match.outer.l4_type_ext = DOCA_FLOW_L4_TYPE_EXT_ROCE_V2;
+	memset(match.outer.roce_v2.bth.dest_qp, 0xFF, sizeof(match.outer.roce_v2.bth.dest_qp));
+	memset(match_mask.outer.roce_v2.bth.dest_qp, 0xFF, sizeof(match_mask.outer.roce_v2.bth.dest_qp));
+	entry_match.outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;
+	entry_match.outer.l4_type_ext = DOCA_FLOW_L4_TYPE_EXT_ROCE_V2;
+	entry_match.outer.roce_v2.bth.dest_qp[2] = QP1_QPN;
+
+	err = doca_flow_pipe_cfg_create(&cfg, port);
+	crash_if_unsuccessful(err, "pipe_cfg_create (%s)", name);
+	crash_if_unsuccessful(doca_flow_pipe_cfg_set_name(cfg, name), "pipe_cfg_set_name (%s)", name);
+	crash_if_unsuccessful(doca_flow_pipe_cfg_set_type(cfg, DOCA_FLOW_PIPE_BASIC), "pipe_cfg_set_type (%s)", name);
+	crash_if_unsuccessful(doca_flow_pipe_cfg_set_domain(cfg, DOCA_FLOW_PIPE_DOMAIN_DEFAULT), "pipe_cfg_set_domain (%s)", name);
+	crash_if_unsuccessful(doca_flow_pipe_cfg_set_is_root(cfg, false), "pipe_cfg_set_is_root (%s)", name);
+	crash_if_unsuccessful(doca_flow_pipe_cfg_set_nr_entries(cfg, 1), "pipe_cfg_set_nr_entries (%s)", name);
+	crash_if_unsuccessful(doca_flow_pipe_cfg_set_match(cfg, &match, &match_mask), "pipe_cfg_set_match (%s)", name);
+	err = doca_flow_pipe_create(cfg, &fwd, &fwd_miss, &pipe);
+	crash_if_unsuccessful(err, "pipe_create (%s)", name);
+	doca_flow_pipe_cfg_destroy(cfg);
+	err = steer_pipe_add_entry(0, pipe, &entry_match, 0, NULL, NULL, NULL, 0, &status, &entry);
+	crash_if_unsuccessful(err, "pipe_add_entry (%s)", name);
+	process_entries(port, &status, 1, name);
+	DOCA_LOG_INFO("%s ready: QP1 normal-forward + DPDK clone", name);
+	return pipe;
+}
+
+/* Install QP1 observation as one self-contained facility. Keep all cloning
+ * mechanics behind this boundary: DOCA 3.x uses flooding hash pipes, while the
+ * DOCA 2.9 backend can replace this body with shared mirror resources without
+ * changing steer_start() or the ordinary ingress/egress pipelines. */
+static void install_qp1_clone_paths(struct doca_flow_port *port,
+				    struct doca_flow_pipe *deliver_sf,
+				    struct doca_flow_pipe *deliver_wire,
+				    struct doca_flow_pipe **wire_target,
+				    struct doca_flow_pipe **sf_target)
+{
+	struct doca_flow_pipe *qp1_rss = create_qp1_rss_pipe(port, "QP1_RSS", QP1_CLONE_QUEUE);
+	struct doca_flow_pipe *wire_flood =
+		create_qp1_flood_pipe(port, "QP1_FLOOD_WIRE", deliver_sf, qp1_rss);
+	*wire_target = create_qp1_clone_check(port, "QP1_CHECK_WIRE", wire_flood, *wire_target);
+
+	struct doca_flow_pipe *sf_flood =
+		create_qp1_flood_pipe(port, "QP1_FLOOD_SF", deliver_wire, qp1_rss);
+	*sf_target = create_qp1_clone_check(port, "QP1_CHECK_SF", sf_flood, *sf_target);
 }
 
 /*
@@ -951,94 +1112,93 @@ static struct doca_flow_pipe *create_selected_mark_pipe(struct doca_flow_port *p
 	return pipe;
 }
 
-/* One independent full-QPN hash marker per virtual path. Only bucket `path`
- * enters that paths sampler/marker; the other bucket bypasses marking. */
-static struct doca_flow_pipe *create_path_qpn_hash_pipe(struct doca_flow_port *port, int path,
+/* Per-path exact-QPN classifier. QP1 CM parsing installs each learned receiver
+ * QPN only in the pipe matching qpn&1; unknown and opposite-class QPs miss to
+ * the unmarked clear-path target. */
+static struct doca_flow_pipe *create_path_qpn_match_pipe(struct doca_flow_port *port, int path,
 						 struct doca_flow_pipe *selected_target,
-						 struct doca_flow_pipe *clear_target,
-						 struct doca_flow_pipe_entry **entries)
+						 struct doca_flow_pipe *clear_target)
 {
-	struct doca_flow_match match_mask = {0};
-	struct doca_flow_monitor monitor = {.counter_type = DOCA_FLOW_RESOURCE_TYPE_NON_SHARED};
-	struct doca_flow_fwd fwd = {.type = DOCA_FLOW_FWD_CHANGEABLE};
+	struct doca_flow_match match = {0}, match_mask = {0};
+	struct doca_flow_fwd fwd = {.type = DOCA_FLOW_FWD_PIPE, .next_pipe = selected_target};
+	struct doca_flow_fwd fwd_miss = {.type = DOCA_FLOW_FWD_PIPE, .next_pipe = clear_target};
 	struct doca_flow_pipe_cfg *cfg;
 	struct doca_flow_pipe *pipe;
-	struct entry_batch_status status = {0};
 	char name[32];
 	doca_error_t err;
 
+	match.outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;
+	match.outer.l4_type_ext = DOCA_FLOW_L4_TYPE_EXT_ROCE_V2;
+	memset(match.outer.roce_v2.bth.dest_qp, 0xFF,
+	       sizeof(match.outer.roce_v2.bth.dest_qp));
 	match_mask.outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;
 	match_mask.outer.l4_type_ext = DOCA_FLOW_L4_TYPE_EXT_ROCE_V2;
 	memset(match_mask.outer.roce_v2.bth.dest_qp, 0xFF,
 	       sizeof(match_mask.outer.roce_v2.bth.dest_qp));
-	snprintf(name, sizeof(name), "PATH%d_QPN_HASH", path);
+	snprintf(name, sizeof(name), "PATH%d_QPN_MATCH", path);
 
 	err = doca_flow_pipe_cfg_create(&cfg, port);
 	crash_if_unsuccessful(err, "pipe_cfg_create (%s)", name);
 	crash_if_unsuccessful(doca_flow_pipe_cfg_set_name(cfg, name), "pipe_cfg_set_name (%s)", name);
-	crash_if_unsuccessful(doca_flow_pipe_cfg_set_type(cfg, DOCA_FLOW_PIPE_HASH), "pipe_cfg_set_type (%s)", name);
+	crash_if_unsuccessful(doca_flow_pipe_cfg_set_type(cfg, DOCA_FLOW_PIPE_BASIC), "pipe_cfg_set_type (%s)", name);
 	crash_if_unsuccessful(doca_flow_pipe_cfg_set_domain(cfg, DOCA_FLOW_PIPE_DOMAIN_DEFAULT), "pipe_cfg_set_domain (%s)", name);
 	crash_if_unsuccessful(doca_flow_pipe_cfg_set_is_root(cfg, false), "pipe_cfg_set_is_root (%s)", name);
-	crash_if_unsuccessful(doca_flow_pipe_cfg_set_nr_entries(cfg, NB_PATHS), "pipe_cfg_set_nr_entries (%s)", name);
-	crash_if_unsuccessful(doca_flow_pipe_cfg_set_hash_map_algorithm(cfg, DOCA_FLOW_PIPE_HASH_MAP_ALGORITHM_HASH),
-	                      "pipe_cfg_set_hash_map_algorithm (%s)", name);
-	crash_if_unsuccessful(doca_flow_pipe_cfg_set_match(cfg, NULL, &match_mask), "pipe_cfg_set_match (%s)", name);
-	crash_if_unsuccessful(doca_flow_pipe_cfg_set_monitor(cfg, &monitor), "pipe_cfg_set_monitor (%s)", name);
-	err = doca_flow_pipe_create(cfg, &fwd, NULL, &pipe);
+	crash_if_unsuccessful(doca_flow_pipe_cfg_set_nr_entries(cfg, MAX_CM_CONNECTIONS),
+	                      "pipe_cfg_set_nr_entries (%s)", name);
+	crash_if_unsuccessful(doca_flow_pipe_cfg_set_match(cfg, &match, &match_mask),
+	                      "pipe_cfg_set_match (%s)", name);
+	err = doca_flow_pipe_create(cfg, &fwd, &fwd_miss, &pipe);
 	crash_if_unsuccessful(err, "pipe_create (%s)", name);
 	doca_flow_pipe_cfg_destroy(cfg);
-
-	for (uint32_t bucket = 0; bucket < NB_PATHS; bucket++) {
-		struct doca_flow_monitor entry_monitor = {.counter_type = DOCA_FLOW_RESOURCE_TYPE_NON_SHARED};
-		struct doca_flow_fwd entry_fwd = {
-			.type = DOCA_FLOW_FWD_PIPE,
-			.next_pipe = ((int)bucket == path) ? selected_target : clear_target,
-		};
-		uint32_t flags = (bucket == 0) ? STEER_WAIT_FOR_BATCH : 0;
-		err = doca_flow_pipe_hash_add_entry(0, pipe, bucket, 0, NULL, &entry_monitor, &entry_fwd,
-		                                    flags, &status, &entries[bucket]);
-		crash_if_unsuccessful(err, "pipe_hash_add_entry (%s bucket=%u)", name, bucket);
-	}
-	process_entries(port, &status, NB_PATHS, name);
-	DOCA_LOG_INFO("%s ready: class%d selected for ECN marking", name, path);
+	DOCA_LOG_INFO("%s ready: learned receiver QPNs with LSB=%d are selected", name, path);
 	return pipe;
 }
 
-/* Create an egress-only full-QPN hash profile for doca_flow_pipe_calc_hash().
- * It is not reachable from the packet pipeline and has no entries. */
-static struct doca_flow_pipe *create_qpn_calc_pipe(struct doca_flow_port *port)
+/* Sender-side diagnostic: exact sender-QPN CNP entries are added after CM
+ * pairing. Hits and misses both continue unchanged to the sender SF. */
+static struct doca_flow_pipe *create_cnp_count_pipe(struct doca_flow_port *port,
+					     struct doca_flow_pipe *deliver_sf,
+					     struct doca_flow_pipe *miss_target)
 {
-	struct doca_flow_match match_mask = {0};
-	struct doca_flow_fwd fwd = {.type = DOCA_FLOW_FWD_DROP};
+	struct doca_flow_match match = {0}, match_mask = {0};
+	struct doca_flow_monitor monitor = {.counter_type = DOCA_FLOW_RESOURCE_TYPE_NON_SHARED};
+	struct doca_flow_fwd fwd = {.type = DOCA_FLOW_FWD_PIPE, .next_pipe = deliver_sf};
+	struct doca_flow_fwd fwd_miss = {.type = DOCA_FLOW_FWD_PIPE, .next_pipe = miss_target};
 	struct doca_flow_pipe_cfg *cfg;
 	struct doca_flow_pipe *pipe;
 	doca_error_t err;
 
+	match.outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;
+	match.outer.l4_type_ext = DOCA_FLOW_L4_TYPE_EXT_ROCE_V2;
+	match.outer.roce_v2.bth.opcode = 0xFF;
+	memset(match.outer.roce_v2.bth.dest_qp, 0xFF,
+	       sizeof(match.outer.roce_v2.bth.dest_qp));
 	match_mask.outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;
 	match_mask.outer.l4_type_ext = DOCA_FLOW_L4_TYPE_EXT_ROCE_V2;
+	match_mask.outer.roce_v2.bth.opcode = 0xFF;
 	memset(match_mask.outer.roce_v2.bth.dest_qp, 0xFF,
 	       sizeof(match_mask.outer.roce_v2.bth.dest_qp));
+
 	err = doca_flow_pipe_cfg_create(&cfg, port);
-	crash_if_unsuccessful(err, "pipe_cfg_create (QPN calc)");
-	crash_if_unsuccessful(doca_flow_pipe_cfg_set_name(cfg, "EGRESS_QPN_HASH_CALC"),
-	                      "pipe_cfg_set_name (QPN calc)");
-	crash_if_unsuccessful(doca_flow_pipe_cfg_set_type(cfg, DOCA_FLOW_PIPE_HASH),
-	                      "pipe_cfg_set_type (QPN calc)");
+	crash_if_unsuccessful(err, "pipe_cfg_create (CNP count)");
+	crash_if_unsuccessful(doca_flow_pipe_cfg_set_name(cfg, "EGRESS_CNP_COUNT"),
+	                      "pipe_cfg_set_name (CNP count)");
+	crash_if_unsuccessful(doca_flow_pipe_cfg_set_type(cfg, DOCA_FLOW_PIPE_BASIC),
+	                      "pipe_cfg_set_type (CNP count)");
 	crash_if_unsuccessful(doca_flow_pipe_cfg_set_domain(cfg, DOCA_FLOW_PIPE_DOMAIN_DEFAULT),
-	                      "pipe_cfg_set_domain (QPN calc)");
+	                      "pipe_cfg_set_domain (CNP count)");
 	crash_if_unsuccessful(doca_flow_pipe_cfg_set_is_root(cfg, false),
-	                      "pipe_cfg_set_is_root (QPN calc)");
-	crash_if_unsuccessful(doca_flow_pipe_cfg_set_nr_entries(cfg, NB_PATHS),
-	                      "pipe_cfg_set_nr_entries (QPN calc)");
-	crash_if_unsuccessful(doca_flow_pipe_cfg_set_hash_map_algorithm(
-	                         cfg, DOCA_FLOW_PIPE_HASH_MAP_ALGORITHM_HASH),
-	                      "pipe_cfg_set_hash_map_algorithm (QPN calc)");
-	crash_if_unsuccessful(doca_flow_pipe_cfg_set_match(cfg, NULL, &match_mask),
-	                      "pipe_cfg_set_match (QPN calc)");
-	err = doca_flow_pipe_create(cfg, &fwd, NULL, &pipe);
-	crash_if_unsuccessful(err, "pipe_create (QPN calc)");
+	                      "pipe_cfg_set_is_root (CNP count)");
+	crash_if_unsuccessful(doca_flow_pipe_cfg_set_nr_entries(cfg, MAX_CNP_TRACKED_QPS),
+	                      "pipe_cfg_set_nr_entries (CNP count)");
+	crash_if_unsuccessful(doca_flow_pipe_cfg_set_match(cfg, &match, &match_mask),
+	                      "pipe_cfg_set_match (CNP count)");
+	crash_if_unsuccessful(doca_flow_pipe_cfg_set_monitor(cfg, &monitor),
+	                      "pipe_cfg_set_monitor (CNP count)");
+	err = doca_flow_pipe_create(cfg, &fwd, &fwd_miss, &pipe);
+	crash_if_unsuccessful(err, "pipe_create (CNP count)");
 	doca_flow_pipe_cfg_destroy(cfg);
-	DOCA_LOG_INFO("Egress QPN calc-hash profile ready");
+	DOCA_LOG_INFO("EGRESS_CNP_COUNT ready: learned sender-QPN CNP diagnostics");
 	return pipe;
 }
 
@@ -1072,9 +1232,21 @@ static struct doca_flow_pipe *path_ce_target(struct doca_flow_port *port, int id
  * ------------------------------------------------------------------ */
 
 struct rate_flow_state {
-	uint32_t qpn;
+	uint32_t qpn; /* PCC sender/initiator QPN */
+	uint32_t hash_qpn; /* mapped receiver/responder QPN used by ingress */
 	uint32_t latest_rate;
 	uint8_t qpn_class;
+	bool classified;
+};
+
+struct cm_request_state {
+	uint32_t comm_id;
+	uint32_t initiator_qpn;
+};
+
+struct qpn_pair_state {
+	uint32_t initiator_qpn;
+	uint32_t responder_qpn;
 };
 
 struct steer_state {
@@ -1083,14 +1255,25 @@ struct steer_state {
 	struct doca_flow_port *port;
 	struct doca_flow_port *sf_rep_port;
 	struct doca_flow_pipe *classify_pipe;
-	struct doca_flow_pipe *qpn_calc_pipe;
+	struct doca_flow_pipe *qpn_match_pipe[NB_PATHS];
+	struct doca_flow_pipe *cnp_count_pipe;
+	bool grouping_enabled;
 	bool classify_is_hash; /* classify is a HASH pipe (fixed buckets, no live move) */
 	struct doca_flow_pipe_entry *classify_entry[NB_PATHS];
 	struct doca_flow_pipe_entry *mark_entry[NB_PATHS];
-	struct doca_flow_pipe_entry *qpn_hash_entry[NB_PATHS * NB_PATHS]; /* [path*NB_PATHS + class] */
 	struct doca_flow_pipe_entry *clear_path_entry;
+	uint32_t installed_receiver_qpn[MAX_CM_CONNECTIONS];
+	uint32_t installed_receiver_qpn_count;
+	uint32_t cnp_sender_qpn[MAX_CNP_TRACKED_QPS];
+	uint8_t cnp_path[MAX_CNP_TRACKED_QPS];
+	struct doca_flow_pipe_entry *cnp_entry[MAX_CNP_TRACKED_QPS];
+	uint32_t cnp_entry_count;
 	struct rate_flow_state rate_flow[MAX_RATE_FLOWS];
 	uint32_t rate_flow_count;
+	struct cm_request_state cm_request[MAX_CM_CONNECTIONS];
+	uint32_t cm_request_count;
+	struct qpn_pair_state qpn_pair[MAX_CM_CONNECTIONS];
+	uint32_t qpn_pair_count;
 	atomic_flag rate_lock;
 	_Atomic uint32_t rate[NB_PATHS]; /* per-parity PCC rate (FXP20) */
 	int applied_move;		 /* enum steer_move_parity currently programmed */
@@ -1229,7 +1412,7 @@ doca_error_t steer_start(const struct steer_opts *opts)
 		 * independent full-QPN ECN marker. Only class==path may be marked. */
 		struct doca_flow_pipe *clear_path =
 			create_clear_path_pipe(g_steer.port, deliver_sf, &g_steer.clear_path_entry);
-		struct doca_flow_pipe *path_hash[NB_PATHS];
+		struct doca_flow_pipe *path_match[NB_PATHS];
 		for (int path = 0; path < NB_PATHS; path++) {
 			struct doca_flow_pipe *mark =
 				create_selected_mark_pipe(g_steer.port, path, deliver_sf,
@@ -1237,19 +1420,21 @@ doca_error_t steer_start(const struct steer_opts *opts)
 			struct doca_flow_pipe *selected =
 				path_ce_target(g_steer.port, path, g_steer.opts.path_percent[path],
 				               mark, clear_path);
-			path_hash[path] =
-				create_path_qpn_hash_pipe(g_steer.port, path, selected, clear_path,
-				                          &g_steer.qpn_hash_entry[path * NB_PATHS]);
+			path_match[path] = create_path_qpn_match_pipe(g_steer.port, path, selected,
+			                                                     clear_path);
+			g_steer.qpn_match_pipe[path] = path_match[path];
 		}
 
 		struct doca_flow_pipe *path_demux =
-			create_path_demux_pipe(g_steer.port, path_hash, clear_path);
+			create_path_demux_pipe(g_steer.port, path_match, clear_path);
 		wire_target = create_roce_check_pipe(g_steer.port, "INGRESS_ROCE_CHECK",
 		                                     path_demux, deliver_sf);
 	}
 
 	if (do_egress) {
-		g_steer.qpn_calc_pipe = create_qpn_calc_pipe(g_steer.port);
+		g_steer.grouping_enabled = true;
+		g_steer.cnp_count_pipe = create_cnp_count_pipe(g_steer.port, deliver_sf, wire_target);
+		wire_target = g_steer.cnp_count_pipe;
 		/* Egress (sender): hash-pipe classify by dest_qp -> native path DSCP bit. */
 		g_steer.classify_pipe = create_classify_pipe(g_steer.port, deliver_wire);
 		g_steer.classify_is_hash = true;
@@ -1264,7 +1449,13 @@ doca_error_t steer_start(const struct steer_opts *opts)
 		/* All admitted RoCE traffic is randomly assigned a DSCP path bit. */
 		sf_target = create_roce_check_pipe(g_steer.port, "EGRESS_ROCE_CHECK",
 		                                   g_steer.classify_pipe, deliver_wire);
+
 	}
+
+	/* Both roles observe CM: egress builds sender->receiver grouping, while
+	 * ingress learns exact receiver QPNs for its parity match pipes. */
+	install_qp1_clone_paths(g_steer.port, deliver_sf, deliver_wire,
+	                        &wire_target, &sf_target);
 
 	create_port_demux_pipe(g_steer.port, sf_target, wire_target);
 
@@ -1281,7 +1472,7 @@ void steer_update_pcc_rate(uint32_t qpn, uint32_t rate)
 	/* Existing rate storage is retained until the dynamic controller replaces it. */
 	atomic_store_explicit(&g_steer.rate[qpn & 1], rate, memory_order_relaxed);
 
-	if (g_steer.qpn_calc_pipe == NULL)
+	if (!g_steer.grouping_enabled)
 		return;
 	qpn &= 0x00FFFFFFu;
 	if (qpn <= 1)
@@ -1297,43 +1488,277 @@ void steer_update_pcc_rate(uint32_t qpn, uint32_t rate)
 		}
 	}
 	if (flow == NULL && g_steer.rate_flow_count < MAX_RATE_FLOWS) {
-		struct doca_flow_match match = {0};
-		uint32_t hash;
-		match.outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;
-		match.outer.l4_type_ext = DOCA_FLOW_L4_TYPE_EXT_ROCE_V2;
-		match.outer.roce_v2.bth.dest_qp[0] = (uint8_t)(qpn >> 16);
-		match.outer.roce_v2.bth.dest_qp[1] = (uint8_t)(qpn >> 8);
-		match.outer.roce_v2.bth.dest_qp[2] = (uint8_t)qpn;
-
-		doca_error_t err = doca_flow_pipe_calc_hash(g_steer.qpn_calc_pipe, &match, &hash);
-		if (err == DOCA_SUCCESS) {
-			flow = &g_steer.rate_flow[g_steer.rate_flow_count++];
-			flow->qpn = qpn;
-			flow->qpn_class = (uint8_t)(hash % NB_PATHS);
-			DOCA_LOG_INFO("egress calc_hash: PCC QPN 0x%06x rate=%u hash=%u bucket=%u",
-			              qpn, rate, hash, flow->qpn_class);
-		} else {
-			DOCA_LOG_WARN("calc_hash failed for PCC QPN 0x%06x: %s", qpn,
-			              doca_error_get_descr(err));
+		flow = &g_steer.rate_flow[g_steer.rate_flow_count++];
+		memset(flow, 0, sizeof(*flow));
+		flow->qpn = qpn;
+	}
+	if (flow != NULL) {
+		flow->latest_rate = rate;
+		uint32_t hash_qpn = 0;
+		for (uint32_t i = 0; i < g_steer.qpn_pair_count; i++) {
+			if (g_steer.qpn_pair[i].initiator_qpn == qpn) {
+				hash_qpn = g_steer.qpn_pair[i].responder_qpn;
+				break;
+			}
+		}
+		if (!flow->classified && hash_qpn != 0) {
+			flow->hash_qpn = hash_qpn;
+			flow->qpn_class = (uint8_t)(hash_qpn & 1u);
+			flow->classified = true;
+			DOCA_LOG_INFO("egress QPN class: PCC sender QPN 0x%06x -> receiver QPN "
+			              "0x%06x rate=%u LSB-class=%u", qpn, hash_qpn, rate,
+			              flow->qpn_class);
 		}
 	}
-	if (flow != NULL)
-		flow->latest_rate = rate;
 	atomic_flag_clear_explicit(&g_steer.rate_lock, memory_order_release);
+}
+
+static uint16_t read_be16(const uint8_t *p)
+{
+	return ((uint16_t)p[0] << 8) | p[1];
+}
+
+static uint32_t read_be32(const uint8_t *p)
+{
+	return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+	       ((uint32_t)p[2] << 8) | p[3];
+}
+
+static void install_receiver_qpn_entry(uint32_t qpn)
+{
+	qpn &= 0x00FFFFFFu;
+	uint32_t qpn_class = qpn & 1u;
+	struct doca_flow_pipe *pipe = g_steer.qpn_match_pipe[qpn_class];
+	if (pipe == NULL || qpn <= QP1_QPN)
+		return;
+	for (uint32_t i = 0; i < g_steer.installed_receiver_qpn_count; i++) {
+		if (g_steer.installed_receiver_qpn[i] == qpn)
+			return;
+	}
+	if (g_steer.installed_receiver_qpn_count >= MAX_CM_CONNECTIONS) {
+		DOCA_LOG_WARN("ingress receiver-QPN table full; cannot install 0x%06x", qpn);
+		return;
+	}
+
+	struct doca_flow_match match = {0};
+	struct doca_flow_pipe_entry *entry;
+	struct entry_batch_status status = {0};
+	match.outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;
+	match.outer.l4_type_ext = DOCA_FLOW_L4_TYPE_EXT_ROCE_V2;
+	match.outer.roce_v2.bth.dest_qp[0] = (uint8_t)(qpn >> 16);
+	match.outer.roce_v2.bth.dest_qp[1] = (uint8_t)(qpn >> 8);
+	match.outer.roce_v2.bth.dest_qp[2] = (uint8_t)qpn;
+	doca_error_t err = steer_pipe_add_entry(0, pipe, &match, 0, NULL, NULL, NULL, 0,
+	                                        &status, &entry);
+	if (err != DOCA_SUCCESS) {
+		DOCA_LOG_WARN("failed to add receiver QPN 0x%06x to class%u: %s", qpn,
+		              qpn_class, doca_error_get_descr(err));
+		return;
+	}
+	process_entries(g_steer.port, &status, 1, "learned receiver QPN");
+	g_steer.installed_receiver_qpn[g_steer.installed_receiver_qpn_count++] = qpn;
+	DOCA_LOG_INFO("ingress QPN rule installed: receiver QPN 0x%06x -> class%u/path%u marker",
+	              qpn, qpn_class, qpn_class);
+}
+
+static void install_sender_cnp_entry(uint32_t sender_qpn, uint32_t receiver_qpn)
+{
+	if (g_steer.cnp_count_pipe == NULL)
+		return;
+	sender_qpn &= 0x00FFFFFFu;
+	receiver_qpn &= 0x00FFFFFFu;
+	for (uint32_t i = 0; i < g_steer.cnp_entry_count; i++) {
+		if (g_steer.cnp_sender_qpn[i] == sender_qpn)
+			return;
+	}
+	if (g_steer.cnp_entry_count >= MAX_CNP_TRACKED_QPS) {
+		DOCA_LOG_WARN("sender CNP diagnostic table full; cannot install QPN 0x%06x",
+		              sender_qpn);
+		return;
+	}
+
+	struct doca_flow_match match = {0};
+	struct doca_flow_monitor monitor = {.counter_type = DOCA_FLOW_RESOURCE_TYPE_NON_SHARED};
+	struct entry_batch_status status = {0};
+	uint32_t idx = g_steer.cnp_entry_count;
+	match.outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;
+	match.outer.l4_type_ext = DOCA_FLOW_L4_TYPE_EXT_ROCE_V2;
+	match.outer.roce_v2.bth.opcode = ROCE_BTH_OPCODE_CNP;
+	match.outer.roce_v2.bth.dest_qp[0] = (uint8_t)(sender_qpn >> 16);
+	match.outer.roce_v2.bth.dest_qp[1] = (uint8_t)(sender_qpn >> 8);
+	match.outer.roce_v2.bth.dest_qp[2] = (uint8_t)sender_qpn;
+	doca_error_t err = steer_pipe_add_entry(0, g_steer.cnp_count_pipe, &match, 0, NULL,
+	                                        &monitor, NULL, 0, &status,
+	                                        &g_steer.cnp_entry[idx]);
+	if (err != DOCA_SUCCESS) {
+		DOCA_LOG_WARN("failed to add sender CNP counter for QPN 0x%06x: %s",
+		              sender_qpn, doca_error_get_descr(err));
+		return;
+	}
+	process_entries(g_steer.port, &status, 1, "sender CNP counter");
+	g_steer.cnp_sender_qpn[idx] = sender_qpn;
+	g_steer.cnp_path[idx] = (uint8_t)(receiver_qpn & 1u);
+	g_steer.cnp_entry_count++;
+	DOCA_LOG_INFO("sender CNP counter installed: sender QPN 0x%06x -> receiver QPN "
+	              "0x%06x path%u", sender_qpn, receiver_qpn, receiver_qpn & 1u);
+}
+
+static void remember_cm_request(uint32_t comm_id, uint32_t initiator_qpn)
+{
+	while (atomic_flag_test_and_set_explicit(&g_steer.rate_lock, memory_order_acquire))
+		;
+	for (uint32_t i = 0; i < g_steer.cm_request_count; i++) {
+		if (g_steer.cm_request[i].comm_id == comm_id) {
+			g_steer.cm_request[i].initiator_qpn = initiator_qpn;
+			atomic_flag_clear_explicit(&g_steer.rate_lock, memory_order_release);
+			return;
+		}
+	}
+	if (g_steer.cm_request_count < MAX_CM_CONNECTIONS) {
+		struct cm_request_state *request = &g_steer.cm_request[g_steer.cm_request_count++];
+		request->comm_id = comm_id;
+		request->initiator_qpn = initiator_qpn;
+	} else {
+		DOCA_LOG_WARN("RDMA-CM request table full; cannot remember comm_id=0x%08x", comm_id);
+	}
+	atomic_flag_clear_explicit(&g_steer.rate_lock, memory_order_release);
+}
+
+static void complete_cm_mapping(uint32_t remote_comm_id, uint32_t responder_qpn)
+{
+	uint32_t initiator_qpn = 0;
+	bool changed = false;
+
+	while (atomic_flag_test_and_set_explicit(&g_steer.rate_lock, memory_order_acquire))
+		;
+	for (uint32_t i = 0; i < g_steer.cm_request_count; i++) {
+		if (g_steer.cm_request[i].comm_id == remote_comm_id) {
+			initiator_qpn = g_steer.cm_request[i].initiator_qpn;
+			break;
+		}
+	}
+	if (initiator_qpn != 0) {
+		struct qpn_pair_state *pair = NULL;
+		for (uint32_t i = 0; i < g_steer.qpn_pair_count; i++) {
+			if (g_steer.qpn_pair[i].initiator_qpn == initiator_qpn) {
+				pair = &g_steer.qpn_pair[i];
+				break;
+			}
+		}
+		if (pair == NULL && g_steer.qpn_pair_count < MAX_CM_CONNECTIONS)
+			pair = &g_steer.qpn_pair[g_steer.qpn_pair_count++];
+		if (pair != NULL && (pair->initiator_qpn != initiator_qpn ||
+		                     pair->responder_qpn != responder_qpn)) {
+			pair->initiator_qpn = initiator_qpn;
+			pair->responder_qpn = responder_qpn;
+			changed = true;
+		}
+	}
+	atomic_flag_clear_explicit(&g_steer.rate_lock, memory_order_release);
+
+	if (initiator_qpn == 0)
+		DOCA_LOG_WARN("RDMA-CM REP has no captured REQ for remote_comm_id=0x%08x",
+		              remote_comm_id);
+	else if (changed)
+		DOCA_LOG_INFO("RDMA-CM QPN mapping: sender 0x%06x -> receiver 0x%06x",
+		              initiator_qpn, responder_qpn);
+	if (initiator_qpn != 0)
+		install_sender_cnp_entry(initiator_qpn, responder_qpn);
+}
+
+static void parse_qp1_clone(struct rte_mbuf *mbuf)
+{
+	uint8_t scratch[512];
+	uint32_t packet_len = rte_pktmbuf_pkt_len(mbuf);
+	uint32_t captured = packet_len < sizeof(scratch) ? packet_len : sizeof(scratch);
+	const uint8_t *packet = rte_pktmbuf_read(mbuf, 0, captured, scratch);
+	if (packet == NULL || captured < RTE_ETHER_HDR_LEN + 20)
+		return;
+	uint32_t l3_offset = RTE_ETHER_HDR_LEN;
+	uint16_t ether_type = read_be16(packet + 12);
+	while ((ether_type == RTE_ETHER_TYPE_VLAN || ether_type == RTE_ETHER_TYPE_QINQ) &&
+	       captured >= l3_offset + 4 + 20) {
+		ether_type = read_be16(packet + l3_offset + 2);
+		l3_offset += 4;
+	}
+	if (ether_type != RTE_ETHER_TYPE_IPV4 || captured < l3_offset + 20)
+		return;
+
+	const uint8_t *ip = packet + l3_offset;
+	uint32_t ip_header_len = (uint32_t)(ip[0] & 0x0f) * 4;
+	if ((ip[0] >> 4) != 4 || ip_header_len < 20 || ip[9] != IPPROTO_UDP ||
+	    captured < l3_offset + ip_header_len + sizeof(struct rte_udp_hdr) + 12)
+		return;
+	const uint8_t *udp = ip + ip_header_len;
+	if (read_be16(udp + 2) != ROCE_UDP_PORT_NATIVE)
+		return;
+	const uint8_t *bth = udp + sizeof(struct rte_udp_hdr);
+	uint32_t destination_qpn = ((uint32_t)bth[5] << 16) | ((uint32_t)bth[6] << 8) | bth[7];
+	if (destination_qpn != QP1_QPN)
+		return;
+
+	/* UD QP1: BTH(12), DETH(8), then the 24-byte MAD header. */
+	const uint8_t *mad = bth + 20;
+	uint32_t mad_offset = (uint32_t)(mad - packet);
+	if (captured < mad_offset + 24)
+		return;
+	uint16_t attribute = read_be16(mad + 16);
+	DOCA_LOG_INFO("QP1 clone: len=%u opcode=0x%02x class=0x%02x method=0x%02x attr=0x%04x",
+	              packet_len, bth[0], mad[1], mad[3], attribute);
+	if (mad[1] != IB_MGMT_CLASS_CM)
+		return;
+	if (attribute == IB_CM_ATTR_REQ && captured >= mad_offset + 60) {
+		uint32_t local_comm_id = read_be32(mad + 24);
+		uint32_t local_qpn = read_be32(mad + 56) >> 8;
+		DOCA_LOG_INFO("RDMA-CM REQ: local_comm_id=0x%08x initiator_qpn=0x%06x",
+		              local_comm_id, local_qpn);
+		remember_cm_request(local_comm_id, local_qpn);
+	} else if (attribute == IB_CM_ATTR_REP && captured >= mad_offset + 40) {
+		uint32_t local_comm_id = read_be32(mad + 24);
+		uint32_t remote_comm_id = read_be32(mad + 28);
+		uint32_t local_qpn = read_be32(mad + 36) >> 8;
+		DOCA_LOG_INFO("RDMA-CM REP: local_comm_id=0x%08x remote_comm_id=0x%08x responder_qpn=0x%06x",
+		              local_comm_id, remote_comm_id, local_qpn);
+		install_receiver_qpn_entry(local_qpn);
+		complete_cm_mapping(remote_comm_id, local_qpn);
+	}
+}
+
+static void poll_qp1_clones(void)
+{
+	if (g_dpdk_rx_port_id == UINT16_MAX)
+		return;
+	for (uint32_t burst = 0; burst < QP1_RX_MAX_BURSTS; burst++) {
+		struct rte_mbuf *packets[QP1_RX_BURST];
+		uint16_t received = rte_eth_rx_burst(g_dpdk_rx_port_id, QP1_CLONE_QUEUE, packets,
+		                                          QP1_RX_BURST);
+		for (uint16_t i = 0; i < received; i++) {
+			parse_qp1_clone(packets[i]);
+			rte_pktmbuf_free(packets[i]);
+		}
+		if (received < QP1_RX_BURST)
+			break;
+	}
 }
 
 void steer_poll(void)
 {
 	if (!g_steer.started)
 		return;
+	poll_qp1_clones();
 
-	if (g_steer.qpn_calc_pipe != NULL) {
+	if (g_steer.grouping_enabled) {
 		uint64_t reduced_sum[NB_PATHS] = {0};
 		uint32_t total[NB_PATHS] = {0}, full[NB_PATHS] = {0}, reduced[NB_PATHS] = {0};
+		uint32_t pending_mapping = 0;
 		while (atomic_flag_test_and_set_explicit(&g_steer.rate_lock, memory_order_acquire))
 			;
 		for (uint32_t i = 0; i < g_steer.rate_flow_count; i++) {
 			const struct rate_flow_state *flow = &g_steer.rate_flow[i];
+			if (!flow->classified) {
+				pending_mapping++;
+				continue;
+			}
 			uint8_t c = flow->qpn_class;
 			total[c]++;
 			if (flow->latest_rate == PCC_FULL_RATE)
@@ -1364,9 +1789,10 @@ void steer_poll(void)
 			}
 		}
 		DOCA_LOG_INFO("PCC path-share diagnostic: c0 total=%u full=%u reduced=%u sum=%lu; "
-		              "c1 total=%u full=%u reduced=%u sum=%lu; proposed path0=%u/64 path1=%u/64 (not applied)",
+		              "c1 total=%u full=%u reduced=%u sum=%lu; pending-map=%u; "
+		              "proposed path0=%u/64 path1=%u/64 (not applied)",
 		              total[0], full[0], reduced[0], reduced_sum[0], total[1], full[1], reduced[1],
-		              reduced_sum[1], path0, PATH_SHARE_BUCKETS - path0);
+		              reduced_sum[1], pending_mapping, path0, PATH_SHARE_BUCKETS - path0);
 	}
 
 	if (g_steer.classify_pipe && !g_steer.classify_is_hash) {
@@ -1377,14 +1803,15 @@ void steer_poll(void)
 	}
 
 	struct doca_flow_resource_query q;
-
-	for (int path = 0; path < NB_PATHS; path++) {
-		for (int bucket = 0; bucket < NB_PATHS; bucket++) {
-			struct doca_flow_pipe_entry *e = g_steer.qpn_hash_entry[path * NB_PATHS + bucket];
-			if (e && doca_flow_resource_query_entry(e, &q) == DOCA_SUCCESS)
-				DOCA_LOG_INFO("ingress: path%d QPN class%d (%s): %lu pkts", path, bucket,
-				              path == bucket ? "selected" : "not selected", q.counter.total_pkts);
+	if (g_steer.cnp_count_pipe != NULL) {
+		uint64_t cnp_by_path[NB_PATHS] = {0};
+		for (uint32_t i = 0; i < g_steer.cnp_entry_count; i++) {
+			if (g_steer.cnp_entry[i] != NULL &&
+			    doca_flow_resource_query_entry(g_steer.cnp_entry[i], &q) == DOCA_SUCCESS)
+				cnp_by_path[g_steer.cnp_path[i]] += q.counter.total_pkts;
 		}
+		DOCA_LOG_INFO("sender received CNP counters: path0=%lu path1=%lu",
+		              cnp_by_path[0], cnp_by_path[1]);
 	}
 
 	/* Egress (sender) role: per-bucket classify counts (bucket i -> native path i). */
@@ -1397,9 +1824,8 @@ void steer_poll(void)
 	for (int i = 0; i < NB_PATHS; i++) {
 		if (g_steer.mark_entry[i] &&
 		    doca_flow_resource_query_entry(g_steer.mark_entry[i], &q) == DOCA_SUCCESS)
-			DOCA_LOG_INFO("path%d selected-class CE marked: %lu pkts  [rate=%u]", i,
-				      q.counter.total_pkts,
-				      atomic_load_explicit(&g_steer.rate[i], memory_order_relaxed));
+			DOCA_LOG_INFO("path%d selected-class CE marked: %lu pkts", i,
+			              q.counter.total_pkts);
 	}
 	if (g_steer.clear_path_entry &&
 	    doca_flow_resource_query_entry(g_steer.clear_path_entry, &q) == DOCA_SUCCESS)
@@ -1410,10 +1836,31 @@ void steer_stop(void)
 {
 	if (!g_steer.started)
 		return;
-	if (g_steer.sf_rep_port)
-		doca_flow_port_stop(g_steer.sf_rep_port);
-	if (g_steer.port)
-		doca_flow_port_stop(g_steer.port);
-	doca_flow_destroy();
+
+	/* Prevent any later host callback from consulting Flow objects while they
+	 * are being removed. PCC is stopped by the embedding application first. */
 	g_steer.started = false;
+	g_steer.grouping_enabled = false;
+	g_steer.cnp_count_pipe = NULL;
+	g_steer.classify_pipe = NULL;
+
+	/* In switch mode port 0 is the proxy and must stop last. NVIDIA's teardown
+	 * helper flushes every port before stopping them in reverse order. */
+	if (g_steer.sf_rep_port)
+		doca_flow_port_pipes_flush(g_steer.sf_rep_port);
+	if (g_steer.port)
+		doca_flow_port_pipes_flush(g_steer.port);
+	if (g_steer.sf_rep_port) {
+		doca_error_t err = doca_flow_port_stop(g_steer.sf_rep_port);
+		if (err != DOCA_SUCCESS)
+			DOCA_LOG_WARN("failed to stop SF Flow port: %s", doca_error_get_descr(err));
+		g_steer.sf_rep_port = NULL;
+	}
+	if (g_steer.port) {
+		doca_error_t err = doca_flow_port_stop(g_steer.port);
+		if (err != DOCA_SUCCESS)
+			DOCA_LOG_WARN("failed to stop proxy Flow port: %s", doca_error_get_descr(err));
+		g_steer.port = NULL;
+	}
+	doca_flow_destroy();
 }

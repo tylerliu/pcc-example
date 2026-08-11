@@ -37,10 +37,6 @@
 #define EVENT_SUMMARY_FLOW_BUCKETS (256)
 #define PCC_TRACE_MAX_WORKERS (1024)
 #define PCC_TRACE_FLUSH_INTERVAL_US (1000000)
-#define PCC_RATE_REPORT_CONTEXT_QPN_INDEX (0)
-#define PCC_RATE_REPORT_CONTEXT_MAGIC_INDEX (1)
-#define PCC_RATE_REPORT_CONTEXT_MAGIC (0x52505451U) /* "RPTQ" */
-
 /**< Counters IDs to configure and read from */
 uint32_t counter_ids[DOCA_PCC_DEV_MAX_NUM_PORTS] = {0};
 /**< Table of TX bytes counters to sample to */
@@ -166,7 +162,11 @@ void doca_pcc_dev_user_algo(doca_pcc_dev_algo_ctxt_t *algo_ctxt,
 	static uint32_t event_count[EVENT_SUMMARY_FLOW_BUCKETS] = {0};
 	static uint32_t tx_count[EVENT_SUMMARY_FLOW_BUCKETS] = {0};
 	static uint32_t rtt_count[EVENT_SUMMARY_FLOW_BUCKETS] = {0};
+	static uint32_t cnp_count[EVENT_SUMMARY_FLOW_BUCKETS] = {0};
+	static uint32_t cnp_window_count[EVENT_SUMMARY_FLOW_BUCKETS] = {0};
 	static uint32_t last_print_ts[EVENT_SUMMARY_FLOW_BUCKETS] = {0};
+	static uint32_t bucket_owner_qpn[EVENT_SUMMARY_FLOW_BUCKETS] = {0};
+	static uint32_t collision_reported_qpn[EVENT_SUMMARY_FLOW_BUCKETS] = {0};
 	uint32_t port_num = doca_pcc_dev_get_ev_attr(event).port_num;
 	uint32_t ev_type = doca_pcc_dev_get_ev_attr(event).ev_type;
 	uint32_t *param = doca_pcc_dev_get_algo_params(port_num, attr->algo_slot);
@@ -176,51 +176,79 @@ void doca_pcc_dev_user_algo(doca_pcc_dev_algo_ctxt_t *algo_ctxt,
 	uint32_t qpn_known = 0;
 	uint32_t first_observed_flow = 0;
 
-	/* BF3 exposes flow_qpn only on TX events. For feedback events, use
-	 * the sender-local QPN cached in this per-flow algorithm context. */
+	/* BF3 exposes the QPN only on TX. libpcc supplies the algorithm context for
+	 * this QP on every event, including CNP, so retain the identity as an
+	 * explicit member of that per-QP context. */
 	if (ev_type == DOCA_PCC_DEV_EVNT_ROCE_TX) {
 		qpn = doca_pcc_dev_get_flow_qpn(event);
 		qpn_known = 1;
-		if (attr->algo_slot == 0 &&
-		    (rtt_ctxt->reserved[PCC_RATE_REPORT_CONTEXT_MAGIC_INDEX] != PCC_RATE_REPORT_CONTEXT_MAGIC ||
-		     rtt_ctxt->reserved[PCC_RATE_REPORT_CONTEXT_QPN_INDEX] != qpn)) {
-			rtt_ctxt->reserved[PCC_RATE_REPORT_CONTEXT_QPN_INDEX] = qpn;
-			rtt_ctxt->reserved[PCC_RATE_REPORT_CONTEXT_MAGIC_INDEX] = PCC_RATE_REPORT_CONTEXT_MAGIC;
+		first_observed_flow = rtt_ctxt->flow_qpn == 0;
+		if (!first_observed_flow && rtt_ctxt->flow_qpn != qpn) {
+			doca_pcc_dev_printf("PCC ERROR: algorithm context QPN changed old=0x%x new=0x%x port=%u slot=%u\n",
+					    rtt_ctxt->flow_qpn, qpn, port_num, attr->algo_slot);
+			/* Treat this as context recycling and force a host rate report for
+			 * the newly observed owner. */
+			rtt_ctxt->last_reported_rate = UINT32_MAX;
 			first_observed_flow = 1;
+			doca_pcc_dev_trace_flush();
 		}
-	} else if (attr->algo_slot == 0 &&
-	           rtt_ctxt->reserved[PCC_RATE_REPORT_CONTEXT_MAGIC_INDEX] == PCC_RATE_REPORT_CONTEXT_MAGIC) {
-		qpn = rtt_ctxt->reserved[PCC_RATE_REPORT_CONTEXT_QPN_INDEX];
+		rtt_ctxt->flow_qpn = qpn;
+	} else if (rtt_ctxt->flow_qpn != 0) {
+		qpn = rtt_ctxt->flow_qpn;
 		qpn_known = 1;
 	}
 	uint32_t flow_bucket = qpn % EVENT_SUMMARY_FLOW_BUCKETS;
 
 	uint32_t now = doca_pcc_dev_get_timer_lo();
 	if (qpn_known) {
+		/* These arrays are diagnostics indexed by qpn % table-size, not the
+		 * algorithm's real per-flow context. Never silently merge two QPs. */
+		if (bucket_owner_qpn[flow_bucket] == 0) {
+			bucket_owner_qpn[flow_bucket] = qpn;
+			last_print_ts[flow_bucket] = now;
+		} else if (bucket_owner_qpn[flow_bucket] != qpn) {
+			if (collision_reported_qpn[flow_bucket] != qpn) {
+				doca_pcc_dev_printf("PCC ERROR: bucket collision bucket=%u owner_qpn=0x%x new_qpn=0x%x\n",
+				                    flow_bucket, bucket_owner_qpn[flow_bucket], qpn);
+				collision_reported_qpn[flow_bucket] = qpn;
+			}
+			goto skip_flow_summary;
+		}
+
 		event_count[flow_bucket]++;
 		if (ev_type == DOCA_PCC_DEV_EVNT_ROCE_TX)
 			tx_count[flow_bucket]++;
 		else if (ev_type == DOCA_PCC_DEV_EVNT_RTT)
 			rtt_count[flow_bucket]++;
+		else if (ev_type == DOCA_PCC_DEV_EVNT_ROCE_CNP) {
+			cnp_count[flow_bucket]++;
+			cnp_window_count[flow_bucket]++;
+		}
 
 		if (now - last_print_ts[flow_bucket] > 1000000) {
-			doca_pcc_dev_printf("PCC: bucket=%u total=%u tx=%u rtt=%u slot=%u port=%u qpn=0x%x rate=%u\n",
+			uint32_t elapsed = now - last_print_ts[flow_bucket];
+			uint32_t cnp_per_sec =
+				(uint32_t)(((uint64_t)cnp_window_count[flow_bucket] * 1000000U) / elapsed);
+
+			doca_pcc_dev_printf("PCC: bucket=%u total=%u tx=%u rtt=%u cnp=%u cnp_s=%u "
+			                    "slot=%u port=%u qpn=0x%x rate=%u\n",
 					    flow_bucket, event_count[flow_bucket], tx_count[flow_bucket],
-					    rtt_count[flow_bucket], attr->algo_slot, port_num, qpn,
-					    rtt_ctxt->cur_rate);
+					    rtt_count[flow_bucket], cnp_count[flow_bucket], cnp_per_sec,
+					    attr->algo_slot, port_num, qpn, rtt_ctxt->cur_rate);
+			cnp_window_count[flow_bucket] = 0;
 			last_print_ts[flow_bucket] = now;
 		}
 	}
+
+skip_flow_summary:
+	;
 
 #ifdef DOCA_PCC_SAMPLE_TX_BYTES
 	thread0_calc_ports_utilization();
 #endif
 
-	/*
-	 * PCC may clone an existing algorithm context into a new flow. Keep an
-	 * owner-QPN tag in this template's reserved context words: a clone inherits
-	 * the previous owner's tag, which differs from the current event's QPN.
-	 */
+	/* Both rate state and its QPN identity live in the PCC-provided per-QP
+	 * algorithm context. */
 	uint32_t prev_rate = rtt_ctxt->cur_rate;
 
 	switch (attr->algo_slot) {
@@ -230,7 +258,7 @@ void doca_pcc_dev_user_algo(doca_pcc_dev_algo_ctxt_t *algo_ctxt,
 			doca_pcc_dev_printf("rtt_template: slot=%u ev=%u rtt_count=%u\n",
 					    attr->algo_slot, ev_type, rtt_count);
 		rtt_count++;
-		rtt_template_algo(event, param, counter, algo_ctxt, results);
+		rtt_template_algo(event, param, counter, algo_ctxt, qpn, results);
 		break;
 	}
 	default: {
@@ -241,8 +269,12 @@ void doca_pcc_dev_user_algo(doca_pcc_dev_algo_ctxt_t *algo_ctxt,
 	}
 	};
 
-	/* Report a flow's first observed slot-0 event and every later rate change. */
-	if (qpn_known && (first_observed_flow || prev_rate == 0 || results->rate != prev_rate)) {
+	/* TX establishes the QPN in this per-QP context. Every later event for the
+	 * same context, including CNP, can therefore publish its rate immediately. */
+	if (qpn_known) {
+		if (rtt_ctxt->last_reported_rate == results->rate)
+			goto skip_rate_report;
+
 		/*
 		 * Trace buffers are worker-local. Flush the startup report immediately so
 		 * each QP's initial rate reaches the host even when its worker receives
@@ -251,9 +283,12 @@ void doca_pcc_dev_user_algo(doca_pcc_dev_algo_ctxt_t *algo_ctxt,
 		uint32_t is_startup_report = first_observed_flow || prev_rate == 0;
 		doca_pcc_dev_trace_5(PCC_RATE_REPORT_FORMAT_ID, qpn, results->rate,
 				     ev_type, rtt_ctxt->rtt, now);
+		rtt_ctxt->last_reported_rate = results->rate;
 		if (is_startup_report)
 			doca_pcc_dev_trace_flush();
 	}
+
+skip_rate_report:
 
 	/*
 	 * Do not share this state across PCC workers: each worker has its own trace

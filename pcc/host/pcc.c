@@ -39,9 +39,9 @@
 #include "pcc_core.h"
 
 static const char *status_str[DOCA_PCC_PS_ERROR + 1] = {"Active", "Standby", "Deactivated", "Error"};
-static bool host_stop;
+static volatile sig_atomic_t host_stop;
 int log_level;
-static bool got_debug_sig;
+static volatile sig_atomic_t got_debug_sig;
 
 /*
  * Signal sigusr1 handler
@@ -291,6 +291,16 @@ int main(int argc, char **argv)
 	}
 
 	PRINT_INFO("Info: Finished waiting on DOCA PCC\n");
+
+	/* Quiesce PCC before destroying the DOCA Flow hash profile consulted by
+	 * asynchronous rate-report callbacks. The shared doca_dev remains open until
+	 * pcc_destroy(), after steering has released its ports. */
+	tmp_result = doca_pcc_stop(resources.doca_pcc);
+	if (tmp_result != DOCA_SUCCESS) {
+		PRINT_ERROR("Error: Failed to stop DOCA PCC before steering cleanup: %s\n",
+		            doca_error_get_descr(tmp_result));
+		DOCA_ERROR_PROPAGATE(result, tmp_result);
+	}
 
 	if (cfg.steer_enable)
 		steer_stop();

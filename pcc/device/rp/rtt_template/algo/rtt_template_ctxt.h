@@ -42,7 +42,9 @@ typedef struct {
 	uint8_t rtt_req_to_rtt_sent; /* Set between the algorithm's RTT request until the time at which the RTT packet
 					was sent */
 	uint32_t min_rtt;	     /* Minimal RTT measurement we got so far */
-	uint32_t reserved[7];	     /* Reserved bits */
+	uint32_t flow_qpn;	     /* QPN belonging to this per-flow algorithm context */
+	uint32_t last_reported_rate; /* Last rate sent to the host for this QP */
+	uint32_t reserved[5];	     /* Reserved bits */
 } cc_ctxt_rtt_template_t;
 
 #endif /* RTT_TEMPLATE_CTXT_H_ */

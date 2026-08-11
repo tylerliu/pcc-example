@@ -35,12 +35,14 @@
  * @param [in]: A pointer to an array of parameters that are used to control algo behavior (see PPCC access register)
  * @counter [in/out]: A pointer to an array of counters that are incremented by algo (see PPCC access register)
  * @algo_ctxt [in/out]: A pointer to a flow context data retrieved by libpcc.
+ * @flow_qpn [in]: Sender-local QPN resolved by the caller from the per-flow context.
  * @results [out]: A pointer to result struct to update rate in HW.
  */
 void rtt_template_algo(doca_pcc_dev_event_t *event,
 		       uint32_t *param,
 		       uint32_t *counter,
 		       doca_pcc_dev_algo_ctxt_t *algo_ctxt,
+		       uint32_t flow_qpn,
 		       doca_pcc_dev_results_t *results);
 
 /*
