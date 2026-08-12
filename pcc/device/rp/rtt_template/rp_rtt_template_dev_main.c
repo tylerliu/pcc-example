@@ -268,11 +268,14 @@ skip_flow_summary:
 		break;
 	}
 	};
+	/* The algorithm context retains the congestion-derived rate for the next
+	 * event and for host steering. Hardware enforcement is disabled below. */
+	uint32_t steering_rate = results->rate;
 
 	/* TX establishes the QPN in this per-QP context. Every later event for the
 	 * same context, including CNP, can therefore publish its rate immediately. */
 	if (qpn_known) {
-		if (rtt_ctxt->last_reported_rate == results->rate)
+		if (rtt_ctxt->last_reported_rate == steering_rate)
 			goto skip_rate_report;
 
 		/*
@@ -281,9 +284,9 @@ skip_flow_summary:
 		 * no later PCC event. Subsequent changes use the per-worker cadence below.
 		 */
 		uint32_t is_startup_report = first_observed_flow || prev_rate == 0;
-		doca_pcc_dev_trace_5(PCC_RATE_REPORT_FORMAT_ID, qpn, results->rate,
+		doca_pcc_dev_trace_5(PCC_RATE_REPORT_FORMAT_ID, qpn, steering_rate,
 				     ev_type, rtt_ctxt->rtt, now);
-		rtt_ctxt->last_reported_rate = results->rate;
+		rtt_ctxt->last_reported_rate = steering_rate;
 		if (is_startup_report)
 			doca_pcc_dev_trace_flush();
 	}
@@ -304,6 +307,11 @@ skip_rate_report:
 			last_flush_ts[worker] = now;
 		}
 	}
+
+	/* PCC is used only as a congestion sensor for the host-side path-share
+	 * controller. Never apply its calculated rate through the ordinary per-QP
+	 * hardware rate limiter. */
+	results->rate = DOCA_PCC_DEV_MAX_RATE;
 }
 
 /*

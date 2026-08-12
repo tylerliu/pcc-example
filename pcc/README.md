@@ -1,6 +1,11 @@
 # PCC rate-report trace path
 
-This PCC application reports per-flow rate information from the DPA to the host through the PCC trace stream. It is intended for observing the rate selected by the custom RTT-template / Pure-ECN algorithm; it does not alter the PCC rate-control path.
+This PCC application reports per-flow rate information from the DPA to the host
+through the PCC trace stream. The custom RTT-template / Pure-ECN algorithm keeps
+calculating its congestion-derived per-QP rate, but that value is a steering
+signal only: it is traced to the host and retained in algorithm context while
+the event result returned to PCC hardware is always `DOCA_PCC_DEV_MAX_RATE`.
+The ordinary PCC per-QP rate limiter therefore does not throttle traffic.
 
 ## Trace format
 
@@ -14,7 +19,7 @@ The DPA emits it with:
 
 ```c
 doca_pcc_dev_trace_5(PCC_RATE_REPORT_FORMAT_ID,
-                     qpn, results->rate, ev_type, rtt, now);
+                     qpn, steering_rate, ev_type, rtt, now);
 ```
 
 The five trace arguments are:
@@ -22,7 +27,7 @@ The five trace arguments are:
 | Argument | Value |
 | --- | --- |
 | 1 | QPN |
-| 2 | PCC rate, in FXP20 format |
+| 2 | calculated steering rate, in FXP20 format; not the enforced hardware rate |
 | 3 | PCC event type |
 | 4 | RTT value from the algorithm context |
 | 5 | DPA low timer value, in microseconds |
