@@ -20,12 +20,12 @@
 
 DOCA_LOG_REGISTER(FLOW_STEER_MAIN);
 
-static volatile bool g_running = true;
+static volatile sig_atomic_t g_running = 1;
 
 static void on_signal(int s)
 {
 	if (s == SIGINT || s == SIGTERM)
-		g_running = false;
+		g_running = 0;
 }
 
 #define CRASH(err, msg)                                                                    \
@@ -47,28 +47,6 @@ static doca_error_t sf_num_cb(void *param, void *config)
 		return DOCA_ERROR_INVALID_VALUE;
 	}
 	o->sf_num = (uint32_t)v;
-	return DOCA_SUCCESS;
-}
-
-static doca_error_t move_cb(void *param, void *config)
-{
-	struct steer_opts *o = config;
-	const char *s = (const char *)param;
-
-	if (strcmp(s, "none") == 0)
-		o->move_parity = STEER_MOVE_NONE;
-	else if (strcmp(s, "even") == 0 || strcmp(s, "0") == 0)
-		o->move_parity = STEER_MOVE_EVEN;
-	else if (strcmp(s, "odd") == 0 || strcmp(s, "1") == 0)
-		o->move_parity = STEER_MOVE_ODD;
-	else if (strcmp(s, "auto") == 0)
-		o->move_parity = STEER_MOVE_AUTO;
-	else if (strcmp(s, "all") == 0)
-		o->move_parity = STEER_MOVE_ALL;
-	else {
-		DOCA_LOG_ERR("--move-parity must be none|even|odd|auto|all (got '%s')", s);
-		return DOCA_ERROR_INVALID_VALUE;
-	}
 	return DOCA_SUCCESS;
 }
 
@@ -112,6 +90,30 @@ static doca_error_t p1pct_cb(void *param, void *config)
 	return DOCA_SUCCESS;
 }
 
+static doca_error_t parse_path_ip(void *param, void *config, unsigned int path)
+{
+	struct steer_opts *o = config;
+	struct in_addr addr;
+
+	if (inet_pton(AF_INET, (const char *)param, &addr) != 1) {
+		DOCA_LOG_ERR("--path%u-ip requires a valid IPv4 address", path);
+		return DOCA_ERROR_INVALID_VALUE;
+	}
+	o->path_ip[path] = addr.s_addr;
+	o->path_ip_set[path] = true;
+	return DOCA_SUCCESS;
+}
+
+static doca_error_t p0ip_cb(void *param, void *config)
+{
+	return parse_path_ip(param, config, 0);
+}
+
+static doca_error_t p1ip_cb(void *param, void *config)
+{
+	return parse_path_ip(param, config, 1);
+}
+
 #if DOCA_VERSION_MAJOR >= 3
 static doca_error_t device_cb(void *param, void *config)
 {
@@ -131,6 +133,24 @@ static doca_error_t rep_cb(void *param, void *config)
 
 	o->dev = rep_ctx->dev_ctx.dev;
 	o->dev_rep = rep_ctx->dev_rep;
+	o->dev_rep_count = 1 + (o->dev_rep_path1 != NULL);
+	if (rep_ctx->dev_ctx.devargs)
+		o->devargs = rep_ctx->dev_ctx.devargs;
+	return DOCA_SUCCESS;
+}
+
+static doca_error_t path1_rep_cb(void *param, void *config)
+{
+	struct steer_opts *o = config;
+	struct doca_argp_device_rep_ctx *rep_ctx = param;
+
+	if (o->dev != NULL && o->dev != rep_ctx->dev_ctx.dev) {
+		DOCA_LOG_ERR("path0 and path1 representors must belong to the same PF device");
+		return DOCA_ERROR_INVALID_VALUE;
+	}
+	o->dev = rep_ctx->dev_ctx.dev;
+	o->dev_rep_path1 = rep_ctx->dev_rep;
+	o->dev_rep_count = 1 + (o->dev_rep != NULL);
 	if (rep_ctx->dev_ctx.devargs)
 		o->devargs = rep_ctx->dev_ctx.devargs;
 	return DOCA_SUCCESS;
@@ -175,7 +195,6 @@ int main(int argc, char **argv)
 	struct steer_opts opts;
 
 	steer_default_opts(&opts);
-	opts.move_parity = STEER_MOVE_NONE; /* standalone default: static, no rewrite */
 
 	/*
 	 * Pre-scan --role for the DPDK --file-prefix. EAL itself is brought up by
@@ -208,19 +227,28 @@ int main(int argc, char **argv)
 
 	CRASH(doca_argp_init("doca_flow_steer", &opts), "doca_argp_init");
 	reg("sf-num", "Receiver SF number (en3f0pf0sf<N>). Default: 0", sf_num_cb);
-	reg("move-parity", "QPN parity moved to the other path: none|even|odd|all|auto. Default: none", move_cb);
 	reg("path0-percent", "Path 0 intended all-traffic CE percent [0,100]; selected-class sampling is 2x, capped at 100. Default: 100", p0pct_cb);
 	reg("path1-percent", "Path 1 intended all-traffic CE percent [0,100]; selected-class sampling is 2x, capped at 100. Default: 100", p1pct_cb);
+	reg("path0-ip", "IPv4 address delivered to the first -r receiver SF", p0ip_cb);
+	reg("path1-ip", "IPv4 address delivered to the second -r receiver SF", p1ip_cb);
 	reg("role", "Which half to build: egress (sender) | ingress (receiver) | both. Default: both", role_cb);
 #if DOCA_VERSION_MAJOR >= 3
 	reg_dev("a", "device", "DOCA device, e.g. pci/0000:03:00.0,dv_flow_en=2", device_cb, DOCA_ARGP_TYPE_DEVICE);
-	reg_dev("r", "rep", "SF representor, e.g. pci/0000:03:00.0,sf0", rep_cb, DOCA_ARGP_TYPE_DEVICE_REP);
+	reg_dev("r", "path0-rep", "Path-0 SF representor, e.g. pci/0000:03:00.0,pf0sf0", rep_cb,
+	        DOCA_ARGP_TYPE_DEVICE_REP);
+	reg_dev("R", "path1-rep", "Path-1 SF representor, e.g. pci/0000:03:00.0,pf0sf4", path1_rep_cb,
+	        DOCA_ARGP_TYPE_DEVICE_REP);
 #endif
 	CRASH(doca_argp_start(argc, argv), "doca_argp_start");
 
 #if DOCA_VERSION_MAJOR >= 3
 	if (opts.dev == NULL || opts.dev_rep == NULL) {
 		DOCA_LOG_CRIT("Specify the SF representor via -r (e.g. -r pci/0000:03:00.0,sf0,dv_flow_en=2)");
+		return EXIT_FAILURE;
+	}
+	if (opts.role != STEER_ROLE_EGRESS &&
+	    (opts.dev_rep_count != STEER_NB_PATHS || !opts.path_ip_set[0] || !opts.path_ip_set[1])) {
+		DOCA_LOG_CRIT("ingress requires -r, -R/--path1-rep, --path0-ip and --path1-ip");
 		return EXIT_FAILURE;
 	}
 #endif
@@ -236,7 +264,10 @@ int main(int argc, char **argv)
 		steer_poll();
 	}
 
+	DOCA_LOG_INFO("stopping steering");
 	steer_stop();
+	DOCA_LOG_INFO("steering stopped; destroying DOCA argp resources");
 	doca_argp_destroy();
+	DOCA_LOG_INFO("DOCA argp resources destroyed");
 	return EXIT_SUCCESS;
 }

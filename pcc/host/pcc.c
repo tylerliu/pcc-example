@@ -64,13 +64,12 @@ static void sigint_handler(int dummy)
 {
 	(void)dummy;
 	host_stop = true;
-	signal(SIGINT, SIG_DFL);
 }
 
 /*
  * Start the embedded DOCA Flow path-steering datapath in this process, in the
  * EGRESS role: this program runs on the sender (the PCC RP), so it sets the
- * DSCP path marker on the moved QPN parity at SF-egress. The receiver-side
+ * DSCP path marker according to the PCC-computed random share at SF-egress. The receiver-side
  * ingress role (CE-mark + restore) runs as a separate doca_flow_steer instance
  * on the receiver's PF. EAL is initialized with a minimal argv; the device and
  * SF representor are opened by DOCA argp (-a/-r) and passed in via cfg.
@@ -83,8 +82,11 @@ static doca_error_t start_embedded_steering(char *prog_name, const struct pcc_co
 	(void)prog_name; /* used only on the DOCA 2.9 EAL-init path below */
 	steer_default_opts(&sopts);
 	sopts.role = STEER_ROLE_EGRESS;
-	sopts.move_parity = cfg->steer_move_parity;
 	sopts.sf_num = cfg->steer_sf_num;
+	for (int path = 0; path < STEER_NB_PATHS; path++) {
+		sopts.path_ip[path] = cfg->steer_path_ip[path];
+		sopts.path_ip_set[path] = cfg->steer_path_ip_set[path];
+	}
 #if DOCA_VERSION_MAJOR >= 3
 	sopts.dev = cfg->steer_dev;
 	sopts.dev_rep = cfg->steer_dev_rep;
@@ -138,7 +140,6 @@ int main(int argc, char **argv)
 	cfg.gns = IFA2_GNS_DEFAULT_VALUE;
 	cfg.gns_ignore_value = IFA2_GNS_IGNORE_DEFAULT_VALUE;
 	cfg.gns_ignore_mask = IFA2_GNS_IGNORE_DEFAULT_MASK;
-	cfg.steer_move_parity = STEER_MOVE_AUTO; /* embedded steering default policy */
 	strcpy(cfg.coredump_file, PCC_COREDUMP_FILE_DEFAULT_PATH);
 	log_level = LOG_LEVEL_INFO;
 

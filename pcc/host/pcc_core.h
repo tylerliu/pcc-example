@@ -140,10 +140,11 @@ struct pcc_config {
 	char coredump_file[MAX_ARG_SIZE];		 /* Coredump file pathname */
 	bool steer_enable;			 /* Enable embedded DOCA Flow path steering */
 	uint32_t steer_sf_num;			 /* Receiver SF number for embedded steering (DOCA 2.9) */
-	int steer_move_parity;			 /* enum steer_move_parity for embedded egress (default AUTO) */
 	struct doca_dev *steer_dev;		 /* Sender PF device for steering (DOCA 3.x, from -a/-r) */
 	struct doca_dev_rep *steer_dev_rep;	 /* Sender SF representor for steering (DOCA 3.x, from -r) */
 	const char *steer_devargs;		 /* Optional probe devargs for steering (DOCA 3.x) */
+	uint32_t steer_path_ip[2];		 /* receiver IPs used only for PCC flow grouping */
+	bool steer_path_ip_set[2];
 	char dpa_resources_file[MAX_ARG_SIZE];		 /* DPA resources yaml file path */
 	char dpa_application_key[MAX_ARG_SIZE];		 /* DPA application file name */
 };

@@ -13,7 +13,9 @@
  *          DOCA_FLOW_ENTRY_FLAGS_WAIT_FOR_BATCH.
  *
  * This header hides those behind steer_* wrappers/macros so one source builds on
- * both. Version-gated on DOCA_VERSION_MAJOR.
+ * both. Version-gated on DOCA_VERSION_MAJOR. The legacy branch is porting
+ * scaffolding only; see README.md "Future DOCA 2.7/2.9 port" before relying on
+ * it with an older SDK.
  */
 
 #ifndef DOCA_FLOW_COMPAT_H_
@@ -25,6 +27,7 @@
 #if DOCA_VERSION_MAJOR >= 3
 
 #define STEER_WAIT_FOR_BATCH DOCA_FLOW_ENTRY_FLAGS_WAIT_FOR_BATCH
+#define STEER_NO_WAIT DOCA_FLOW_ENTRY_FLAGS_NO_WAIT
 /* parser_meta source-port field name (used as .parser_meta.STEER_PARSER_PORT). */
 #define STEER_PARSER_PORT port_id
 /* All-ones wildcard sized to the source-port field (uint16_t on 3.x). */
@@ -38,6 +41,8 @@ static inline doca_error_t steer_port_cfg_set_port_id(struct doca_flow_port_cfg 
 #else /* DOCA 2.9 */
 
 #define STEER_WAIT_FOR_BATCH DOCA_FLOW_WAIT_FOR_BATCH
+/* The legacy API submits immediately when WAIT_FOR_BATCH is absent. */
+#define STEER_NO_WAIT 0
 #define STEER_PARSER_PORT port_meta
 /* All-ones wildcard sized to the source-port field (uint32_t on 2.9). */
 #define STEER_PORT_ALL 0xFFFFFFFFu

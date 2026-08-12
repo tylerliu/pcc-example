@@ -2,7 +2,7 @@
  *
  * Egress admits IPv4 RoCEv2/UDP 4791 and uses parser_meta.random to write a
  * two-way DSCP path marker. Ingress first demuxes by path, then runs one
- * learned exact-QPN marker per path. Only receiver-QPN LSB==path may be newly CE-marked; all
+ * destination-IP marker per path. Only packets whose receiver IP belongs to the selected path may be newly CE-marked; all
  * branches clear the private path marker before SF delivery.
  */
 
@@ -49,7 +49,6 @@ DOCA_LOG_REGISTER(FLOW_STEER);
 #define IB_CM_ATTR_REQ 0x0010u
 #define IB_CM_ATTR_REP 0x0013u
 #define ROCE_BTH_OPCODE_CNP 0x81u
-#define ROCE_UDP_PORT_MOVED 4792 /* legacy: UDP-port marker (breaks RoCEv2 ICRC; no longer used) */
 #define IP4_DSCP_ECN_CE 0x03	 /* ECN=11 (CE); set masked so DSCP is preserved */
 #define IP4_ECN_MASK 0x03	 /* the two ECN bits of the ToS byte */
 /*
@@ -69,9 +68,8 @@ DOCA_LOG_REGISTER(FLOW_STEER);
 /* path id (0/1) -> ToS value for the masked write, and back */
 #define PATH_DSCP_VAL(path) ((uint8_t)((path) ? PATH_DSCP_MASK : 0x00))
 
-/* EGRESS_CLASSIFY distributes packets independently of QPN. Hashing the HW
- * parser random value gives a per-packet 50/50 choice between the two buckets,
- * following the DOCA 3.4 flow_random sample. */
+/* EGRESS_CLASSIFY distributes packets independently of QPN. The low bits of
+ * the HW parser random value select an explicit per-packet bucket. */
 
 #define NB_PATHS STEER_NB_PATHS
 
@@ -81,8 +79,6 @@ DOCA_LOG_REGISTER(FLOW_STEER);
  * (same technique as the tutorial doca_flow_ecn.c / DOCA flow_random sample).
  */
 #define RANDOM_FIELD_WIDTH 16
-
-/* enum steer_move_parity and struct steer_opts are defined in steer.h */
 
 /* Log at CRIT level and terminate if err != DOCA_SUCCESS -- mirrors rte_exit(). */
 static __attribute__((format(printf, 2, 3))) void crash_if_unsuccessful(doca_error_t err, const char *fmt, ...)
@@ -112,7 +108,11 @@ static void entry_process_cb(struct doca_flow_pipe_entry *entry, uint16_t pipe_q
 {
 	(void)entry;
 	(void)pipe_queue;
-	(void)op;
+	/* Entry usr_ctx points at the batch status used while an ADD/UPDATE is
+	 * synchronously processed. Most setup batches are stack-local and are no
+	 * longer valid when a later pipe flush reports DEL/AGED completions. */
+	if (op != DOCA_FLOW_ENTRY_OP_ADD && op != DOCA_FLOW_ENTRY_OP_UPD)
+		return;
 	struct entry_batch_status *s = user_ctx;
 
 	if (s == NULL)
@@ -123,9 +123,8 @@ static void entry_process_cb(struct doca_flow_pipe_entry *entry, uint16_t pipe_q
 }
 
 /*
- * Stable usr_ctx for the classify entries. A live steer_apply() updates those
- * entries, and the completion callback fires with the usr_ctx bound at add
- * time; a stack-local status would dangle, so use a static one.
+ * Stable usr_ctx for classify entries because live updates reuse the usr_ctx
+ * bound when each rule was added.
  */
 static struct entry_batch_status g_classify_batch;
 
@@ -205,10 +204,11 @@ static uint16_t g_dpdk_rx_port_id = UINT16_MAX;
  * default for the other PF). NOTE: repr_matching_en and representor=sfN are NOT
  * valid probe keys on 3.x -- the representor is passed as a doca_dev_rep object.
  */
-static void probe_device(struct doca_dev *dev, const char *devargs, struct doca_dev_rep *dev_rep)
+static void probe_device(struct doca_dev *dev, const char *devargs, struct doca_dev_rep **dev_reps,
+			 uint32_t nb_reps)
 {
 	const char *args = (devargs && devargs[0]) ? devargs : "dv_flow_en=2,fdb_def_rule_en=1";
-	doca_error_t err = doca_dpdk_port_probe_with_representors(dev, args, &dev_rep, 1);
+	doca_error_t err = doca_dpdk_port_probe_with_representors(dev, args, dev_reps, nb_reps);
 
 	crash_if_unsuccessful(err, "doca_dpdk_port_probe_with_representors");
 }
@@ -471,9 +471,10 @@ static struct doca_flow_port *rep_port_start(uint16_t dpdk_port_id)
 }
 #endif
 
-/* Port ids in the eSwitch: 0 = p0 wire uplink, 1 = SF representor (receiver). */
+/* Logical eSwitch ports: uplink 0, path-0 SF 1, optional path-1 SF 2. */
 #define WIRE_PORT_ID 0
 #define SF_PORT_ID 1
+#define SF_PATH1_PORT_ID 2
 
 /*
  * DELIVER pipe: forward-only basic pipe whose HIT fate is a port. On 3.x HWS a
@@ -525,6 +526,56 @@ static struct doca_flow_pipe *create_deliver_pipe(struct doca_flow_port *port, c
 	return pipe;
 }
 
+/* Final PF0 receiver selection. The path bit and ECN policy are handled before
+ * this pipe; delivery itself is determined solely by the packet's original
+ * RoCE destination IP. */
+static struct doca_flow_pipe *create_receiver_ip_demux(struct doca_flow_port *port,
+						       struct doca_flow_pipe *deliver_sf[NB_PATHS],
+						       const uint32_t path_ip[NB_PATHS])
+{
+	struct doca_flow_match match = {0}, match_mask = {0};
+	struct doca_flow_fwd fwd = {.type = DOCA_FLOW_FWD_CHANGEABLE};
+	struct doca_flow_fwd fwd_miss = {.type = DOCA_FLOW_FWD_PIPE, .next_pipe = deliver_sf[0]};
+	struct doca_flow_pipe_cfg *cfg;
+	struct doca_flow_pipe *pipe;
+	doca_error_t err;
+
+	match.outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;
+	match.outer.ip4.dst_ip = UINT32_MAX;
+	match_mask.outer.l3_type = UINT32_MAX;
+	match_mask.outer.ip4.dst_ip = UINT32_MAX;
+
+	err = doca_flow_pipe_cfg_create(&cfg, port);
+	crash_if_unsuccessful(err, "pipe_cfg_create (receiver IP demux)");
+	crash_if_unsuccessful(doca_flow_pipe_cfg_set_name(cfg, "RECEIVER_IP_DEMUX"),
+				"pipe_cfg_set_name (receiver IP demux)");
+	crash_if_unsuccessful(doca_flow_pipe_cfg_set_type(cfg, DOCA_FLOW_PIPE_BASIC),
+				"pipe_cfg_set_type (receiver IP demux)");
+	crash_if_unsuccessful(doca_flow_pipe_cfg_set_nr_entries(cfg, NB_PATHS),
+				"pipe_cfg_set_nr_entries (receiver IP demux)");
+	crash_if_unsuccessful(doca_flow_pipe_cfg_set_match(cfg, &match, &match_mask),
+				"pipe_cfg_set_match (receiver IP demux)");
+	err = doca_flow_pipe_create(cfg, &fwd, &fwd_miss, &pipe);
+	crash_if_unsuccessful(err, "pipe_create (receiver IP demux)");
+	doca_flow_pipe_cfg_destroy(cfg);
+
+	struct entry_batch_status status = {0};
+	for (int path = 0; path < NB_PATHS; path++) {
+		struct doca_flow_match entry_match = {0};
+		struct doca_flow_fwd entry_fwd = {.type = DOCA_FLOW_FWD_PIPE, .next_pipe = deliver_sf[path]};
+		struct doca_flow_pipe_entry *entry;
+
+		entry_match.outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;
+		entry_match.outer.ip4.dst_ip = path_ip[path];
+		err = steer_pipe_add_entry(0, pipe, &entry_match, 0, NULL, NULL, &entry_fwd,
+					   path == 0 ? STEER_WAIT_FOR_BATCH : 0, &status, &entry);
+		crash_if_unsuccessful(err, "pipe_add_entry (receiver IP path %d)", path);
+	}
+	process_entries(port, &status, NB_PATHS, "receiver IP demux entries");
+	DOCA_LOG_INFO("RECEIVER_IP_DEMUX ready: path IPs -> SF ports 1/2");
+	return pipe;
+}
+
 /*
  * Mask-based random matching supports only negative-power-of-two percentages
  * (50, 25, 12.5, ...): rounds the request down to the nearest supported one.
@@ -567,6 +618,10 @@ static struct doca_flow_pipe *create_random_sample_pipe(struct doca_flow_port *p
 	struct entry_batch_status status = {0};
 	doca_error_t err;
 
+	/* EGRESS_CLASSIFY consumes random bit 0 as the path selector. Sampling that
+	 * same bit makes path1 (bit0==1) unable to match value zero and doubles the
+	 * conditional probability on path0. Use only the higher random bits. */
+	random_mask = (uint16_t)(random_mask << 1);
 	match.parser_meta.random = 0;
 	match_mask.parser_meta.random = random_mask;
 
@@ -598,7 +653,7 @@ static struct doca_flow_pipe *create_random_sample_pipe(struct doca_flow_port *p
 
 /*
  * INGRESS_PATH_DEMUX (non-root): classify looped-back wire ingress by the DSCP
- * path bit (written at egress) into two independent path-specific QPN hash markers.
+ * path bit (written at egress) into two independent path-specific destination-IP markers.
  * Non-IPv4 misses go to the shared clear-and-deliver pipe.
  */
 static struct doca_flow_pipe *create_path_demux_pipe(struct doca_flow_port *port,
@@ -649,22 +704,14 @@ static struct doca_flow_pipe *create_path_demux_pipe(struct doca_flow_port *port
 		crash_if_unsuccessful(err, "pipe_add_entry (path demux %d)", i);
 	}
 	process_entries(port, &status, NB_PATHS, "path demux entries");
-	DOCA_LOG_INFO("Path demux ready: path0->PATH0_QPN_MATCH path1->PATH1_QPN_MATCH by DSCP bit 0x%02x",
+	DOCA_LOG_INFO("Path demux ready: path0->PATH0_IP_MATCH path1->PATH1_IP_MATCH by DSCP bit 0x%02x",
 	              PATH_DSCP_MASK);
 	return pipe;
 }
 
-/* Current path of a QP: home path = parity (even->0, odd->1); flipped when this
- * parity is "moved" (or under MOVE_ALL) onto the other path. */
-static int current_path(int parity, int move_parity)
-{
-	bool moved = (move_parity == STEER_MOVE_ALL) || (parity == move_parity);
-
-	return moved ? (parity ^ 1) : parity;
-}
-
-/* EGRESS_CLASSIFY (HASH pipe): parser_meta.random selects one of two buckets
- * per packet. Each bucket writes its DSCP path bit and forwards to the wire. */
+/* EGRESS_CLASSIFY (BASIC pipe): the low six parser_meta.random bits select one
+ * of 64 persistent buckets. The pipe reserves another 64 rule slots because
+ * HWS entry replacement temporarily consumes a new rule index. */
 static struct doca_flow_pipe *create_classify_pipe(struct doca_flow_port *port, struct doca_flow_pipe *deliver_wire)
 {
 	struct doca_flow_match match_mask = {0};
@@ -672,14 +719,13 @@ static struct doca_flow_pipe *create_classify_pipe(struct doca_flow_port *port, 
 	struct doca_flow_actions set0_mask = {0}, set1_mask = {0};
 	struct doca_flow_actions *actions_arr[2] = {&set0, &set1};
 	struct doca_flow_actions *actions_masks_arr[2] = {&set0_mask, &set1_mask};
-	struct doca_flow_monitor monitor = {.counter_type = DOCA_FLOW_RESOURCE_TYPE_NON_SHARED};
 	struct doca_flow_fwd fwd = {.type = DOCA_FLOW_FWD_PIPE, .next_pipe = deliver_wire};
 	struct doca_flow_pipe_cfg *cfg;
 	struct doca_flow_pipe *pipe;
 	doca_error_t err;
 
 	/* Per-packet random distribution, independent of all flow fields. */
-	match_mask.parser_meta.random = RTE_BE16(UINT16_MAX);
+	match_mask.parser_meta.random = RTE_BE16(PATH_SHARE_BUCKETS - 1);
 
 	/* Two masked-write templates; entry (bucket) idx selects idx0=path0, idx1=path1. */
 	set0.outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;
@@ -695,21 +741,18 @@ static struct doca_flow_pipe *create_classify_pipe(struct doca_flow_port *port, 
 	crash_if_unsuccessful(err, "pipe_cfg_create (classify)");
 	err = doca_flow_pipe_cfg_set_name(cfg, "EGRESS_CLASSIFY");
 	crash_if_unsuccessful(err, "pipe_cfg_set_name (classify)");
-	err = doca_flow_pipe_cfg_set_type(cfg, DOCA_FLOW_PIPE_HASH);
+	err = doca_flow_pipe_cfg_set_type(cfg, DOCA_FLOW_PIPE_BASIC);
 	crash_if_unsuccessful(err, "pipe_cfg_set_type (classify)");
 	err = doca_flow_pipe_cfg_set_domain(cfg, DOCA_FLOW_PIPE_DOMAIN_DEFAULT);
 	crash_if_unsuccessful(err, "pipe_cfg_set_domain (classify)");
 	err = doca_flow_pipe_cfg_set_is_root(cfg, false);
 	crash_if_unsuccessful(err, "pipe_cfg_set_is_root (classify)");
-	err = doca_flow_pipe_cfg_set_nr_entries(cfg, NB_PATHS); /* 2 buckets (power of 2) */
+	err = doca_flow_pipe_cfg_set_nr_entries(cfg, PATH_SHARE_BUCKETS * 2);
 	crash_if_unsuccessful(err, "pipe_cfg_set_nr_entries (classify)");
 	err = doca_flow_pipe_cfg_set_match(cfg, NULL, &match_mask);
 	crash_if_unsuccessful(err, "pipe_cfg_set_match (classify)");
 	err = doca_flow_pipe_cfg_set_actions(cfg, actions_arr, actions_masks_arr, NULL, 2);
 	crash_if_unsuccessful(err, "pipe_cfg_set_actions (classify)");
-	err = doca_flow_pipe_cfg_set_monitor(cfg, &monitor);
-	crash_if_unsuccessful(err, "pipe_cfg_set_monitor (classify)");
-
 	err = doca_flow_pipe_create(cfg, &fwd, NULL, &pipe);
 	crash_if_unsuccessful(err, "pipe_create (classify)");
 	doca_flow_pipe_cfg_destroy(cfg);
@@ -717,35 +760,39 @@ static struct doca_flow_pipe *create_classify_pipe(struct doca_flow_port *port, 
 }
 
 /*
- * Add the two random-distribution buckets; bucket i writes DSCP path bit i.
+ * Preallocate all random-distribution buckets once. Startup is 32/32; later
+ * ratio changes update existing entries and never add or remove rules.
  */
-static void add_classify_entries(struct doca_flow_pipe *pipe, struct doca_flow_port *port, int move_parity,
-				 struct doca_flow_pipe_entry *entries[NB_PATHS])
+static void add_classify_entries(struct doca_flow_pipe *pipe, struct doca_flow_port *port,
+				 struct doca_flow_pipe_entry *entries[PATH_SHARE_BUCKETS],
+				 uint8_t bucket_path[PATH_SHARE_BUCKETS])
 {
 	doca_error_t err;
 
-	(void)move_parity; /* hash bucket = native path; no move on this pipe */
 	memset(&g_classify_batch, 0, sizeof(g_classify_batch));
 
-	for (uint32_t idx = 0; idx < NB_PATHS; idx++) {
+	for (uint32_t idx = 0; idx < PATH_SHARE_BUCKETS; idx++) {
+		struct doca_flow_match match = {0};
 		struct doca_flow_actions actions = {0};
-		struct doca_flow_monitor monitor = {.counter_type = DOCA_FLOW_RESOURCE_TYPE_NON_SHARED};
-		uint32_t flags = (idx == 0) ? STEER_WAIT_FOR_BATCH : 0;
+		uint32_t flags = (idx == PATH_SHARE_BUCKETS - 1) ? 0 : STEER_WAIT_FOR_BATCH;
+		uint8_t path = idx < PATH_SHARE_BUCKETS / 2 ? 0 : 1;
 
 		actions.outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;
-		actions.outer.ip4.dscp_ecn = PATH_DSCP_VAL(idx);
+		actions.outer.ip4.dscp_ecn = PATH_DSCP_VAL(path);
+		match.parser_meta.random = RTE_BE16(idx);
 
-		err = doca_flow_pipe_hash_add_entry(0, pipe, idx, (uint8_t)idx, &actions, &monitor, NULL, flags,
-						    &g_classify_batch, &entries[idx]);
-		crash_if_unsuccessful(err, "pipe_hash_add_entry (bucket=%u)", idx);
+		err = steer_pipe_add_entry(0, pipe, &match, path, &actions, NULL, NULL, flags,
+					   &g_classify_batch, &entries[idx]);
+		crash_if_unsuccessful(err, "pipe_add_entry (classify bucket=%u)", idx);
+		bucket_path[idx] = path;
 	}
-	process_entries(port, &g_classify_batch, NB_PATHS, "classify (hash) entries");
-	DOCA_LOG_INFO("Classify hash pipe ready: bucket0->path0 bucket1->path1 using parser_meta.random");
+	process_entries(port, &g_classify_batch, PATH_SHARE_BUCKETS, "classify entries");
+	DOCA_LOG_INFO("Classify random-bucket pipe ready: 64 persistent rules plus 64 update slots, initial ratio 32:32");
 }
 
 /* EGRESS_ROCE_CHECK (non-root): admit only IPv4 RoCEv2 on UDP 4791 to
  * the random path classifier. All other SF-egress traffic bypasses
- * the hash pipe and is delivered to the wire unchanged. */
+ * the random-bucket pipe and is delivered to the wire unchanged. */
 static struct doca_flow_pipe *create_roce_check_pipe(struct doca_flow_port *port, const char *name,
                                                      struct doca_flow_pipe *roce_target,
                                                      struct doca_flow_pipe *bypass_target)
@@ -946,7 +993,7 @@ static void install_qp1_clone_paths(struct doca_flow_port *port,
  *   miss -> DROP
  */
 static void create_port_demux_pipe(struct doca_flow_port *port, struct doca_flow_pipe *sf_target,
-				   struct doca_flow_pipe *wire_target)
+				   struct doca_flow_pipe *wire_target, uint32_t nb_sf_ports)
 {
 	struct doca_flow_match match = {0};
 	struct doca_flow_match match_mask = {0};
@@ -969,7 +1016,7 @@ static void create_port_demux_pipe(struct doca_flow_port *port, struct doca_flow
 	crash_if_unsuccessful(err, "pipe_cfg_set_domain (demux)");
 	err = doca_flow_pipe_cfg_set_is_root(cfg, true);
 	crash_if_unsuccessful(err, "pipe_cfg_set_is_root (demux)");
-	err = doca_flow_pipe_cfg_set_nr_entries(cfg, 2);
+	err = doca_flow_pipe_cfg_set_nr_entries(cfg, 1 + nb_sf_ports);
 	crash_if_unsuccessful(err, "pipe_cfg_set_nr_entries (demux)");
 	err = doca_flow_pipe_cfg_set_match(cfg, &match, &match_mask);
 	crash_if_unsuccessful(err, "pipe_cfg_set_match (demux)");
@@ -992,23 +1039,26 @@ static void create_port_demux_pipe(struct doca_flow_port *port, struct doca_flow
 				   &entry);
 	crash_if_unsuccessful(err, "pipe_add_entry (demux wire->target)");
 
-	/* SF egress (port 1) -> sf_target (classify on sender, plain deliver on receiver) */
-	entry_match.parser_meta.STEER_PARSER_PORT = SF_PORT_ID;
-	memset(&entry_fwd, 0, sizeof(entry_fwd));
-	entry_fwd.type = DOCA_FLOW_FWD_PIPE;
-	entry_fwd.next_pipe = sf_target;
-	err = steer_pipe_add_entry(0, pipe, &entry_match, 0, NULL, NULL, &entry_fwd, 0, &status, &entry);
-	crash_if_unsuccessful(err, "pipe_add_entry (demux sf->target)");
+	/* Every receiver SF egresses through the same wire-facing target. */
+	for (uint32_t path = 0; path < nb_sf_ports; path++) {
+		entry_match.parser_meta.STEER_PARSER_PORT = SF_PORT_ID + path;
+		memset(&entry_fwd, 0, sizeof(entry_fwd));
+		entry_fwd.type = DOCA_FLOW_FWD_PIPE;
+		entry_fwd.next_pipe = sf_target;
+		err = steer_pipe_add_entry(0, pipe, &entry_match, 0, NULL, NULL, &entry_fwd, 0,
+					   &status, &entry);
+		crash_if_unsuccessful(err, "pipe_add_entry (demux sf%u->target)", path);
+	}
 
-	process_entries(port, &status, 2, "demux entries");
-	DOCA_LOG_INFO("Port demux ready: wire-ingress and SF-egress routed per role");
+	process_entries(port, &status, 1 + nb_sf_ports, "demux entries");
+	DOCA_LOG_INFO("Port demux ready: wire ingress and %u SF egress port(s) routed", nb_sf_ports);
 }
 
 /* CLI parsing lives in the standalone main (doca_flow_steer.c). */
 
 /* Final ingress bypass action: remove only the private DSCP path marker and
  * preserve the packets existing ECN bits. Selected-class sampling misses and
- * non-selected QPN classes both terminate here. */
+ * destination-IP mismatches both terminate here. */
 static struct doca_flow_pipe *create_clear_path_pipe(struct doca_flow_port *port,
 					      struct doca_flow_pipe *deliver_sf,
 					      struct doca_flow_pipe_entry **entry_out)
@@ -1063,7 +1113,7 @@ static struct doca_flow_pipe *create_clear_path_pipe(struct doca_flow_port *port
 }
 
 /* Per-path selected-class marker. Packets reach this pipe only after that
- * paths QPN hash selected its matching class and optional sampling hit. */
+ * path's destination-IP match and optional sampling hit. */
 static struct doca_flow_pipe *create_selected_mark_pipe(struct doca_flow_port *port, int path,
 						 struct doca_flow_pipe *deliver_sf,
 						 struct doca_flow_pipe_entry **entry_out)
@@ -1112,14 +1162,16 @@ static struct doca_flow_pipe *create_selected_mark_pipe(struct doca_flow_port *p
 	return pipe;
 }
 
-/* Per-path exact-QPN classifier. QP1 CM parsing installs each learned receiver
- * QPN only in the pipe matching qpn&1; unknown and opposite-class QPs miss to
- * the unmarked clear-path target. */
-static struct doca_flow_pipe *create_path_qpn_match_pipe(struct doca_flow_port *port, int path,
-						 struct doca_flow_pipe *selected_target,
-						 struct doca_flow_pipe *clear_target)
+/* Each virtual path has one independent ECN marker. It is eligible only when
+ * the packet's original destination IP belongs to that path's receiver SF. */
+static struct doca_flow_pipe *create_path_ip_match_pipe(struct doca_flow_port *port, int path,
+						struct doca_flow_pipe *selected_target,
+						struct doca_flow_pipe *clear_target,
+						uint32_t path_ip,
+						struct doca_flow_pipe_entry **entry_out)
 {
-	struct doca_flow_match match = {0}, match_mask = {0};
+	struct doca_flow_match match = {0}, match_mask = {0}, entry_match = {0};
+	struct doca_flow_monitor monitor = {.counter_type = DOCA_FLOW_RESOURCE_TYPE_NON_SHARED};
 	struct doca_flow_fwd fwd = {.type = DOCA_FLOW_FWD_PIPE, .next_pipe = selected_target};
 	struct doca_flow_fwd fwd_miss = {.type = DOCA_FLOW_FWD_PIPE, .next_pipe = clear_target};
 	struct doca_flow_pipe_cfg *cfg;
@@ -1128,14 +1180,10 @@ static struct doca_flow_pipe *create_path_qpn_match_pipe(struct doca_flow_port *
 	doca_error_t err;
 
 	match.outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;
-	match.outer.l4_type_ext = DOCA_FLOW_L4_TYPE_EXT_ROCE_V2;
-	memset(match.outer.roce_v2.bth.dest_qp, 0xFF,
-	       sizeof(match.outer.roce_v2.bth.dest_qp));
+	match.outer.ip4.dst_ip = UINT32_MAX;
 	match_mask.outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;
-	match_mask.outer.l4_type_ext = DOCA_FLOW_L4_TYPE_EXT_ROCE_V2;
-	memset(match_mask.outer.roce_v2.bth.dest_qp, 0xFF,
-	       sizeof(match_mask.outer.roce_v2.bth.dest_qp));
-	snprintf(name, sizeof(name), "PATH%d_QPN_MATCH", path);
+	match_mask.outer.ip4.dst_ip = UINT32_MAX;
+	snprintf(name, sizeof(name), "PATH%d_IP_MATCH", path);
 
 	err = doca_flow_pipe_cfg_create(&cfg, port);
 	crash_if_unsuccessful(err, "pipe_cfg_create (%s)", name);
@@ -1143,14 +1191,24 @@ static struct doca_flow_pipe *create_path_qpn_match_pipe(struct doca_flow_port *
 	crash_if_unsuccessful(doca_flow_pipe_cfg_set_type(cfg, DOCA_FLOW_PIPE_BASIC), "pipe_cfg_set_type (%s)", name);
 	crash_if_unsuccessful(doca_flow_pipe_cfg_set_domain(cfg, DOCA_FLOW_PIPE_DOMAIN_DEFAULT), "pipe_cfg_set_domain (%s)", name);
 	crash_if_unsuccessful(doca_flow_pipe_cfg_set_is_root(cfg, false), "pipe_cfg_set_is_root (%s)", name);
-	crash_if_unsuccessful(doca_flow_pipe_cfg_set_nr_entries(cfg, MAX_CM_CONNECTIONS),
+	crash_if_unsuccessful(doca_flow_pipe_cfg_set_nr_entries(cfg, 1),
 	                      "pipe_cfg_set_nr_entries (%s)", name);
 	crash_if_unsuccessful(doca_flow_pipe_cfg_set_match(cfg, &match, &match_mask),
 	                      "pipe_cfg_set_match (%s)", name);
+	crash_if_unsuccessful(doca_flow_pipe_cfg_set_monitor(cfg, &monitor),
+	                      "pipe_cfg_set_monitor (%s)", name);
 	err = doca_flow_pipe_create(cfg, &fwd, &fwd_miss, &pipe);
 	crash_if_unsuccessful(err, "pipe_create (%s)", name);
 	doca_flow_pipe_cfg_destroy(cfg);
-	DOCA_LOG_INFO("%s ready: learned receiver QPNs with LSB=%d are selected", name, path);
+	entry_match.outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;
+	entry_match.outer.ip4.dst_ip = path_ip;
+	struct entry_batch_status status = {0};
+	err = steer_pipe_add_entry(0, pipe, &entry_match, 0, NULL, &monitor, NULL, 0,
+	                           &status, entry_out);
+	crash_if_unsuccessful(err, "pipe_add_entry (%s)", name);
+	process_entries(port, &status, 1, name);
+	DOCA_LOG_INFO("%s ready: destination IP 0x%08x is eligible for path%d CE", name,
+	              rte_be_to_cpu_32(path_ip), path);
 	return pipe;
 }
 
@@ -1233,37 +1291,42 @@ static struct doca_flow_pipe *path_ce_target(struct doca_flow_port *port, int id
 
 struct rate_flow_state {
 	uint32_t qpn; /* PCC sender/initiator QPN */
-	uint32_t hash_qpn; /* mapped receiver/responder QPN used by ingress */
+	uint32_t receiver_qpn; /* optional responder QPN learned from CM REP */
 	uint32_t latest_rate;
-	uint8_t qpn_class;
+	uint64_t interval_rate_sum;
+	uint64_t interval_rate_reports;
+	uint8_t path;
 	bool classified;
 };
 
 struct cm_request_state {
 	uint32_t comm_id;
 	uint32_t initiator_qpn;
+	uint32_t receiver_ip;
+	uint8_t path;
+	bool path_known;
 };
 
 struct qpn_pair_state {
 	uint32_t initiator_qpn;
 	uint32_t responder_qpn;
+	uint8_t path;
 };
 
 struct steer_state {
 	bool started;
 	struct steer_opts opts;
 	struct doca_flow_port *port;
-	struct doca_flow_port *sf_rep_port;
+	struct doca_flow_port *sf_rep_port[NB_PATHS];
 	struct doca_flow_pipe *classify_pipe;
-	struct doca_flow_pipe *qpn_match_pipe[NB_PATHS];
 	struct doca_flow_pipe *cnp_count_pipe;
 	bool grouping_enabled;
-	bool classify_is_hash; /* classify is a HASH pipe (fixed buckets, no live move) */
-	struct doca_flow_pipe_entry *classify_entry[NB_PATHS];
+	struct doca_flow_pipe_entry *classify_entry[PATH_SHARE_BUCKETS];
+	uint8_t classify_bucket_path[PATH_SHARE_BUCKETS];
+	uint32_t applied_path0_share;
+	struct doca_flow_pipe_entry *path_ip_entry[NB_PATHS];
 	struct doca_flow_pipe_entry *mark_entry[NB_PATHS];
 	struct doca_flow_pipe_entry *clear_path_entry;
-	uint32_t installed_receiver_qpn[MAX_CM_CONNECTIONS];
-	uint32_t installed_receiver_qpn_count;
 	uint32_t cnp_sender_qpn[MAX_CNP_TRACKED_QPS];
 	uint8_t cnp_path[MAX_CNP_TRACKED_QPS];
 	struct doca_flow_pipe_entry *cnp_entry[MAX_CNP_TRACKED_QPS];
@@ -1275,8 +1338,6 @@ struct steer_state {
 	struct qpn_pair_state qpn_pair[MAX_CM_CONNECTIONS];
 	uint32_t qpn_pair_count;
 	atomic_flag rate_lock;
-	_Atomic uint32_t rate[NB_PATHS]; /* per-parity PCC rate (FXP20) */
-	int applied_move;		 /* enum steer_move_parity currently programmed */
 };
 
 static struct steer_state g_steer;
@@ -1286,75 +1347,50 @@ void steer_default_opts(struct steer_opts *opts)
 	memset(opts, 0, sizeof(*opts));
 	opts->sf_num = 0;
 	opts->role = STEER_ROLE_BOTH;
-	opts->move_parity = STEER_MOVE_AUTO;
 	opts->path_percent[0] = 100.0;
 	opts->path_percent[1] = 100.0;
-	opts->auto_ratio_threshold = 0.5;
 }
 
-/*
- * Resolve the effective "moved" parity. Fixed configs return opts.move_parity.
- * STEER_MOVE_AUTO derives it from per-parity PCC rate: the more-congested parity
- * (lower rate) is moved onto the alternate (4792) path once its rate falls below
- * auto_ratio_threshold * the other parity's rate.
- *
- * NOTE: this AUTO policy is a first, deliberately simple placeholder; the exact
- * PCC-driven policy is intended to be refined later.
- */
-static int steer_decide(void)
+/* Enforce a calculated path share by changing only persistent buckets whose
+ * assignment crosses the old/new boundary. No entry is added or removed. */
+static void apply_path_share(uint32_t path0_share)
 {
-	if (g_steer.opts.move_parity != STEER_MOVE_AUTO)
-		return g_steer.opts.move_parity;
-
-	uint32_t r_even = atomic_load_explicit(&g_steer.rate[0], memory_order_relaxed);
-	uint32_t r_odd = atomic_load_explicit(&g_steer.rate[1], memory_order_relaxed);
-
-	if (r_even == 0 || r_odd == 0)
-		return STEER_MOVE_NONE; /* no rate yet for one path */
-
-	double thr = g_steer.opts.auto_ratio_threshold;
-
-	if ((double)r_even < (double)r_odd * thr)
-		return STEER_MOVE_EVEN;
-	if ((double)r_odd < (double)r_even * thr)
-		return STEER_MOVE_ODD;
-	return STEER_MOVE_NONE;
-}
-
-/* Reprogram the classify entries so `move_parity` is rewritten 4791->4792. */
-static void steer_apply(int move_parity)
-{
-	doca_error_t err = DOCA_SUCCESS;
-
-	memset(&g_classify_batch, 0, sizeof(g_classify_batch));
-
-	for (int parity = 0; parity < NB_PATHS; parity++) {
-		struct doca_flow_actions actions = {0};
-		struct doca_flow_monitor monitor = {.counter_type = DOCA_FLOW_RESOURCE_TYPE_NON_SHARED};
-
-		/* action_idx = current path under `move_parity` (0 or 1); the template
-		 * for that idx writes the DSCP path bit accordingly. */
-		uint8_t aidx = (uint8_t)current_path(parity, move_parity);
-
-		actions.outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;
-		actions.outer.ip4.dscp_ecn = PATH_DSCP_VAL(aidx);
-
-		err = steer_pipe_update_entry(0, g_steer.classify_pipe, aidx, &actions, &monitor, NULL, 0,
-					      g_steer.classify_entry[parity]);
-		if (err != DOCA_SUCCESS)
-			break;
-	}
-
-	/* A live-update failure (e.g. transient HWS pool pressure) must not kill the
-	 * embedding process. Leave applied_move unchanged so the next poll retries. */
-	if (err != DOCA_SUCCESS) {
-		DOCA_LOG_WARN("classify update failed (%s); keeping move_parity=%d, will retry",
-			      doca_error_get_descr(err), g_steer.applied_move);
+	if (g_steer.classify_pipe == NULL || path0_share > PATH_SHARE_BUCKETS ||
+	    path0_share == g_steer.applied_path0_share)
 		return;
+
+	uint32_t old_share = g_steer.applied_path0_share;
+	for (uint32_t bucket = 0; bucket < PATH_SHARE_BUCKETS; bucket++) {
+		uint8_t wanted_path = bucket < path0_share ? 0 : 1;
+		if (g_steer.classify_bucket_path[bucket] == wanted_path)
+			continue;
+
+		memset(&g_classify_batch, 0, sizeof(g_classify_batch));
+		doca_error_t err = steer_pipe_update_entry(0, g_steer.classify_pipe, wanted_path,
+							 NULL, NULL, NULL, STEER_NO_WAIT,
+							 g_steer.classify_entry[bucket]);
+		if (err == DOCA_SUCCESS)
+			err = doca_flow_entries_process(g_steer.port, 0, 10000, 1);
+		if (err != DOCA_SUCCESS || g_classify_batch.failure ||
+		    g_classify_batch.nb_processed != 1) {
+			DOCA_LOG_WARN("path-share update failed at bucket %u (%s); will retry",
+			              bucket, doca_error_get_descr(err != DOCA_SUCCESS ? err : DOCA_ERROR_BAD_STATE));
+			return;
+		}
+		g_steer.classify_bucket_path[bucket] = wanted_path;
 	}
-	process_entries(g_steer.port, &g_classify_batch, NB_PATHS, "classify update");
-	g_steer.applied_move = move_parity;
-	DOCA_LOG_INFO("steer decision applied: move_parity=%d", move_parity);
+
+	/* Processing one completion per update can return before HWS has retired
+	 * the replaced rule version. Drain those internal operations now so pipe
+	 * teardown never races a pending replacement. */
+	doca_error_t drain_err = doca_flow_entries_process(g_steer.port, 0, 10000, 0);
+	if (drain_err != DOCA_SUCCESS)
+		DOCA_LOG_WARN("failed to drain path-share replacements: %s",
+		              doca_error_get_descr(drain_err));
+
+	g_steer.applied_path0_share = path0_share;
+	DOCA_LOG_INFO("PCC path share applied: path0 %u->%u/64 path1=%u/64",
+	              old_share, path0_share, PATH_SHARE_BUCKETS - path0_share);
 }
 
 doca_error_t steer_start(const struct steer_opts *opts)
@@ -1364,8 +1400,6 @@ doca_error_t steer_start(const struct steer_opts *opts)
 
 	g_steer.opts = *opts;
 	g_sf_num = opts->sf_num;
-	for (int i = 0; i < NB_PATHS; i++)
-		atomic_store_explicit(&g_steer.rate[i], 0, memory_order_relaxed);
 	atomic_flag_clear(&g_steer.rate_lock);
 
 #if DOCA_VERSION_MAJOR >= 3
@@ -1375,13 +1409,23 @@ doca_error_t steer_start(const struct steer_opts *opts)
 		return DOCA_ERROR_INVALID_VALUE;
 	}
 	struct doca_dev *dev = opts->dev;
+	const bool probe_do_ingress = (g_steer.opts.role != STEER_ROLE_EGRESS);
+	uint32_t probe_nb_sf_ports = probe_do_ingress ? NB_PATHS : 1;
+	struct doca_dev_rep *dev_reps[NB_PATHS] = {opts->dev_rep, opts->dev_rep_path1};
 
-	probe_device(dev, opts->devargs, opts->dev_rep);
+	if (probe_do_ingress &&
+	    (opts->dev_rep_path1 == NULL || !opts->path_ip_set[0] || !opts->path_ip_set[1])) {
+		DOCA_LOG_CRIT("ingress requires two receiver SF representors and both path IPs");
+		return DOCA_ERROR_INVALID_VALUE;
+	}
+	probe_device(dev, opts->devargs, dev_reps, probe_nb_sf_ports);
 	configure_and_start_dpdk_port(dev);
 	initialize_doca_flow();
 
 	g_steer.port = port_start(dev, WIRE_PORT_ID);
-	g_steer.sf_rep_port = rep_port_start(SF_PORT_ID, opts->dev_rep);
+	g_steer.sf_rep_port[0] = rep_port_start(SF_PORT_ID, opts->dev_rep);
+	if (probe_nb_sf_ports == NB_PATHS)
+		g_steer.sf_rep_port[1] = rep_port_start(SF_PATH1_PORT_ID, opts->dev_rep_path1);
 #else
 	char probe_args[128];
 
@@ -1392,59 +1436,69 @@ doca_error_t steer_start(const struct steer_opts *opts)
 	initialize_doca_flow();
 
 	g_steer.port = port_start(dev, WIRE_PORT_ID);
-	g_steer.sf_rep_port = rep_port_start(find_sf_representor_port_id());
+	g_steer.sf_rep_port[0] = rep_port_start(find_sf_representor_port_id());
 #endif
 
 	/* Deliver pipes: fwd_miss cannot be a port on 3.x HWS, so port delivery is
 	 * done via these FWD_PIPE targets. Both roles need both. */
-	struct doca_flow_pipe *deliver_sf = create_deliver_pipe(g_steer.port, "DELIVER_SF", SF_PORT_ID);
+	struct doca_flow_pipe *deliver_sf[NB_PATHS] = {0};
+	deliver_sf[0] = create_deliver_pipe(g_steer.port, "DELIVER_SF0", SF_PORT_ID);
 	struct doca_flow_pipe *deliver_wire = create_deliver_pipe(g_steer.port, "DELIVER_WIRE", WIRE_PORT_ID);
 
 	const bool do_ingress = (g_steer.opts.role != STEER_ROLE_EGRESS);
 	const bool do_egress = (g_steer.opts.role != STEER_ROLE_INGRESS);
+	if ((!g_steer.opts.path_ip_set[0] || !g_steer.opts.path_ip_set[1]) &&
+	    (do_ingress || do_egress)) {
+		DOCA_LOG_CRIT("both path0-ip and path1-ip are required");
+		return DOCA_ERROR_INVALID_VALUE;
+	}
+	DOCA_LOG_INFO("Configured path grouping: path0 IP=0x%08x path1 IP=0x%08x",
+	              rte_be_to_cpu_32(g_steer.opts.path_ip[0]),
+	              rte_be_to_cpu_32(g_steer.opts.path_ip[1]));
+	uint32_t nb_sf_ports = do_ingress ? NB_PATHS : 1;
+	struct doca_flow_pipe *receiver_target = deliver_sf[0];
+	if (do_ingress) {
+		deliver_sf[1] = create_deliver_pipe(g_steer.port, "DELIVER_SF1", SF_PATH1_PORT_ID);
+		receiver_target = create_receiver_ip_demux(g_steer.port, deliver_sf, g_steer.opts.path_ip);
+	}
 
 	/* PORT_DEMUX targets default to plain delivery; the active role overrides. */
-	struct doca_flow_pipe *wire_target = deliver_sf;  /* wire-ingress fate */
+	struct doca_flow_pipe *wire_target = receiver_target; /* wire-ingress fate */
 	struct doca_flow_pipe *sf_target = deliver_wire;  /* SF-egress fate */
 
 	if (do_ingress) {
-		/* Ingress: choose the virtual path first, then run that paths
-		 * independent full-QPN ECN marker. Only class==path may be marked. */
+		/* Ingress: choose the virtual path first, then run that path's
+		 * independent destination-IP ECN marker. */
 		struct doca_flow_pipe *clear_path =
-			create_clear_path_pipe(g_steer.port, deliver_sf, &g_steer.clear_path_entry);
+			create_clear_path_pipe(g_steer.port, receiver_target, &g_steer.clear_path_entry);
 		struct doca_flow_pipe *path_match[NB_PATHS];
 		for (int path = 0; path < NB_PATHS; path++) {
 			struct doca_flow_pipe *mark =
-				create_selected_mark_pipe(g_steer.port, path, deliver_sf,
+				create_selected_mark_pipe(g_steer.port, path, receiver_target,
 				                          &g_steer.mark_entry[path]);
 			struct doca_flow_pipe *selected =
 				path_ce_target(g_steer.port, path, g_steer.opts.path_percent[path],
 				               mark, clear_path);
-			path_match[path] = create_path_qpn_match_pipe(g_steer.port, path, selected,
-			                                                     clear_path);
-			g_steer.qpn_match_pipe[path] = path_match[path];
+			path_match[path] = create_path_ip_match_pipe(g_steer.port, path, selected,
+			                                                   clear_path,
+			                                                   g_steer.opts.path_ip[path],
+			                                                   &g_steer.path_ip_entry[path]);
 		}
 
 		struct doca_flow_pipe *path_demux =
 			create_path_demux_pipe(g_steer.port, path_match, clear_path);
 		wire_target = create_roce_check_pipe(g_steer.port, "INGRESS_ROCE_CHECK",
-		                                     path_demux, deliver_sf);
+		                                     path_demux, receiver_target);
 	}
 
 	if (do_egress) {
 		g_steer.grouping_enabled = true;
-		g_steer.cnp_count_pipe = create_cnp_count_pipe(g_steer.port, deliver_sf, wire_target);
+		g_steer.cnp_count_pipe = create_cnp_count_pipe(g_steer.port, deliver_sf[0], wire_target);
 		wire_target = g_steer.cnp_count_pipe;
-		/* Egress (sender): hash-pipe classify by dest_qp -> native path DSCP bit. */
 		g_steer.classify_pipe = create_classify_pipe(g_steer.port, deliver_wire);
-		g_steer.classify_is_hash = true;
-
-		/* AUTO starts as NONE until per-path rates arrive. */
-		int initial_move = (g_steer.opts.move_parity == STEER_MOVE_AUTO) ? STEER_MOVE_NONE
-										 : g_steer.opts.move_parity;
-
-		add_classify_entries(g_steer.classify_pipe, g_steer.port, initial_move, g_steer.classify_entry);
-		g_steer.applied_move = initial_move;
+		add_classify_entries(g_steer.classify_pipe, g_steer.port,
+		                     g_steer.classify_entry, g_steer.classify_bucket_path);
+		g_steer.applied_path0_share = PATH_SHARE_BUCKETS / 2;
 
 		/* All admitted RoCE traffic is randomly assigned a DSCP path bit. */
 		sf_target = create_roce_check_pipe(g_steer.port, "EGRESS_ROCE_CHECK",
@@ -1452,26 +1506,23 @@ doca_error_t steer_start(const struct steer_opts *opts)
 
 	}
 
-	/* Both roles observe CM: egress builds sender->receiver grouping, while
-	 * ingress learns exact receiver QPNs for its parity match pipes. */
-	install_qp1_clone_paths(g_steer.port, deliver_sf, deliver_wire,
+	/* Both roles observe CM. Egress still uses sender/receiver pairing for its
+	 * diagnostics; ingress path eligibility is now static by destination IP. */
+	install_qp1_clone_paths(g_steer.port, receiver_target, deliver_wire,
 	                        &wire_target, &sf_target);
 
-	create_port_demux_pipe(g_steer.port, sf_target, wire_target);
+	create_port_demux_pipe(g_steer.port, sf_target, wire_target, nb_sf_ports);
 
 	g_steer.started = true;
-	DOCA_LOG_INFO("steer started (role=%s, move_parity=%d, path0=%.4g%% path1=%.4g%%)",
+	DOCA_LOG_INFO("steer started (role=%s, path0=%.4g%% path1=%.4g%%)",
 		      g_steer.opts.role == STEER_ROLE_EGRESS ? "egress"
 		      : g_steer.opts.role == STEER_ROLE_INGRESS ? "ingress" : "both",
-		      g_steer.opts.move_parity, g_steer.opts.path_percent[0], g_steer.opts.path_percent[1]);
+		      g_steer.opts.path_percent[0], g_steer.opts.path_percent[1]);
 	return DOCA_SUCCESS;
 }
 
 void steer_update_pcc_rate(uint32_t qpn, uint32_t rate)
 {
-	/* Existing rate storage is retained until the dynamic controller replaces it. */
-	atomic_store_explicit(&g_steer.rate[qpn & 1], rate, memory_order_relaxed);
-
 	if (!g_steer.grouping_enabled)
 		return;
 	qpn &= 0x00FFFFFFu;
@@ -1494,20 +1545,35 @@ void steer_update_pcc_rate(uint32_t qpn, uint32_t rate)
 	}
 	if (flow != NULL) {
 		flow->latest_rate = rate;
+		flow->interval_rate_sum += rate;
+		flow->interval_rate_reports++;
 		uint32_t hash_qpn = 0;
+		uint8_t path = 0;
+		bool path_known = false;
 		for (uint32_t i = 0; i < g_steer.qpn_pair_count; i++) {
 			if (g_steer.qpn_pair[i].initiator_qpn == qpn) {
 				hash_qpn = g_steer.qpn_pair[i].responder_qpn;
+				path = g_steer.qpn_pair[i].path;
+				path_known = true;
 				break;
 			}
 		}
-		if (!flow->classified && hash_qpn != 0) {
-			flow->hash_qpn = hash_qpn;
-			flow->qpn_class = (uint8_t)(hash_qpn & 1u);
+		if (!path_known) {
+			for (uint32_t i = 0; i < g_steer.cm_request_count; i++) {
+				if (g_steer.cm_request[i].initiator_qpn == qpn &&
+				    g_steer.cm_request[i].path_known) {
+					path = g_steer.cm_request[i].path;
+					path_known = true;
+					break;
+				}
+			}
+		}
+		if (!flow->classified && path_known) {
+			flow->receiver_qpn = hash_qpn;
+			flow->path = path;
 			flow->classified = true;
-			DOCA_LOG_INFO("egress QPN class: PCC sender QPN 0x%06x -> receiver QPN "
-			              "0x%06x rate=%u LSB-class=%u", qpn, hash_qpn, rate,
-			              flow->qpn_class);
+			DOCA_LOG_INFO("egress path class: PCC sender QPN 0x%06x rate=%u IP-path=%u",
+			              qpn, rate, flow->path);
 		}
 	}
 	atomic_flag_clear_explicit(&g_steer.rate_lock, memory_order_release);
@@ -1524,44 +1590,7 @@ static uint32_t read_be32(const uint8_t *p)
 	       ((uint32_t)p[2] << 8) | p[3];
 }
 
-static void install_receiver_qpn_entry(uint32_t qpn)
-{
-	qpn &= 0x00FFFFFFu;
-	uint32_t qpn_class = qpn & 1u;
-	struct doca_flow_pipe *pipe = g_steer.qpn_match_pipe[qpn_class];
-	if (pipe == NULL || qpn <= QP1_QPN)
-		return;
-	for (uint32_t i = 0; i < g_steer.installed_receiver_qpn_count; i++) {
-		if (g_steer.installed_receiver_qpn[i] == qpn)
-			return;
-	}
-	if (g_steer.installed_receiver_qpn_count >= MAX_CM_CONNECTIONS) {
-		DOCA_LOG_WARN("ingress receiver-QPN table full; cannot install 0x%06x", qpn);
-		return;
-	}
-
-	struct doca_flow_match match = {0};
-	struct doca_flow_pipe_entry *entry;
-	struct entry_batch_status status = {0};
-	match.outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;
-	match.outer.l4_type_ext = DOCA_FLOW_L4_TYPE_EXT_ROCE_V2;
-	match.outer.roce_v2.bth.dest_qp[0] = (uint8_t)(qpn >> 16);
-	match.outer.roce_v2.bth.dest_qp[1] = (uint8_t)(qpn >> 8);
-	match.outer.roce_v2.bth.dest_qp[2] = (uint8_t)qpn;
-	doca_error_t err = steer_pipe_add_entry(0, pipe, &match, 0, NULL, NULL, NULL, 0,
-	                                        &status, &entry);
-	if (err != DOCA_SUCCESS) {
-		DOCA_LOG_WARN("failed to add receiver QPN 0x%06x to class%u: %s", qpn,
-		              qpn_class, doca_error_get_descr(err));
-		return;
-	}
-	process_entries(g_steer.port, &status, 1, "learned receiver QPN");
-	g_steer.installed_receiver_qpn[g_steer.installed_receiver_qpn_count++] = qpn;
-	DOCA_LOG_INFO("ingress QPN rule installed: receiver QPN 0x%06x -> class%u/path%u marker",
-	              qpn, qpn_class, qpn_class);
-}
-
-static void install_sender_cnp_entry(uint32_t sender_qpn, uint32_t receiver_qpn)
+static void install_sender_cnp_entry(uint32_t sender_qpn, uint32_t receiver_qpn, uint8_t path)
 {
 	if (g_steer.cnp_count_pipe == NULL)
 		return;
@@ -1597,19 +1626,32 @@ static void install_sender_cnp_entry(uint32_t sender_qpn, uint32_t receiver_qpn)
 	}
 	process_entries(g_steer.port, &status, 1, "sender CNP counter");
 	g_steer.cnp_sender_qpn[idx] = sender_qpn;
-	g_steer.cnp_path[idx] = (uint8_t)(receiver_qpn & 1u);
+	g_steer.cnp_path[idx] = path;
 	g_steer.cnp_entry_count++;
 	DOCA_LOG_INFO("sender CNP counter installed: sender QPN 0x%06x -> receiver QPN "
-	              "0x%06x path%u", sender_qpn, receiver_qpn, receiver_qpn & 1u);
+	              "0x%06x path%u", sender_qpn, receiver_qpn, path);
 }
 
-static void remember_cm_request(uint32_t comm_id, uint32_t initiator_qpn)
+static void remember_cm_request(uint32_t comm_id, uint32_t initiator_qpn, uint32_t receiver_ip)
 {
+	uint8_t path = 0;
+	bool path_known = false;
+	for (uint8_t i = 0; i < NB_PATHS; i++) {
+		if (g_steer.opts.path_ip_set[i] &&
+		    rte_be_to_cpu_32(g_steer.opts.path_ip[i]) == receiver_ip) {
+			path = i;
+			path_known = true;
+			break;
+		}
+	}
 	while (atomic_flag_test_and_set_explicit(&g_steer.rate_lock, memory_order_acquire))
 		;
 	for (uint32_t i = 0; i < g_steer.cm_request_count; i++) {
 		if (g_steer.cm_request[i].comm_id == comm_id) {
 			g_steer.cm_request[i].initiator_qpn = initiator_qpn;
+			g_steer.cm_request[i].receiver_ip = receiver_ip;
+			g_steer.cm_request[i].path = path;
+			g_steer.cm_request[i].path_known = path_known;
 			atomic_flag_clear_explicit(&g_steer.rate_lock, memory_order_release);
 			return;
 		}
@@ -1618,15 +1660,36 @@ static void remember_cm_request(uint32_t comm_id, uint32_t initiator_qpn)
 		struct cm_request_state *request = &g_steer.cm_request[g_steer.cm_request_count++];
 		request->comm_id = comm_id;
 		request->initiator_qpn = initiator_qpn;
+		request->receiver_ip = receiver_ip;
+		request->path = path;
+		request->path_known = path_known;
 	} else {
 		DOCA_LOG_WARN("RDMA-CM request table full; cannot remember comm_id=0x%08x", comm_id);
 	}
+	if (path_known) {
+		for (uint32_t i = 0; i < g_steer.rate_flow_count; i++) {
+			struct rate_flow_state *flow = &g_steer.rate_flow[i];
+			if (flow->qpn == initiator_qpn) {
+				flow->path = path;
+				flow->classified = true;
+				break;
+			}
+		}
+	}
 	atomic_flag_clear_explicit(&g_steer.rate_lock, memory_order_release);
+	if (path_known)
+		DOCA_LOG_INFO("RDMA-CM REQ grouping: sender QPN 0x%06x receiver IP=0x%08x -> path%u",
+		              initiator_qpn, receiver_ip, path);
+	else
+		DOCA_LOG_WARN("RDMA-CM REQ sender QPN 0x%06x receiver IP=0x%08x is not configured",
+		              initiator_qpn, receiver_ip);
 }
 
 static void complete_cm_mapping(uint32_t remote_comm_id, uint32_t responder_qpn)
 {
 	uint32_t initiator_qpn = 0;
+	uint8_t path = 0;
+	bool path_known = false;
 	bool changed = false;
 
 	while (atomic_flag_test_and_set_explicit(&g_steer.rate_lock, memory_order_acquire))
@@ -1634,10 +1697,12 @@ static void complete_cm_mapping(uint32_t remote_comm_id, uint32_t responder_qpn)
 	for (uint32_t i = 0; i < g_steer.cm_request_count; i++) {
 		if (g_steer.cm_request[i].comm_id == remote_comm_id) {
 			initiator_qpn = g_steer.cm_request[i].initiator_qpn;
+			path = g_steer.cm_request[i].path;
+			path_known = g_steer.cm_request[i].path_known;
 			break;
 		}
 	}
-	if (initiator_qpn != 0) {
+	if (initiator_qpn != 0 && path_known) {
 		struct qpn_pair_state *pair = NULL;
 		for (uint32_t i = 0; i < g_steer.qpn_pair_count; i++) {
 			if (g_steer.qpn_pair[i].initiator_qpn == initiator_qpn) {
@@ -1648,10 +1713,20 @@ static void complete_cm_mapping(uint32_t remote_comm_id, uint32_t responder_qpn)
 		if (pair == NULL && g_steer.qpn_pair_count < MAX_CM_CONNECTIONS)
 			pair = &g_steer.qpn_pair[g_steer.qpn_pair_count++];
 		if (pair != NULL && (pair->initiator_qpn != initiator_qpn ||
-		                     pair->responder_qpn != responder_qpn)) {
+		                     pair->responder_qpn != responder_qpn || pair->path != path)) {
 			pair->initiator_qpn = initiator_qpn;
 			pair->responder_qpn = responder_qpn;
+			pair->path = path;
 			changed = true;
+		}
+		for (uint32_t i = 0; i < g_steer.rate_flow_count; i++) {
+			struct rate_flow_state *flow = &g_steer.rate_flow[i];
+			if (flow->qpn == initiator_qpn) {
+				flow->receiver_qpn = responder_qpn;
+				flow->path = path;
+				flow->classified = true;
+				break;
+			}
 		}
 	}
 	atomic_flag_clear_explicit(&g_steer.rate_lock, memory_order_release);
@@ -1659,11 +1734,13 @@ static void complete_cm_mapping(uint32_t remote_comm_id, uint32_t responder_qpn)
 	if (initiator_qpn == 0)
 		DOCA_LOG_WARN("RDMA-CM REP has no captured REQ for remote_comm_id=0x%08x",
 		              remote_comm_id);
+	else if (!path_known)
+		DOCA_LOG_WARN("RDMA-CM sender QPN 0x%06x receiver IP is not a configured path", initiator_qpn);
 	else if (changed)
-		DOCA_LOG_INFO("RDMA-CM QPN mapping: sender 0x%06x -> receiver 0x%06x",
-		              initiator_qpn, responder_qpn);
-	if (initiator_qpn != 0)
-		install_sender_cnp_entry(initiator_qpn, responder_qpn);
+		DOCA_LOG_INFO("RDMA-CM mapping: sender 0x%06x -> receiver 0x%06x path%u",
+		              initiator_qpn, responder_qpn, path);
+	if (initiator_qpn != 0 && path_known)
+		install_sender_cnp_entry(initiator_qpn, responder_qpn, path);
 }
 
 static void parse_qp1_clone(struct rte_mbuf *mbuf)
@@ -1710,16 +1787,16 @@ static void parse_qp1_clone(struct rte_mbuf *mbuf)
 	if (attribute == IB_CM_ATTR_REQ && captured >= mad_offset + 60) {
 		uint32_t local_comm_id = read_be32(mad + 24);
 		uint32_t local_qpn = read_be32(mad + 56) >> 8;
-		DOCA_LOG_INFO("RDMA-CM REQ: local_comm_id=0x%08x initiator_qpn=0x%06x",
-		              local_comm_id, local_qpn);
-		remember_cm_request(local_comm_id, local_qpn);
+		uint32_t receiver_ip = read_be32(ip + 16);
+		DOCA_LOG_INFO("RDMA-CM REQ: local_comm_id=0x%08x initiator_qpn=0x%06x receiver_ip=0x%08x",
+		              local_comm_id, local_qpn, receiver_ip);
+		remember_cm_request(local_comm_id, local_qpn, receiver_ip);
 	} else if (attribute == IB_CM_ATTR_REP && captured >= mad_offset + 40) {
 		uint32_t local_comm_id = read_be32(mad + 24);
 		uint32_t remote_comm_id = read_be32(mad + 28);
 		uint32_t local_qpn = read_be32(mad + 36) >> 8;
 		DOCA_LOG_INFO("RDMA-CM REP: local_comm_id=0x%08x remote_comm_id=0x%08x responder_qpn=0x%06x",
 		              local_comm_id, remote_comm_id, local_qpn);
-		install_receiver_qpn_entry(local_qpn);
 		complete_cm_mapping(remote_comm_id, local_qpn);
 	}
 }
@@ -1754,18 +1831,24 @@ void steer_poll(void)
 		while (atomic_flag_test_and_set_explicit(&g_steer.rate_lock, memory_order_acquire))
 			;
 		for (uint32_t i = 0; i < g_steer.rate_flow_count; i++) {
-			const struct rate_flow_state *flow = &g_steer.rate_flow[i];
+			struct rate_flow_state *flow = &g_steer.rate_flow[i];
+			uint32_t control_rate = flow->latest_rate;
+			if (flow->interval_rate_reports != 0)
+				control_rate = (uint32_t)(flow->interval_rate_sum /
+							  flow->interval_rate_reports);
+			flow->interval_rate_sum = 0;
+			flow->interval_rate_reports = 0;
 			if (!flow->classified) {
 				pending_mapping++;
 				continue;
 			}
-			uint8_t c = flow->qpn_class;
+			uint8_t c = flow->path;
 			total[c]++;
-			if (flow->latest_rate == PCC_FULL_RATE)
+			if (control_rate == PCC_FULL_RATE)
 				full[c]++;
 			else {
 				reduced[c]++;
-				reduced_sum[c] += flow->latest_rate;
+				reduced_sum[c] += control_rate;
 			}
 		}
 		atomic_flag_clear_explicit(&g_steer.rate_lock, memory_order_release);
@@ -1788,18 +1871,16 @@ void steer_poll(void)
 					path0 = PATH_SHARE_BUCKETS - PATH_SHARE_MIN_BUCKETS;
 			}
 		}
-		DOCA_LOG_INFO("PCC path-share diagnostic: c0 total=%u full=%u reduced=%u sum=%lu; "
-		              "c1 total=%u full=%u reduced=%u sum=%lu; pending-map=%u; "
-		              "proposed path0=%u/64 path1=%u/64 (not applied)",
-		              total[0], full[0], reduced[0], reduced_sum[0], total[1], full[1], reduced[1],
-		              reduced_sum[1], pending_mapping, path0, PATH_SHARE_BUCKETS - path0);
-	}
-
-	if (g_steer.classify_pipe && !g_steer.classify_is_hash) {
-		int want = steer_decide();
-
-		if (want != g_steer.applied_move)
-			steer_apply(want);
+		DOCA_LOG_INFO("PCC path-share diagnostic: path0 total=%u full=%u reduced=%u sum=%lu avg=%lu; "
+		              "path1 total=%u full=%u reduced=%u sum=%lu avg=%lu; pending-map=%u; "
+		              "target path0=%u/64 path1=%u/64; applied path0=%u/64",
+		              total[0], full[0], reduced[0], reduced_sum[0],
+		              reduced[0] ? reduced_sum[0] / reduced[0] : 0,
+		              total[1], full[1], reduced[1], reduced_sum[1],
+		              reduced[1] ? reduced_sum[1] / reduced[1] : 0,
+		              pending_mapping, path0, PATH_SHARE_BUCKETS - path0,
+		              g_steer.applied_path0_share);
+		apply_path_share(path0);
 	}
 
 	struct doca_flow_resource_query q;
@@ -1814,14 +1895,11 @@ void steer_poll(void)
 		              cnp_by_path[0], cnp_by_path[1]);
 	}
 
-	/* Egress (sender) role: per-bucket classify counts (bucket i -> native path i). */
-	for (int i = 0; g_steer.classify_pipe && i < NB_PATHS; i++) {
-		if (g_steer.classify_entry[i] &&
-		    doca_flow_resource_query_entry(g_steer.classify_entry[i], &q) == DOCA_SUCCESS)
-			DOCA_LOG_INFO("egress: bucket%d -> path%d: %lu pkts", i, i, q.counter.total_pkts);
-	}
-
 	for (int i = 0; i < NB_PATHS; i++) {
+		if (g_steer.path_ip_entry[i] &&
+		    doca_flow_resource_query_entry(g_steer.path_ip_entry[i], &q) == DOCA_SUCCESS)
+			DOCA_LOG_INFO("ingress: path%d destination-IP eligible: %lu pkts", i,
+			              q.counter.total_pkts);
 		if (g_steer.mark_entry[i] &&
 		    doca_flow_resource_query_entry(g_steer.mark_entry[i], &q) == DOCA_SUCCESS)
 			DOCA_LOG_INFO("path%d selected-class CE marked: %lu pkts", i,
@@ -1844,23 +1922,33 @@ void steer_stop(void)
 	g_steer.cnp_count_pipe = NULL;
 	g_steer.classify_pipe = NULL;
 
-	/* In switch mode port 0 is the proxy and must stop last. NVIDIA's teardown
-	 * helper flushes every port before stopping them in reverse order. */
-	if (g_steer.sf_rep_port)
-		doca_flow_port_pipes_flush(g_steer.sf_rep_port);
-	if (g_steer.port)
-		doca_flow_port_pipes_flush(g_steer.port);
-	if (g_steer.sf_rep_port) {
-		doca_error_t err = doca_flow_port_stop(g_steer.sf_rep_port);
+	/* Every pipe belongs to the proxy, so one flush tears down the pipeline.
+	 * Representors are child ports and must be stopped before their proxy parent.
+	 * Empty representor ports must not be flushed on the DOCA 3.4 dual-SF path. */
+	if (g_steer.port) {
+		doca_error_t err = doca_flow_entries_process(g_steer.port, 0, 100000, 0);
 		if (err != DOCA_SUCCESS)
-			DOCA_LOG_WARN("failed to stop SF Flow port: %s", doca_error_get_descr(err));
-		g_steer.sf_rep_port = NULL;
+			DOCA_LOG_WARN("failed to drain Flow operations before flush: %s",
+			              doca_error_get_descr(err));
+		doca_flow_port_pipes_flush(g_steer.port);
+	}
+	for (int path = NB_PATHS - 1; path >= 0; path--) {
+		if (g_steer.sf_rep_port[path]) {
+			DOCA_LOG_INFO("stopping SF%d Flow port", path);
+			doca_error_t err = doca_flow_port_stop(g_steer.sf_rep_port[path]);
+			if (err != DOCA_SUCCESS)
+				DOCA_LOG_WARN("failed to stop SF%d Flow port: %s", path,
+				              doca_error_get_descr(err));
+			g_steer.sf_rep_port[path] = NULL;
+		}
 	}
 	if (g_steer.port) {
+		DOCA_LOG_INFO("stopping proxy Flow port");
 		doca_error_t err = doca_flow_port_stop(g_steer.port);
 		if (err != DOCA_SUCCESS)
 			DOCA_LOG_WARN("failed to stop proxy Flow port: %s", doca_error_get_descr(err));
 		g_steer.port = NULL;
 	}
 	doca_flow_destroy();
+	memset(&g_steer, 0, sizeof(g_steer));
 }

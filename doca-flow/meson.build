@@ -9,12 +9,10 @@
 #   ninja -C build
 #   sudo ./build/doca_flow_steer --help
 #
-# The program runs on the BF3 eSwitch (switch,hws,isolated) and, on a p0<->p1
-# DAC loopback, (a) classifies the sender's two RoCE QPs by QPN parity on
-# egress, (b) optionally rewrites UDP dst 4791->4792 to mark a flow as moved to
-# the other virtual path, then on wire ingress (c) CE-marks only native (4791)
-# packets so CNP->QPN attribution stays coherent and (d) restores 4792->4791
-# before delivering to the receiver SF. See README.md.
+# The program runs on the BF3 eSwitch (switch,hws). Egress assigns RoCE packets
+# to two DSCP-marked paths using a PCC-controlled random share. Ingress chooses
+# the destination-IP-specific ECN marker and delivers to one of two receiver
+# SFs. See README.md.
 #
 
 project('pcc_doca_flow', 'c',

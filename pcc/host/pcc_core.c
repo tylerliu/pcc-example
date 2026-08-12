@@ -28,6 +28,7 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <ctype.h>
+#include <arpa/inet.h>
 
 #include "steer.h"
 
@@ -960,30 +961,23 @@ static doca_error_t steer_sf_callback(void *param, void *config)
 	return DOCA_SUCCESS;
 }
 
-/*
- * ARGP Callback - embedded steering move policy: none|even|odd|all|auto.
- * Default (unset) is AUTO. Does not by itself enable steering (-r does that).
- */
-static doca_error_t steer_move_callback(void *param, void *config)
+static doca_error_t steer_path_ip_callback(void *param, void *config, unsigned int path)
 {
-	struct pcc_config *pcc_cfg = (struct pcc_config *)config;
-	const char *s = (const char *)param;
-
-	if (strcmp(s, "none") == 0)
-		pcc_cfg->steer_move_parity = STEER_MOVE_NONE;
-	else if (strcmp(s, "even") == 0 || strcmp(s, "0") == 0)
-		pcc_cfg->steer_move_parity = STEER_MOVE_EVEN;
-	else if (strcmp(s, "odd") == 0 || strcmp(s, "1") == 0)
-		pcc_cfg->steer_move_parity = STEER_MOVE_ODD;
-	else if (strcmp(s, "all") == 0)
-		pcc_cfg->steer_move_parity = STEER_MOVE_ALL;
-	else if (strcmp(s, "auto") == 0)
-		pcc_cfg->steer_move_parity = STEER_MOVE_AUTO;
-	else {
-		PRINT_ERROR("Error: --steer-move must be none|even|odd|all|auto (got '%s')\n", s);
+	struct pcc_config *cfg = config;
+	struct in_addr addr;
+	if (inet_pton(AF_INET, (const char *)param, &addr) != 1)
 		return DOCA_ERROR_INVALID_VALUE;
-	}
+	cfg->steer_path_ip[path] = addr.s_addr;
+	cfg->steer_path_ip_set[path] = true;
 	return DOCA_SUCCESS;
+}
+static doca_error_t steer_path0_ip_callback(void *param, void *config)
+{
+	return steer_path_ip_callback(param, config, 0);
+}
+static doca_error_t steer_path1_ip_callback(void *param, void *config)
+{
+	return steer_path_ip_callback(param, config, 1);
 }
 
 #if DOCA_VERSION_MAJOR >= 3
@@ -1335,26 +1329,29 @@ doca_error_t register_pcc_params(void)
 		return result;
 	}
 
-	/* Embedded steering move policy (none|even|odd|all|auto). Default AUTO. */
-	struct doca_argp_param *steer_move_param;
-
-	result = doca_argp_param_create(&steer_move_param);
-	if (result != DOCA_SUCCESS) {
-		PRINT_ERROR("Error: Failed to create ARGP param: %s\n", doca_error_get_descr(result));
+	struct doca_argp_param *path0_ip_param, *path1_ip_param;
+	result = doca_argp_param_create(&path0_ip_param);
+	if (result != DOCA_SUCCESS)
 		return result;
-	}
-	doca_argp_param_set_long_name(steer_move_param, "steer-move");
-	doca_argp_param_set_arguments(steer_move_param, "<none|even|odd|all|auto>");
-	doca_argp_param_set_description(
-		steer_move_param,
-		"Embedded steering move policy: none|even|odd|all|auto (optional, default auto).");
-	doca_argp_param_set_callback(steer_move_param, steer_move_callback);
-	doca_argp_param_set_type(steer_move_param, DOCA_ARGP_TYPE_STRING);
-	result = doca_argp_register_param(steer_move_param);
-	if (result != DOCA_SUCCESS) {
-		PRINT_ERROR("Error: Failed to register program param: %s\n", doca_error_get_descr(result));
+	doca_argp_param_set_long_name(path0_ip_param, "path0-ip");
+	doca_argp_param_set_arguments(path0_ip_param, "<IPv4>");
+	doca_argp_param_set_description(path0_ip_param, "Path-0 receiver IP used for PCC flow grouping.");
+	doca_argp_param_set_callback(path0_ip_param, steer_path0_ip_callback);
+	doca_argp_param_set_type(path0_ip_param, DOCA_ARGP_TYPE_STRING);
+	result = doca_argp_register_param(path0_ip_param);
+	if (result != DOCA_SUCCESS)
 		return result;
-	}
+	result = doca_argp_param_create(&path1_ip_param);
+	if (result != DOCA_SUCCESS)
+		return result;
+	doca_argp_param_set_long_name(path1_ip_param, "path1-ip");
+	doca_argp_param_set_arguments(path1_ip_param, "<IPv4>");
+	doca_argp_param_set_description(path1_ip_param, "Path-1 receiver IP used for PCC flow grouping.");
+	doca_argp_param_set_callback(path1_ip_param, steer_path1_ip_callback);
+	doca_argp_param_set_type(path1_ip_param, DOCA_ARGP_TYPE_STRING);
+	result = doca_argp_register_param(path1_ip_param);
+	if (result != DOCA_SUCCESS)
+		return result;
 
 #if DOCA_VERSION_MAJOR >= 3
 	/* Create and register the sender SF representor param for embedded steering.
