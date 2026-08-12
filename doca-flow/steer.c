@@ -13,6 +13,7 @@
 #include "doca_flow_compat.h"
 #include "steer.h"
 #include <rte_byteorder.h>
+#include <rte_cycles.h>
 #include <rte_eal.h>
 #include <rte_ether.h>
 #include <rte_ethdev.h>
@@ -39,6 +40,13 @@ DOCA_LOG_REGISTER(FLOW_STEER);
 #define MAX_CNP_TRACKED_QPS 64u
 #define PATH_SHARE_BUCKETS 64u
 #define PATH_SHARE_MIN_BUCKETS 3u
+/* Persistent host-side EWMA: new sample weight = numerator / denominator. */
+#define PATH_RATE_EWMA_NUMERATOR 1u
+#define PATH_RATE_EWMA_DENOMINATOR 8u
+
+#if PATH_RATE_EWMA_NUMERATOR == 0 || PATH_RATE_EWMA_NUMERATOR > PATH_RATE_EWMA_DENOMINATOR
+#error "PATH_RATE_EWMA_NUMERATOR must be in [1, PATH_RATE_EWMA_DENOMINATOR]"
+#endif
 
 #define ROCE_UDP_PORT_NATIVE 4791
 #define QP1_QPN 1u
@@ -658,12 +666,14 @@ static struct doca_flow_pipe *create_random_sample_pipe(struct doca_flow_port *p
  */
 static struct doca_flow_pipe *create_path_demux_pipe(struct doca_flow_port *port,
 						     struct doca_flow_pipe *target[NB_PATHS],
-						     struct doca_flow_pipe *clear_pipe)
+						     struct doca_flow_pipe *clear_pipe,
+						     struct doca_flow_pipe_entry *path_entries[NB_PATHS])
 {
 	struct doca_flow_match match = {0};
 	struct doca_flow_match match_mask = {0};
 	struct doca_flow_fwd fwd = {.type = DOCA_FLOW_FWD_CHANGEABLE};
 	struct doca_flow_fwd fwd_miss = {.type = DOCA_FLOW_FWD_PIPE, .next_pipe = clear_pipe};
+	struct doca_flow_monitor monitor = {.counter_type = DOCA_FLOW_RESOURCE_TYPE_NON_SHARED};
 	struct doca_flow_pipe_cfg *cfg_pipe;
 	struct doca_flow_pipe *pipe;
 	doca_error_t err;
@@ -686,6 +696,8 @@ static struct doca_flow_pipe *create_path_demux_pipe(struct doca_flow_port *port
 	crash_if_unsuccessful(err, "pipe_cfg_set_nr_entries (path demux)");
 	err = doca_flow_pipe_cfg_set_match(cfg_pipe, &match, &match_mask);
 	crash_if_unsuccessful(err, "pipe_cfg_set_match (path demux)");
+	err = doca_flow_pipe_cfg_set_monitor(cfg_pipe, &monitor);
+	crash_if_unsuccessful(err, "pipe_cfg_set_monitor (path demux)");
 
 	err = doca_flow_pipe_create(cfg_pipe, &fwd, &fwd_miss, &pipe);
 	crash_if_unsuccessful(err, "pipe_create (path demux)");
@@ -696,11 +708,11 @@ static struct doca_flow_pipe *create_path_demux_pipe(struct doca_flow_port *port
 	for (int i = 0; i < NB_PATHS; i++) {
 		struct doca_flow_match entry_match = {0};
 		struct doca_flow_fwd entry_fwd = {.type = DOCA_FLOW_FWD_PIPE, .next_pipe = target[i]};
-		struct doca_flow_pipe_entry *entry;
 		uint32_t flags = (i == NB_PATHS - 1) ? 0 : STEER_WAIT_FOR_BATCH;
 
 		entry_match.outer.ip4.dscp_ecn = PATH_DSCP_VAL(i);
-		err = steer_pipe_add_entry(0, pipe, &entry_match, 0, NULL, NULL, &entry_fwd, flags, &status, &entry);
+		err = steer_pipe_add_entry(0, pipe, &entry_match, 0, NULL, &monitor, &entry_fwd,
+					   flags, &status, &path_entries[i]);
 		crash_if_unsuccessful(err, "pipe_add_entry (path demux %d)", i);
 	}
 	process_entries(port, &status, NB_PATHS, "path demux entries");
@@ -1295,6 +1307,8 @@ struct rate_flow_state {
 	uint32_t latest_rate;
 	uint64_t interval_rate_sum;
 	uint64_t interval_rate_reports;
+	uint32_t smoothed_rate;
+	bool smoothed_rate_valid;
 	uint8_t path;
 	bool classified;
 };
@@ -1325,6 +1339,7 @@ struct steer_state {
 	uint8_t classify_bucket_path[PATH_SHARE_BUCKETS];
 	uint32_t applied_path0_share;
 	struct doca_flow_pipe_entry *path_ip_entry[NB_PATHS];
+	struct doca_flow_pipe_entry *path_demux_entry[NB_PATHS];
 	struct doca_flow_pipe_entry *mark_entry[NB_PATHS];
 	struct doca_flow_pipe_entry *clear_path_entry;
 	uint32_t cnp_sender_qpn[MAX_CNP_TRACKED_QPS];
@@ -1337,6 +1352,9 @@ struct steer_state {
 	uint32_t cm_request_count;
 	struct qpn_pair_state qpn_pair[MAX_CM_CONNECTIONS];
 	uint32_t qpn_pair_count;
+	uint64_t ingress_prev_bytes[NB_PATHS];
+	uint64_t ingress_prev_cycles;
+	bool ingress_throughput_ready;
 	atomic_flag rate_lock;
 };
 
@@ -1486,7 +1504,8 @@ doca_error_t steer_start(const struct steer_opts *opts)
 		}
 
 		struct doca_flow_pipe *path_demux =
-			create_path_demux_pipe(g_steer.port, path_match, clear_path);
+			create_path_demux_pipe(g_steer.port, path_match, clear_path,
+			                       g_steer.path_demux_entry);
 		wire_target = create_roce_check_pipe(g_steer.port, "INGRESS_ROCE_CHECK",
 		                                     path_demux, receiver_target);
 	}
@@ -1832,12 +1851,24 @@ void steer_poll(void)
 			;
 		for (uint32_t i = 0; i < g_steer.rate_flow_count; i++) {
 			struct rate_flow_state *flow = &g_steer.rate_flow[i];
-			uint32_t control_rate = flow->latest_rate;
+			uint32_t interval_rate = flow->latest_rate;
 			if (flow->interval_rate_reports != 0)
-				control_rate = (uint32_t)(flow->interval_rate_sum /
-							  flow->interval_rate_reports);
+				interval_rate = (uint32_t)(flow->interval_rate_sum /
+							 flow->interval_rate_reports);
 			flow->interval_rate_sum = 0;
 			flow->interval_rate_reports = 0;
+			if (!flow->smoothed_rate_valid) {
+				flow->smoothed_rate = interval_rate;
+				flow->smoothed_rate_valid = true;
+			} else {
+				uint64_t retained = (uint64_t)flow->smoothed_rate *
+				                    (PATH_RATE_EWMA_DENOMINATOR - PATH_RATE_EWMA_NUMERATOR);
+				uint64_t added = (uint64_t)interval_rate * PATH_RATE_EWMA_NUMERATOR;
+				flow->smoothed_rate = (uint32_t)((retained + added +
+							       PATH_RATE_EWMA_DENOMINATOR / 2) /
+							      PATH_RATE_EWMA_DENOMINATOR);
+			}
+			uint32_t control_rate = flow->smoothed_rate;
 			if (!flow->classified) {
 				pending_mapping++;
 				continue;
@@ -1895,19 +1926,36 @@ void steer_poll(void)
 		              cnp_by_path[0], cnp_by_path[1]);
 	}
 
+	uint64_t ingress_bytes[NB_PATHS] = {0};
+	bool ingress_bytes_valid = true;
 	for (int i = 0; i < NB_PATHS; i++) {
-		if (g_steer.path_ip_entry[i] &&
-		    doca_flow_resource_query_entry(g_steer.path_ip_entry[i], &q) == DOCA_SUCCESS)
-			DOCA_LOG_INFO("ingress: path%d destination-IP eligible: %lu pkts", i,
-			              q.counter.total_pkts);
+		if (g_steer.path_demux_entry[i] == NULL ||
+		    doca_flow_resource_query_entry(g_steer.path_demux_entry[i], &q) != DOCA_SUCCESS)
+			ingress_bytes_valid = false;
+		else
+			ingress_bytes[i] = q.counter.total_bytes;
 		if (g_steer.mark_entry[i] &&
 		    doca_flow_resource_query_entry(g_steer.mark_entry[i], &q) == DOCA_SUCCESS)
 			DOCA_LOG_INFO("path%d selected-class CE marked: %lu pkts", i,
 			              q.counter.total_pkts);
 	}
-	if (g_steer.clear_path_entry &&
-	    doca_flow_resource_query_entry(g_steer.clear_path_entry, &q) == DOCA_SUCCESS)
-		DOCA_LOG_INFO("ingress: unmarked/path-bit-cleared: %lu pkts", q.counter.total_pkts);
+	if (ingress_bytes_valid) {
+		uint64_t now_cycles = rte_get_timer_cycles();
+		if (g_steer.ingress_throughput_ready && now_cycles > g_steer.ingress_prev_cycles) {
+			double seconds = (double)(now_cycles - g_steer.ingress_prev_cycles) /
+			                 (double)rte_get_timer_hz();
+			double path0_gbps = (double)(ingress_bytes[0] - g_steer.ingress_prev_bytes[0]) * 8.0 /
+			                    seconds / 1.0e9;
+			double path1_gbps = (double)(ingress_bytes[1] - g_steer.ingress_prev_bytes[1]) * 8.0 /
+			                    seconds / 1.0e9;
+			DOCA_LOG_INFO("ingress throughput: path0=%.3f Gbps path1=%.3f Gbps total=%.3f Gbps",
+			              path0_gbps, path1_gbps, path0_gbps + path1_gbps);
+		}
+		for (int i = 0; i < NB_PATHS; i++)
+			g_steer.ingress_prev_bytes[i] = ingress_bytes[i];
+		g_steer.ingress_prev_cycles = now_cycles;
+		g_steer.ingress_throughput_ready = true;
+	}
 }
 
 void steer_stop(void)

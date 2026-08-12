@@ -65,7 +65,10 @@ rule during an entry update.
 
 The initial assignment is 32 buckets per path. Once per host poll:
 
-1. PCC rate reports are averaged per sender QPN over the complete interval.
+1. PCC rate reports are averaged per sender QPN over the complete poll interval.
+   That interval sample then enters a persistent per-flow EWMA. Its compile-time
+   tuning constants are `PATH_RATE_EWMA_NUMERATOR` and
+   `PATH_RATE_EWMA_DENOMINATOR`; the default new-sample weight is `1/8`.
 2. RDMA-CM maps each QPN into its destination-IP path group.
 3. Full-rate flows (`1 << 20`) are excluded from each reduced-rate sum.
 4. When both paths contain reduced flows, path 0 receives
@@ -86,6 +89,11 @@ traffic on that path. Only the selected half of the random path/class space is
 eligible, so the hardware sampler uses twice the requested percentage, capped
 at 100%. Both marker hits and misses clear only the private DSCP path bit before
 delivery; unrelated DSCP and existing ECN bits are preserved.
+
+The two `INGRESS_PATH_DEMUX` entries count bytes before destination-IP matching.
+Once per poll, the application reports the byte deltas as path0, path1, and total
+throughput in Gbps. These counters therefore measure the actual DSCP-selected
+virtual-path traffic rather than only packets eligible for a path's ECN marker.
 
 ## Build
 
