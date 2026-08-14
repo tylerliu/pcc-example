@@ -36,7 +36,7 @@
 #include <doca_version.h>
 
 #include "pcc_core.h"
-#include "../common/device/pcc_rate_report.h"
+#include "../device/pcc_rate_report.h"
 
 /*
  * Formats of the trace message to be printed from the device

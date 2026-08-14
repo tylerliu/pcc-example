@@ -97,18 +97,18 @@ virtual-path traffic rather than only packets eligible for a path's ECN marker.
 
 ## Build
 
-The module is built standalone and linked into `doca_pcc`:
+The root Meson project builds the standalone binary and links the same steering
+library into `doca_pcc`:
 
 ```bash
 meson setup build --reconfigure
 ninja -C build
 ```
 
-For standalone development:
+To rebuild only the standalone executable:
 
 ```bash
-meson setup /tmp/pcc-flow-check doca-flow
-ninja -C /tmp/pcc-flow-check
+ninja -C build doca_flow_steer
 ```
 
 DOCA 3.x is built and hardware-tested on 3.4.0112. DOCA 3.1 source support uses

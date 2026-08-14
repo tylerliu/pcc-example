@@ -119,33 +119,18 @@ else
 	endif
 endif
 
-common_path = 'common'
-base_app_inc_dirs = [
-	include_directories(common_path),
-]
-
-APP_NAME = 'pcc'
-
-fs = import('fs')
-
-# Basic app definitions
 app_dependencies = base_app_dependencies
 app_doca_dependencies = []
 app_driver_dependencies = []
-app_doca_depends = []
+app_doca_depends = ['common']
 app_driver_depends = []
-app_inc_dirs = base_app_inc_dirs
+app_inc_dirs = []
 
 ######################################
 # Check dependencies before starting #
 ######################################
 
-if fs.is_dir(APP_NAME + '/' + 'dependencies')
-	subdir(APP_NAME + '/' + 'dependencies')
-endif
-
-# Everything should use common (no need for all apps to add it manually)
-app_doca_depends += 'common'
+subdir('dependencies')
 
 # DOCA Libraries
 foreach doca_dep : app_doca_depends
@@ -171,9 +156,89 @@ endforeach
 app_dependencies += app_doca_dependencies
 app_dependencies += app_driver_dependencies
 
+##########################
+# Shared steering library #
+##########################
+
+steer_deps = [
+	dependency('libdpdk', required: true),
+	dependency('doca-flow', required: true),
+	dependency('doca-argp', required: true),
+	dependency('doca-dpdk-bridge', required: true),
+	dependency('doca-common', required: true),
+]
+
+steer_lib = static_library('steer', 'steering/steer.c',
+	c_args : base_c_args,
+	include_directories : 'steering',
+	dependencies : steer_deps,
+	install : false,
+)
+
 #########################
-# Build the Application #
+# PCC DPA device archive #
 #########################
 
-# Enter the application's directory
-subdir(APP_NAME)
+device_code_build_script_name = 'build_device_code.sh'
+device_code_build_script = meson.current_source_dir() / device_code_build_script_name
+device_code_build_script_file = files(device_code_build_script_name)
+device_code_builder = find_program(device_code_build_script)
+
+app_device_build_dir = meson.project_build_root() / 'device/build_dpacc'
+doca_common_dep = dependency('doca-common')
+doca_lib_dir = doca_common_dep.get_variable(pkgconfig : 'libdir')
+pcc_app_dev_src_dir = meson.current_source_dir() / 'device'
+
+if get_option('enable_pcc_application_tx_counter_sampling')
+	enable_tx_counter_sampling = 'true'
+else
+	enable_tx_counter_sampling = 'false'
+endif
+
+pcc_app_name = 'pcc_rp_rtt_template_app'
+pcc_dev_stubs_keep_dir_path = app_device_build_dir / pcc_app_name
+device_code_inputs = files([
+	'device/rp_main.c',
+	'device/pcc_common_dev.h',
+	'device/pcc_rate_report.h',
+	'device/dpa_app_attributes.yaml',
+	'device/algo/rtt_template.c',
+	'device/algo/rtt_template.h',
+	'device/algo/rtt_template_algo_params.h',
+	'device/algo/rtt_template_ctxt.h',
+	'device/algo/utils.h',
+])
+pcc_device_archive = custom_target('pcc-device-app',
+	input : device_code_inputs,
+	output : pcc_app_name + '.a',
+	command : [device_code_builder, pcc_app_dev_src_dir, app_device_build_dir, doca_lib_dir, pcc_app_name,
+		pcc_dev_stubs_keep_dir_path, enable_tx_counter_sampling, dpacc_mcpu_flag, '@OUTPUT@'],
+	depend_files : device_code_build_script_file,
+	build_by_default : true,
+)
+pcc_device_dep = declare_dependency(
+	sources : pcc_device_archive,
+	link_args : [meson.current_build_dir() / (pcc_app_name + '.a')],
+)
+
+###############
+# Executables #
+###############
+
+executable('doca_pcc',
+	['host/pcc.c', 'host/pcc_core.c'],
+	c_args : base_c_args,
+	include_directories : ['host', 'steering'],
+	dependencies : [app_dependencies, steer_deps, pcc_device_dep],
+	link_with : steer_lib,
+	install : false,
+)
+
+executable('doca_flow_steer',
+	'steering/doca_flow_steer.c',
+	c_args : base_c_args,
+	include_directories : 'steering',
+	dependencies : steer_deps,
+	link_with : steer_lib,
+	install : false,
+)

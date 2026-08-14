@@ -339,7 +339,6 @@ static inline void rtt_template_handle_roce_rtt(doca_pcc_dev_event_t *event,
 static inline void rtt_template_handle_roce_cnp(doca_pcc_dev_event_t *event,
 						uint32_t cur_rate,
 						cc_ctxt_rtt_template_t *ccctx,
-						uint32_t flow_qpn,
 						doca_pcc_dev_results_t *results)
 {
 	ccctx->flags.was_cnp = 1;
@@ -349,9 +348,7 @@ static inline void rtt_template_handle_roce_cnp(doca_pcc_dev_event_t *event,
 		cur_rate = MIN_RATE;
 	{ static uint32_t g_cnp = 0;              /* optional: observe the loop engaging */
 	  if ((++g_cnp % 500) == 1) {
-		/* BF3 CNP events do not carry a QPN directly. flow_qpn comes from the
-		 * per-QP algorithm context established by that QP's preceding TX event. */
-		doca_pcc_dev_printf("PURE_ECN qpn=0x%x cnp=%u rate=%u\n", flow_qpn, g_cnp, cur_rate);
+		doca_pcc_dev_printf("PURE_ECN cnp=%u rate=%u\n", g_cnp, cur_rate);
 		doca_pcc_dev_trace_flush();
 	  } }
 
@@ -417,7 +414,6 @@ void rtt_template_algo(doca_pcc_dev_event_t *event,
 		       uint32_t *param,
 		       uint32_t *counter,
 		       doca_pcc_dev_algo_ctxt_t *algo_ctxt,
-		       uint32_t flow_qpn,
 		       doca_pcc_dev_results_t *results)
 {
 	cc_ctxt_rtt_template_t *rtt_template_ctx = (cc_ctxt_rtt_template_t *)algo_ctxt;
@@ -438,7 +434,7 @@ void rtt_template_algo(doca_pcc_dev_event_t *event,
 		if (counter != NULL)
 			counter[RTT_TEMPLATE_COUNTER_RTT_EVENT]++;
 	} else if (ev_type == DOCA_PCC_DEV_EVNT_ROCE_CNP) {
-		rtt_template_handle_roce_cnp(event, cur_rate, rtt_template_ctx, flow_qpn, results);
+		rtt_template_handle_roce_cnp(event, cur_rate, rtt_template_ctx, results);
 	} else if (ev_type == DOCA_PCC_DEV_EVNT_ROCE_NACK) {
 		rtt_template_handle_roce_nack(event, cur_rate, rtt_template_ctx, results);
 	} else {

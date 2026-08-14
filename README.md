@@ -1,4 +1,4 @@
-# PCC rate-report trace path
+# PCC path steering
 
 This PCC application reports per-flow rate information from the DPA to the host
 through the PCC trace stream. The custom RTT-template / Pure-ECN algorithm keeps
@@ -9,7 +9,7 @@ The ordinary PCC per-QP rate limiter therefore does not throttle traffic.
 
 ## Trace format
 
-Format ID `6` is reserved in `common/device/pcc_rate_report.h`:
+Format ID `6` is reserved in `device/pcc_rate_report.h`:
 
 ```c
 #define PCC_RATE_REPORT_FORMAT_ID (6)
@@ -36,7 +36,7 @@ For example, `1048576` (`1 << 20`) is the configured `NEW_FLOW_RATE` currently o
 
 ## Host decoding and aggregation
 
-`pcc/host/pcc_core.c` registers `rate_report_trace_handler()` with `doca_pcc_register_trace_handler()`.
+`host/pcc_core.c` registers `rate_report_trace_handler()` with `doca_pcc_register_trace_handler()`.
 
 `struct doca_pcc_bin_report` is opaque in the public PCC API. It is 64 bytes in
 both supported 3.x ABIs, but its argument offset differs:
@@ -110,20 +110,22 @@ Do not flush on every TX or every rate report in the production path: `doca_pcc_
 
 ## Build
 
-Rebuild both host and DPA code after changing DPA sources:
+Build both host and DPA code:
 
 ```bash
-cd /home/tylerliu/pcc_example/build
-meson setup --wipe ..
-ninja
+meson setup build
+ninja -C build
 ```
 
-The DPA archive is regenerated during Meson setup through `pcc/build_device_code.sh` / `dpacc`.
+The DPA archive is a Ninja custom target. Changes to the device C sources,
+headers, attributes YAML, or `build_device_code.sh` automatically rerun
+`dpacc` during an ordinary `ninja -C build`; no Meson wipe or reconfigure is
+required.
 
 ## Embedded DOCA Flow path steering
 
 For the BF3 experiment, the PCC executable runs the **DOCA Flow path-steering
-module** (`../doca-flow/steer.c`) in the **same host process**, in the **egress
+module** (`steering/steer.c`) in the **same host process**, in the **egress
 role**: because the PCC RP runs on the sender, `doca_pcc` sets the DSCP path marker
 independently on each sender packet at SF egress. Enable it by passing the sender
 SF representor with `-r` (DOCA 3.x), which also opens the PF device and SF rep the
@@ -131,10 +133,10 @@ steering datapath needs:
 
 ```bash
 # sender (PCC RP + embedded egress steering), PF1 / pf1sf0:
-sudo ./build/pcc/doca_pcc --device mlx5_1 -r pci/0000:03:00.1,pf1sf0 <PCC args...>
+sudo ./build/doca_pcc --device mlx5_1 -r pci/0000:03:00.1,pf1sf0 <PCC args...>
 
 # receiver side runs the ingress half as a separate standalone instance, PF0:
-sudo ./doca-flow/build/doca_flow_steer -r pci/0000:03:00.0,pf0sf0 --role ingress
+sudo ./build/doca_flow_steer -r pci/0000:03:00.0,pf0sf0 --role ingress
 ```
 
 (`--steer-sf <N>` remains for the DOCA 2.9 discovery path.) Drive traffic with two
@@ -149,7 +151,7 @@ egress hash is fixed and is not live-updated by PCC rates.
 > **Marker mechanism.** The the selected virtual path is marked on the wire with an
 > ICRC-exempt **DSCP bit** (masked modify), *not* a UDP-port rewrite — rewriting the
 > RoCEv2 UDP port breaks ICRC and drops rewritten traffic. See
-> [`../doca-flow/README.md`](../doca-flow/README.md).
+> [`steering/README.md`](steering/README.md).
 
 > **Status.** The standalone `doca_flow_steer` (two per-PF instances,
 > `--role egress`/`--role ingress`) is hardware-validated. The embedded egress path
@@ -170,8 +172,8 @@ DPA-timer second and remains the primary visibility point for the trace feed:
 ```
 
 The steering pipeline, options, and the DOCA 2.9/3.x compatibility notes are
-documented in [`../doca-flow/README.md`](../doca-flow/README.md). The same module
-also builds as a standalone `doca_flow_steer` binary there for testing.
+documented in [`steering/README.md`](steering/README.md). The same unified build
+also produces the standalone `doca_flow_steer` binary for testing.
 
 > The former `peer_sim` sender/DRR component has been removed; the sender is now
 > just a RoCE traffic generator (e.g. `ib_write_bw`), and DOCA Flow performs the

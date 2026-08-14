@@ -35,6 +35,7 @@ set -e -x
 # arg5: Absolute paths of directory to keep host stubs
 # arg6: Flag to indicate enabling TX counter sampling
 # arg7: DPACC MCPU flag
+# arg8: Final host-linkable archive path tracked by Meson/Ninja
 
 ####################
 ## Configurations ##
@@ -47,6 +48,7 @@ PCC_APP_NAME=$4
 PCC_DEV_STUBS_KEEP_DIR=$5
 ENABLE_TX_COUNTER_SAMPLING=$6
 DPACC_MCPU_FLAG=$7
+FINAL_ARCHIVE=$8
 
 # Tools location - DPACC, DPA compiler
 MLNX_INSTALL_PATH="/opt/mellanox"
@@ -57,9 +59,8 @@ DPA_APP_ATTRIBUTES2BLOB="${DOCA_TOOLS}/dpa-app-attributes2blob"
 FLEXIO_INCLUDE="${MLNX_INSTALL_PATH}/flexio/include"
 
 # DOCA include list
-DOCA_APP_DEVICE_COMMON_DIR="${PCC_APP_DEVICE_SRC_DIR}/../../common/device"
 DOCA_APP_DEVICE_PCC_DIR="${PCC_APP_DEVICE_SRC_DIR}"
-DOCA_INC_LIST="-I${DOCA_INSTALL_DIR}/include/ -I${DOCA_APP_DEVICE_PCC_DIR} -I${DOCA_APP_DEVICE_COMMON_DIR}"
+DOCA_INC_LIST="-I${DOCA_INSTALL_DIR}/include/ -I${DOCA_APP_DEVICE_PCC_DIR}"
 APPLICATION_DPA_ATTRIBUTES="${PCC_APP_DEVICE_SRC_DIR}/dpa_app_attributes.yaml"
 APPLICATION_DPA_ATTRIBUTES_BLOB="${APPLICATION_DEVICE_BUILD_DIR}/${PCC_APP_NAME}_attributes.blob"
 
@@ -67,11 +68,10 @@ APPLICATION_DPA_ATTRIBUTES_BLOB="${APPLICATION_DEVICE_BUILD_DIR}/${PCC_APP_NAME}
 if [ "${PCC_APP_NAME}" = "pcc_rp_rtt_template_app" ]
 then
         DOCA_PCC_DEV_LIB_NAME="doca_pcc_dev"
-        PCC_DEV_RP_RTT_TEMPLATE_DIR=${PCC_APP_DEVICE_SRC_DIR}/rp/rtt_template
-        PCC_APP_DEVICE_SRCS=`ls ${PCC_DEV_RP_RTT_TEMPLATE_DIR}/*.c`
-        PCC_APP_DEVICE_ALGO_SRCS=`ls ${PCC_DEV_RP_RTT_TEMPLATE_DIR}/algo/*.c`
+        PCC_APP_DEVICE_SRCS=`ls ${PCC_APP_DEVICE_SRC_DIR}/*.c`
+        PCC_APP_DEVICE_ALGO_SRCS=`ls ${PCC_APP_DEVICE_SRC_DIR}/algo/*.c`
         PCC_DEVICE_SRC_FILES="${PCC_APP_DEVICE_SRCS} ${PCC_APP_DEVICE_ALGO_SRCS}"
-        APP_INC_LIST="${DOCA_INC_LIST} -I${PCC_DEV_RP_RTT_TEMPLATE_DIR}/algo"
+	APP_INC_LIST="${DOCA_INC_LIST} -I${PCC_APP_DEVICE_SRC_DIR}/algo"
 	if [ "${AMALGAMATION_BUILD_MODE:-false}" = "true" ]; then
 		APP_INC_LIST="${APP_INC_LIST} -I${DOCA_PCC_DIR}/device/include/rp -I${DOCA_PCC_DIR}/device/adb_gen/"
 	fi
@@ -163,3 +163,7 @@ ${DPA_PROC_ATTR_OPTION}
 
 # generate device application program from auto-generated host stubs
 generate_prog_from_stubs "${PCC_DEVICE_SRC_FILES}"
+
+# Publish the linkable host-stub archive as the custom target's declared
+# output. Meson/Ninja tracks this file and all device inputs that produce it.
+cp -f "${PCC_DEV_STUBS_KEEP_DIR}/${PCC_APP_NAME}.a" "${FINAL_ARCHIVE}"

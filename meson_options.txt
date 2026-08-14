@@ -35,10 +35,6 @@ option('enable_trace_log', type: 'boolean', value: false,
 option('enable_pcc_application_tx_counter_sampling', type: 'boolean', value: false,
 	description: 'Enable sampling of TX bytes counter in PCC application.')
 
-option('enable_pcc_application_np_rx_rate', type: 'boolean', value: false,
-	description: 'Enable PCC application CC rate update via notification point RX bytes.')
-
 # DPACC options
 option('dpacc_mcpu', type : 'string', value : 'nv-dpa-bf3,nv-dpa-cx7,nv-dpa-cx8,nv-dpa-cx9',
 	description : 'Set the supported architecture for DPA related application.')
-

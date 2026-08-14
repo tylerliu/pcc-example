@@ -23,8 +23,8 @@
  *
  */
 
-#ifndef COMMON_DEVICE_UTILS_H_
-#define COMMON_DEVICE_UTILS_H_
+#ifndef PCC_DEVICE_ALGO_UTILS_H_
+#define PCC_DEVICE_ALGO_UTILS_H_
 
 #ifndef MIN
 #define MIN(X, Y) (((X) < (Y)) ? (X) : (Y)) /* Return the minimum value between X and Y */
@@ -42,4 +42,4 @@
 #define unlikely(x) __builtin_expect((x), 0)
 #endif
 
-#endif /* COMMON_DEVICE_UTILS_H_ */
+#endif /* PCC_DEVICE_ALGO_UTILS_H_ */

@@ -8,8 +8,8 @@
  * Host side:   filters incoming trace reports by format_id == PCC_RATE_REPORT_FORMAT_ID
  */
 
-#ifndef PCC_RATE_REPORT_H_
-#define PCC_RATE_REPORT_H_
+#ifndef PCC_DEVICE_RATE_REPORT_H_
+#define PCC_DEVICE_RATE_REPORT_H_
 
 /*
  * Trace format ID for per-flow rate reports.
@@ -26,4 +26,4 @@
  *   arg5 = timestamp (doca_pcc_dev_get_timer_lo)
  */
 
-#endif /* PCC_RATE_REPORT_H_ */
+#endif /* PCC_DEVICE_RATE_REPORT_H_ */

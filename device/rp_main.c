@@ -184,7 +184,7 @@ void doca_pcc_dev_user_algo(doca_pcc_dev_algo_ctxt_t *algo_ctxt,
 		qpn_known = 1;
 		first_observed_flow = rtt_ctxt->flow_qpn == 0;
 		if (!first_observed_flow && rtt_ctxt->flow_qpn != qpn) {
-			doca_pcc_dev_printf("PCC ERROR: algorithm context QPN changed old=0x%x new=0x%x port=%u slot=%u\n",
+			doca_pcc_dev_printf("PCC WARNING: algorithm context QPN changed old=0x%x new=0x%x port=%u slot=%u\n",
 					    rtt_ctxt->flow_qpn, qpn, port_num, attr->algo_slot);
 			/* Treat this as context recycling and force a host rate report for
 			 * the newly observed owner. */
@@ -258,7 +258,7 @@ skip_flow_summary:
 			doca_pcc_dev_printf("rtt_template: slot=%u ev=%u rtt_count=%u\n",
 					    attr->algo_slot, ev_type, rtt_count);
 		rtt_count++;
-		rtt_template_algo(event, param, counter, algo_ctxt, qpn, results);
+		rtt_template_algo(event, param, counter, algo_ctxt, results);
 		break;
 	}
 	default: {
