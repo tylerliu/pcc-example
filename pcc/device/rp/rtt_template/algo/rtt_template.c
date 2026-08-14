@@ -36,10 +36,9 @@
  *  Pure-ECN (DCQCN-style) congestion controller  --  tutorial add-on
  *  Rate is driven ONLY by CNP (multiplicative decrease) + TX (additive increase).
  *  The RTT-based rate update is disabled in rtt_template_handle_roce_rtt() below.
- *  Conservative steering-signal tuning: AI and MD strength are 1/10 of the
- *  original values. A 1% MD means retaining 99% of the rate per CNP.
+ *  Tune ECN_CNP_DEC_FACTOR: 800..995  =>  x0.800 .. x0.995 per CNP (x0.90 is the sweet spot).
  * ==========================================================================*/
-#define ECN_CNP_DEC_FACTOR (((1 << 16) * 990) / 1000) /* x0.99 per CNP, fxp16 */
+#define ECN_CNP_DEC_FACTOR (((1 << 16) * 900) / 1000) /* x0.90 per CNP, fxp16 */
 
 #pragma clang diagnostic ignored "-Wunused-parameter"
 

@@ -33,6 +33,7 @@
 #include "steer.h"
 
 #include <doca_argp.h>
+#include <doca_version.h>
 
 #include "pcc_core.h"
 #include "../common/device/pcc_rate_report.h"
@@ -43,10 +44,10 @@
 static char *trace_message_formats[] = {
 	"format 0 - user init: port num = %#lx, algo index = %#lx, algo slot = %#lx, algo enable = %#lx, disable event bitmask = %#lx\n",
 	"format 1 - user algo: algo slot = %#lx, result rate = %#lx, result rtt req = %#lx, port num = %#lx, timestamp = %#lx\n",
-	"format 2 - pcc_np dev: thread_idx = %#lx, debug_init = %#lx, cnt_enter = %#lx, cnt_arm = %#lx. end %u\n",
-	"format 3 - pcc_np dev: thread_idx = %#lx, cnt_recv_packet = %#lx, cnt_sent_packet = %#lx, cnt_user_func_err = %#lx. end %u\n",
-	"format 4 - pcc_np dev: thread_idx = %#lx, rq = %#lx, rq_pi = %#lx, rqcq = %#lx, rqcq_ci = %#lx\n",
-	"format 5 - pcc_np dev: thread_idx = %#lx, sq = %#lx, sq_pi = %#lx, sqcq = %#lx. end %u\n",
+	"unused format 2\n",
+	"unused format 3\n",
+	"unused format 4\n",
+	"unused format 5\n",
 	"RATE_REPORT: qpn=%#lx rate=%#lx ev_type=%#lx rtt=%#lx ts=%#lx\n",
 	NULL};
 
@@ -85,12 +86,10 @@ static struct flow_rate_entry *find_or_create_flow(uint32_t qpn)
 	return NULL;
 }
 
-/*
- * doca_pcc_bin_report is intentionally opaque. PCC uses a 64-byte record:
- * metadata at offset 8, an internal timestamp at offset 16, and the five
- * arguments of doca_pcc_dev_trace_5 at offset 24. This is distinct from the
- * similarly sized FlexIO msg_bin_report, whose args begin at offset 16.
- */
+/* doca_pcc_bin_report is intentionally opaque and changed layout while keeping
+ * its 64-byte size. DOCA 3.1 uses the legacy FlexIO report (args at byte 16),
+ * while DOCA 3.4 inserts an internal timestamp (args at byte 24). */
+#if DOCA_VERSION_MAJOR > 3 || (DOCA_VERSION_MAJOR == 3 && DOCA_VERSION_MINOR >= 4)
 struct pcc_trace_report {
 	uint32_t msg_number;
 	uint32_t seq_number;
@@ -98,6 +97,16 @@ struct pcc_trace_report {
 	uint64_t internal_timestamp;
 	uint64_t args[5];
 };
+#else
+struct pcc_trace_report {
+	uint32_t msg_number;
+	uint32_t seq_number;
+	uint64_t thread_and_timestamp;
+	uint64_t args[6];
+};
+#endif
+
+_Static_assert(sizeof(struct pcc_trace_report) == 64, "unexpected PCC trace report size");
 
 /*
  * Trace handler callback - receives binary trace reports from the DPA.
@@ -161,10 +170,6 @@ const uint32_t default_pcc_rp_threads_list[PCC_RP_THREADS_NUM_DEFAULT_VALUE] = {
 	176, 177, 178, 179, 180, 181, 182, 183, 184, 185, 186, 187, 192, 193, 194, 195, 196,
 	197, 198, 199, 200, 201, 202, 203, 208, 209, 210, 211, 212, 213, 214, 215, 216, 217,
 	218, 219, 224, 225, 226, 227, 228, 229, 230, 231, 232, 233, 234, 235, 240};
-/* Default PCC NP threads */
-const uint32_t default_pcc_np_threads_list[PCC_NP_THREADS_NUM_DEFAULT_VALUE] =
-	{16, 17, 18, 19, 20, 21, 22, 23, 32, 33, 34, 35, 36, 37, 38, 39, 48};
-
 /*
  * Declare threads list flag
  */
@@ -180,11 +185,7 @@ static bool use_dpa_resources = false;
  */
 static bool use_dpa_application_key = false;
 
-/*
- * Declare user set application flag
- */
-static bool user_set_app = false;
-
+#if DOCA_VERSION_MAJOR > 3 || (DOCA_VERSION_MAJOR == 3 && DOCA_VERSION_MINOR >= 4)
 /**
  * @brief Get the size of a file
  *
@@ -245,12 +246,12 @@ static doca_error_t read_file_into_buffer(const char *path, char *buffer, size_t
 	*bytes_read = read_byte_count;
 	return DOCA_SUCCESS;
 }
+#endif
 
 /*
  * Check if the provided device name is a name of a valid IB device
  *
  * @device_name [in]: The wanted IB device name
- * @role [in]: Role of the PCC context
  * @return: True if device_name is an IB device, false otherwise.
  */
 static bool pcc_device_exists_check(const char *device_name)
@@ -294,7 +295,7 @@ static bool pcc_device_exists_check(const char *device_name)
  * @doca_device [out]: An allocated DOCA device that supports PCC on success and NULL otherwise
  * @return: DOCA_SUCCESS on success and DOCA_ERROR otherwise
  */
-static doca_error_t open_pcc_device(const char *device_name, pcc_role_t role, struct doca_dev **doca_device)
+static doca_error_t open_pcc_device(const char *device_name, struct doca_dev **doca_device)
 {
 	struct doca_devinfo **dev_list;
 	uint32_t nb_devs = 0;
@@ -320,15 +321,10 @@ static doca_error_t open_pcc_device(const char *device_name, pcc_role_t role, st
 		if (strncmp(device_name, ibdev_name, DOCA_DEVINFO_IBDEV_NAME_SIZE) != 0)
 			continue;
 
-		if (role == PCC_ROLE_RP)
-			result = doca_devinfo_get_is_pcc_supported(dev_list[i]);
-		else if (role == PCC_ROLE_NP)
-			result = doca_pcc_np_cap_is_supported(dev_list[i]);
+		result = doca_devinfo_get_is_pcc_supported(dev_list[i]);
 		if (result != DOCA_SUCCESS) {
 			doca_devinfo_destroy_list(dev_list);
-			PRINT_ERROR("Error: DOCA device %s does not support PCC %s role\n",
-				    device_name,
-				    (role == PCC_ROLE_RP ? "RP" : "NP"));
+			PRINT_ERROR("Error: DOCA device %s does not support PCC RP\n", device_name);
 			return result;
 		}
 
@@ -353,6 +349,7 @@ static doca_error_t open_pcc_device(const char *device_name, pcc_role_t role, st
 
 static doca_error_t create_dpa_resources(struct pcc_config *cfg)
 {
+#if DOCA_VERSION_MAJOR > 3 || (DOCA_VERSION_MAJOR == 3 && DOCA_VERSION_MINOR >= 4)
 	char *file_buffer;
 	size_t bytes_read;
 	struct doca_pcc_resources *doca_pcc_resources;
@@ -423,6 +420,11 @@ static doca_error_t create_dpa_resources(struct pcc_config *cfg)
 	free(file_buffer);
 
 	return DOCA_SUCCESS;
+#else
+	(void)cfg;
+	PRINT_ERROR("Error: DPA resources-file parsing requires DOCA 3.4 or newer; use --threads on this SDK\n");
+	return DOCA_ERROR_NOT_SUPPORTED;
+#endif
 }
 
 doca_error_t pcc_init(struct pcc_config *cfg, struct pcc_resources *resources)
@@ -451,7 +453,7 @@ doca_error_t pcc_init(struct pcc_config *cfg, struct pcc_resources *resources)
 	}
 
 	/* Open DOCA device that supports PCC */
-	result = open_pcc_device(cfg->device_name, cfg->role, &(resources->doca_device));
+	result = open_pcc_device(cfg->device_name, &(resources->doca_device));
 	if (result != DOCA_SUCCESS) {
 		PRINT_ERROR("Error: Failed to open DOCA device that supports PCC\n");
 		return result;
@@ -459,24 +461,16 @@ doca_error_t pcc_init(struct pcc_config *cfg, struct pcc_resources *resources)
 
 	/* Create DOCA PCC context */
 	bool use_default_threads = !use_threads_list && !use_dpa_resources;
-	if (cfg->role == PCC_ROLE_RP)
-		result = doca_pcc_create(resources->doca_device, &(resources->doca_pcc));
-	else if (cfg->role == PCC_ROLE_NP)
-		result = doca_pcc_np_create(resources->doca_device, &(resources->doca_pcc));
+	result = doca_pcc_create(resources->doca_device, &(resources->doca_pcc));
 	if (result != DOCA_SUCCESS) {
 		PRINT_ERROR("Error: Failed to create DOCA PCC context\n");
 		goto close_doca_dev;
 	}
 
-	/* Define default threads if not set according to role */
+	/* Define default RP threads if not explicitly configured. */
 	if (use_default_threads) {
-		if (cfg->role == PCC_ROLE_RP) {
-			memcpy(cfg->threads_list, default_pcc_rp_threads_list, sizeof(default_pcc_rp_threads_list));
-			cfg->threads_num = PCC_RP_THREADS_NUM_DEFAULT_VALUE;
-		} else if (cfg->role == PCC_ROLE_NP) {
-			memcpy(cfg->threads_list, default_pcc_np_threads_list, sizeof(default_pcc_np_threads_list));
-			cfg->threads_num = PCC_NP_THREADS_NUM_DEFAULT_VALUE;
-		}
+		memcpy(cfg->threads_list, default_pcc_rp_threads_list, sizeof(default_pcc_rp_threads_list));
+		cfg->threads_num = PCC_RP_THREADS_NUM_DEFAULT_VALUE;
 	}
 
 	result = doca_pcc_get_min_num_threads(resources->doca_pcc, &min_num_threads);
@@ -514,58 +508,16 @@ doca_error_t pcc_init(struct pcc_config *cfg, struct pcc_resources *resources)
 		goto destroy_pcc;
 	}
 
-	/* Set DOCA PCC probe packet format */
-	switch (cfg->probe_packet_format) {
-	case PCC_DEV_PROBE_PACKET_CCMAD:
-		result = doca_pcc_set_ccmad_probe_packet_format(resources->doca_pcc, 0);
-		if (result != DOCA_SUCCESS) {
-			PRINT_ERROR("Error: Failed to set CCMAD probe packet format for DOCA PCC\n");
-			goto destroy_pcc;
-		}
-		if (cfg->role == PCC_ROLE_RP) {
-			result =
-				doca_pcc_rp_set_ccmad_remote_sw_handler(resources->doca_pcc, 0, cfg->remote_sw_handler);
-			if (result != DOCA_SUCCESS) {
-				PRINT_ERROR("Error: Failed to set CCMAD remote SW handler for DOCA PCC\n");
-				goto destroy_pcc;
-			}
-		}
-		break;
-	case PCC_DEV_PROBE_PACKET_IFA1:
-		result = doca_pcc_set_ifa1_probe_packet_format(resources->doca_pcc, 0);
-		if (result != DOCA_SUCCESS) {
-			PRINT_ERROR("Error: Failed to set IFA1 probe packet format for DOCA PCC\n");
-			goto destroy_pcc;
-		}
-		break;
-	case PCC_DEV_PROBE_PACKET_IFA2:
-		result = doca_pcc_set_ifa2_probe_packet_format(resources->doca_pcc, 0);
-		if (result != DOCA_SUCCESS) {
-			PRINT_ERROR("Error: Failed to set IFA2 probe packet format for DOCA PCC\n");
-			goto destroy_pcc;
-		}
-		if (cfg->role == PCC_ROLE_RP) {
-			result = doca_pcc_rp_set_ifa2_gns(resources->doca_pcc, 0, cfg->gns);
-			if (result != DOCA_SUCCESS) {
-				PRINT_ERROR("Error: Failed to set IFA2 GNS for DOCA PCC\n");
-				goto destroy_pcc;
-			}
-			result = doca_pcc_rp_set_ifa2_hop_limit(resources->doca_pcc, 0, cfg->hop_limit);
-			if (result != DOCA_SUCCESS) {
-				PRINT_ERROR("Error: Failed to set IFA2 hop limit for DOCA PCC\n");
-				goto destroy_pcc;
-			}
-		} else if (cfg->role == PCC_ROLE_NP) {
-			result = doca_pcc_np_set_ifa2_gns_ignore(resources->doca_pcc,
-								 0,
-								 cfg->gns_ignore_mask,
-								 cfg->gns_ignore_value);
-			if (result != DOCA_SUCCESS) {
-				PRINT_ERROR("Error: Failed to set IFA2 GNS ignore for DOCA PCC\n");
-				goto destroy_pcc;
-			}
-		}
-		break;
+	/* This RP application uses CCMAD probes only. */
+	result = doca_pcc_set_ccmad_probe_packet_format(resources->doca_pcc, 0);
+	if (result != DOCA_SUCCESS) {
+		PRINT_ERROR("Error: Failed to set CCMAD probe packet format for DOCA PCC\n");
+		goto destroy_pcc;
+	}
+	result = doca_pcc_rp_set_ccmad_remote_sw_handler(resources->doca_pcc, 0, cfg->remote_sw_handler);
+	if (result != DOCA_SUCCESS) {
+		PRINT_ERROR("Error: Failed to set CCMAD remote SW handler for DOCA PCC\n");
+		goto destroy_pcc;
 	}
 
 	/* Set DOCA PCC print buffer size */
@@ -596,13 +548,6 @@ doca_error_t pcc_init(struct pcc_config *cfg, struct pcc_resources *resources)
 		goto destroy_pcc;
 	}
 
-	/* Set DOCA PCC mailbox */
-	result = doca_pcc_set_mailbox(resources->doca_pcc, PCC_MAILBOX_REQUEST_SIZE, PCC_MAILBOX_RESPONSE_SIZE);
-	if (result != DOCA_SUCCESS) {
-		PRINT_ERROR("Error: Failed to set mailbox for DOCA PCC\n");
-		goto destroy_pcc;
-	}
-
 	return result;
 
 destroy_pcc:
@@ -619,40 +564,6 @@ close_doca_dev:
 	}
 
 	return result;
-}
-
-doca_error_t pcc_mailbox_send(struct pcc_config *cfg, struct pcc_resources *resources)
-{
-	doca_error_t result;
-	uint32_t *request_buf;
-	uint32_t response_size, cb_ret_val;
-
-	if (!(cfg->app == pcc_np_switch_telemetry_app))
-		return DOCA_SUCCESS;
-
-	/* Get the request buffer of the mailbox */
-	result = doca_pcc_mailbox_get_request_buffer(resources->doca_pcc, (void **)&request_buf);
-	if (result != DOCA_SUCCESS) {
-		PRINT_ERROR("Error: Failed to get the request buffer of the PCC mailbox\n");
-		return result;
-	}
-
-	/* send hop limit to device */
-	*request_buf = cfg->hop_limit;
-
-	/* Send the request buffer that holds the hop limit */
-	result = doca_pcc_mailbox_send(resources->doca_pcc, PCC_MAILBOX_REQUEST_SIZE, &response_size, &cb_ret_val);
-	if (result != DOCA_SUCCESS) {
-		PRINT_ERROR("Error: Failed to send the PCC mailbox request buffer\n");
-		return result;
-	}
-
-	if (cb_ret_val != 0) {
-		PRINT_ERROR("Error: Mailbox callback returned error status\n");
-		return DOCA_ERROR_UNEXPECTED;
-	}
-
-	return DOCA_SUCCESS;
 }
 
 doca_error_t pcc_destroy(struct pcc_resources *resources)
@@ -697,61 +608,6 @@ static doca_error_t device_name_callback(void *param, void *config)
 		PRINT_ERROR("Error: Entered IB device name: %s doesn't exist\n", pcc_cfg->device_name);
 		return DOCA_ERROR_INVALID_VALUE;
 	}
-
-	return DOCA_SUCCESS;
-}
-
-/*
- * ARGP Callback - Handle PCC RP Switch Telemetry parameter
- *
- * @param [in]: Input parameter
- * @config [in/out]: Program configuration context
- * @return: DOCA_SUCCESS on success and DOCA_ERROR otherwise
- */
-static doca_error_t rp_switch_telemetry_callback(void *param, void *config)
-{
-	struct pcc_config *pcc_cfg = (struct pcc_config *)config;
-	bool rp_switch_telemetry = *((bool *)param);
-
-	if (user_set_app) {
-		PRINT_ERROR("Error: Can not set multiple runtime application.\n");
-		return DOCA_ERROR_INITIALIZATION;
-	}
-
-	if (rp_switch_telemetry) {
-		pcc_cfg->app = pcc_rp_switch_telemetry_app;
-		pcc_cfg->probe_packet_format = PCC_DEV_PROBE_PACKET_IFA2;
-	}
-	user_set_app = true;
-	PRINT_INFO("Info: Set DOCA PCC RP Switch Telemetry application\n");
-
-	return DOCA_SUCCESS;
-}
-
-/*
- * ARGP Callback - Handle PCC NP Switch Telemetry parameter
- *
- * @param [in]: Input parameter
- * @config [in/out]: Program configuration context
- * @return: DOCA_SUCCESS on success and DOCA_ERROR otherwise
- */
-static doca_error_t np_switch_telemetry_callback(void *param, void *config)
-{
-	struct pcc_config *pcc_cfg = (struct pcc_config *)config;
-	bool np_switch_telemetry = *((bool *)param);
-
-	if (user_set_app) {
-		PRINT_ERROR("Error: Can not set multiple runtime application.\n");
-		return DOCA_ERROR_INITIALIZATION;
-	}
-
-	if (np_switch_telemetry) {
-		pcc_cfg->app = pcc_np_switch_telemetry_app;
-		pcc_cfg->role = PCC_ROLE_NP;
-		pcc_cfg->probe_packet_format = PCC_DEV_PROBE_PACKET_IFA2;
-	}
-	user_set_app = true;
-	PRINT_INFO("Info: Set DOCA PCC RP Switch Telemetry application\n");
 
 	return DOCA_SUCCESS;
 }
@@ -857,70 +713,6 @@ static doca_error_t ccmad_remote_sw_handler_callback(void *param, void *config)
 }
 
 /*
- * ARGP Callback - Handle PCC hop limit parameter
- *
- * @param [in]: Input parameter
- * @config [in/out]: Program configuration context
- * @return: DOCA_SUCCESS on success and DOCA_ERROR otherwise
- */
-static doca_error_t ifa2_hop_limit_callback(void *param, void *config)
-{
-	struct pcc_config *pcc_cfg = (struct pcc_config *)config;
-
-	pcc_cfg->hop_limit = *((uint8_t *)param);
-
-	return DOCA_SUCCESS;
-}
-
-/*
- * ARGP Callback - Handle PCC gns parameter
- *
- * @param [in]: Input parameter
- * @config [in/out]: Program configuration context
- * @return: DOCA_SUCCESS on success and DOCA_ERROR otherwise
- */
-static doca_error_t ifa2_gns_callback(void *param, void *config)
-{
-	struct pcc_config *pcc_cfg = (struct pcc_config *)config;
-
-	pcc_cfg->gns = *((uint8_t *)param);
-
-	return DOCA_SUCCESS;
-}
-
-/*
- * ARGP Callback - Handle PCC gns ignore mask parameter
- *
- * @param [in]: Input parameter
- * @config [in/out]: Program configuration context
- * @return: DOCA_SUCCESS on success and DOCA_ERROR otherwise
- */
-static doca_error_t ifa2_gns_ignore_mask_callback(void *param, void *config)
-{
-	struct pcc_config *pcc_cfg = (struct pcc_config *)config;
-
-	pcc_cfg->gns_ignore_mask = *((uint8_t *)param);
-
-	return DOCA_SUCCESS;
-}
-
-/*
- * ARGP Callback - Handle PCC gns ignore value parameter
- *
- * @param [in]: Input parameter
- * @config [in/out]: Program configuration context
- * @return: DOCA_SUCCESS on success and DOCA_ERROR otherwise
- */
-static doca_error_t ifa2_gns_ignore_value_callback(void *param, void *config)
-{
-	struct pcc_config *pcc_cfg = (struct pcc_config *)config;
-
-	pcc_cfg->gns_ignore_value = *((uint8_t *)param);
-
-	return DOCA_SUCCESS;
-}
-
-/*
  * ARGP Callback - Handle PCC device coredump file parameter
  *
  * @param [in]: Input parameter
@@ -978,6 +770,20 @@ static doca_error_t steer_path0_ip_callback(void *param, void *config)
 static doca_error_t steer_path1_ip_callback(void *param, void *config)
 {
 	return steer_path_ip_callback(param, config, 1);
+}
+
+static doca_error_t steer_force_path_callback(void *param, void *config)
+{
+	struct pcc_config *cfg = config;
+	const char *value = param;
+
+	if (strcmp(value, "0") != 0 && strcmp(value, "1") != 0) {
+		PRINT_ERROR("Error: --force-path must be 0 or 1\n");
+		return DOCA_ERROR_INVALID_VALUE;
+	}
+	cfg->steer_force_path = value[0] - '0';
+	cfg->steer_force_path_set = true;
+	return DOCA_SUCCESS;
 }
 
 #if DOCA_VERSION_MAJOR >= 3
@@ -1077,15 +883,9 @@ static doca_error_t dpa_application_key_callback(void *param, void *config)
 doca_error_t register_pcc_params(void)
 {
 	struct doca_argp_param *device_param;
-	struct doca_argp_param *rp_switch_telemetry_param;
-	struct doca_argp_param *np_switch_telemetry_param;
 	struct doca_argp_param *threads_list_param;
 	struct doca_argp_param *wait_time_param;
 	struct doca_argp_param *remote_sw_handler_param;
-	struct doca_argp_param *hop_limit_param;
-	struct doca_argp_param *gns_param;
-	struct doca_argp_param *gns_ignore_mask_param;
-	struct doca_argp_param *gns_ignore_value_param;
 	struct doca_argp_param *coredump_file_param;
 	struct doca_argp_param *steer_sf_param;
 	struct doca_argp_param *dpa_resources_file;
@@ -1105,46 +905,6 @@ doca_error_t register_pcc_params(void)
 	doca_argp_param_set_type(device_param, DOCA_ARGP_TYPE_STRING);
 	doca_argp_param_set_mandatory(device_param);
 	result = doca_argp_register_param(device_param);
-	if (result != DOCA_SUCCESS) {
-		PRINT_ERROR("Error: Failed to register program param: %s\n", doca_error_get_descr(result));
-		return result;
-	}
-
-	/* Create and register PCC RP Switch Telemetry parameter */
-	result = doca_argp_param_create(&rp_switch_telemetry_param);
-	if (result != DOCA_SUCCESS) {
-		PRINT_ERROR("Error: Failed to create ARGP param: %s\n", doca_error_get_descr(result));
-		return result;
-	}
-	doca_argp_param_set_short_name(rp_switch_telemetry_param, "rp-st");
-	doca_argp_param_set_long_name(rp_switch_telemetry_param, "rp-switch-telemetry");
-	doca_argp_param_set_arguments(rp_switch_telemetry_param, "<PCC Reaction Point Switch Telemetry>");
-	doca_argp_param_set_description(
-		rp_switch_telemetry_param,
-		"Flag to indicate running as a Reaction Point Switch Telemetry (optional). The application will generate IFA2 probe packets. By default the flag is set to false.");
-	doca_argp_param_set_callback(rp_switch_telemetry_param, rp_switch_telemetry_callback);
-	doca_argp_param_set_type(rp_switch_telemetry_param, DOCA_ARGP_TYPE_BOOLEAN);
-	result = doca_argp_register_param(rp_switch_telemetry_param);
-	if (result != DOCA_SUCCESS) {
-		PRINT_ERROR("Error: Failed to register program param: %s\n", doca_error_get_descr(result));
-		return result;
-	}
-
-	/* Create and register PCC NP Switch Telemetry parameter */
-	result = doca_argp_param_create(&np_switch_telemetry_param);
-	if (result != DOCA_SUCCESS) {
-		PRINT_ERROR("Error: Failed to create ARGP param: %s\n", doca_error_get_descr(result));
-		return result;
-	}
-	doca_argp_param_set_short_name(np_switch_telemetry_param, "np-st");
-	doca_argp_param_set_long_name(np_switch_telemetry_param, "np-switch-telemetry");
-	doca_argp_param_set_arguments(np_switch_telemetry_param, "<PCC Notification Point Switch Telemetry>");
-	doca_argp_param_set_description(
-		np_switch_telemetry_param,
-		"Flag to indicate running as a Notification Point Switch Telemetry (optional). The application will generate IFA2 probe packets. By default the flag is set to false.");
-	doca_argp_param_set_callback(np_switch_telemetry_param, np_switch_telemetry_callback);
-	doca_argp_param_set_type(np_switch_telemetry_param, DOCA_ARGP_TYPE_BOOLEAN);
-	result = doca_argp_register_param(np_switch_telemetry_param);
 	if (result != DOCA_SUCCESS) {
 		PRINT_ERROR("Error: Failed to register program param: %s\n", doca_error_get_descr(result));
 		return result;
@@ -1210,86 +970,6 @@ doca_error_t register_pcc_params(void)
 		return result;
 	}
 
-	/* Create and register PCC hop limit parameter */
-	result = doca_argp_param_create(&hop_limit_param);
-	if (result != DOCA_SUCCESS) {
-		PRINT_ERROR("Error: Failed to create ARGP param: %s\n", doca_error_get_descr(result));
-		return result;
-	}
-	doca_argp_param_set_short_name(hop_limit_param, "hl");
-	doca_argp_param_set_long_name(hop_limit_param, "hop-limit");
-	doca_argp_param_set_arguments(hop_limit_param, "<IFA2 hop limit>");
-	doca_argp_param_set_description(
-		hop_limit_param,
-		"The IFA2 probe packet hop limit (optional). If not provided then 0XFE will be chosen.");
-	doca_argp_param_set_callback(hop_limit_param, ifa2_hop_limit_callback);
-	doca_argp_param_set_type(hop_limit_param, DOCA_ARGP_TYPE_INT);
-	result = doca_argp_register_param(hop_limit_param);
-	if (result != DOCA_SUCCESS) {
-		PRINT_ERROR("Error: Failed to register program param: %s\n", doca_error_get_descr(result));
-		return result;
-	}
-
-	/* Create and register PCC gns parameter */
-	result = doca_argp_param_create(&gns_param);
-	if (result != DOCA_SUCCESS) {
-		PRINT_ERROR("Error: Failed to create ARGP param: %s\n", doca_error_get_descr(result));
-		return result;
-	}
-	doca_argp_param_set_short_name(gns_param, "gns");
-	doca_argp_param_set_long_name(gns_param, "global-namespace");
-	doca_argp_param_set_arguments(gns_param, "<IFA2 global namespace>");
-	doca_argp_param_set_description(
-		gns_param,
-		"The IFA2 probe packet global namespace (optional). If not provided then 0XF will be chosen.");
-	doca_argp_param_set_callback(gns_param, ifa2_gns_callback);
-	doca_argp_param_set_type(gns_param, DOCA_ARGP_TYPE_INT);
-	result = doca_argp_register_param(gns_param);
-	if (result != DOCA_SUCCESS) {
-		PRINT_ERROR("Error: Failed to register program param: %s\n", doca_error_get_descr(result));
-		return result;
-	}
-
-	/* Create and register PCC gns ignore mask parameter */
-	result = doca_argp_param_create(&gns_ignore_mask_param);
-	if (result != DOCA_SUCCESS) {
-		PRINT_ERROR("Error: Failed to create ARGP param: %s\n", doca_error_get_descr(result));
-		return result;
-	}
-	doca_argp_param_set_short_name(gns_ignore_mask_param, "gns-ignore-mask");
-	doca_argp_param_set_long_name(gns_ignore_mask_param, "global-namespace-ignore-mask");
-	doca_argp_param_set_arguments(gns_ignore_mask_param, "<IFA2 global namespace ignore mask>");
-	doca_argp_param_set_description(
-		gns_ignore_mask_param,
-		"The IFA2 probe packet global namespace ignore mask (optional). If not provided then 0 will be chosen.");
-	doca_argp_param_set_callback(gns_ignore_mask_param, ifa2_gns_ignore_mask_callback);
-	doca_argp_param_set_type(gns_ignore_mask_param, DOCA_ARGP_TYPE_INT);
-	result = doca_argp_register_param(gns_ignore_mask_param);
-	if (result != DOCA_SUCCESS) {
-		PRINT_ERROR("Error: Failed to register program param: %s\n", doca_error_get_descr(result));
-		return result;
-	}
-
-	/* Create and register PCC gns ignore value parameter */
-	result = doca_argp_param_create(&gns_ignore_value_param);
-	if (result != DOCA_SUCCESS) {
-		PRINT_ERROR("Error: Failed to create ARGP param: %s\n", doca_error_get_descr(result));
-		return result;
-	}
-	doca_argp_param_set_short_name(gns_ignore_value_param, "gns-ignore-val");
-	doca_argp_param_set_long_name(gns_ignore_value_param, "global-namespace-ignore-value");
-	doca_argp_param_set_arguments(gns_ignore_value_param, "<IFA2 global namespace ignore value>");
-	doca_argp_param_set_description(
-		gns_ignore_value_param,
-		"The IFA2 probe packet global namespace ignore value (optional). If not provided then 0 will be chosen.");
-	doca_argp_param_set_callback(gns_ignore_value_param, ifa2_gns_ignore_value_callback);
-	doca_argp_param_set_type(gns_ignore_value_param, DOCA_ARGP_TYPE_INT);
-	result = doca_argp_register_param(gns_ignore_value_param);
-	if (result != DOCA_SUCCESS) {
-		PRINT_ERROR("Error: Failed to register program param: %s\n", doca_error_get_descr(result));
-		return result;
-	}
-
 	/* Create and register PCC device coredump file parameter */
 	result = doca_argp_param_create(&coredump_file_param);
 	if (result != DOCA_SUCCESS) {
@@ -1329,7 +1009,7 @@ doca_error_t register_pcc_params(void)
 		return result;
 	}
 
-	struct doca_argp_param *path0_ip_param, *path1_ip_param;
+	struct doca_argp_param *path0_ip_param, *path1_ip_param, *force_path_param;
 	result = doca_argp_param_create(&path0_ip_param);
 	if (result != DOCA_SUCCESS)
 		return result;
@@ -1350,6 +1030,20 @@ doca_error_t register_pcc_params(void)
 	doca_argp_param_set_callback(path1_ip_param, steer_path1_ip_callback);
 	doca_argp_param_set_type(path1_ip_param, DOCA_ARGP_TYPE_STRING);
 	result = doca_argp_register_param(path1_ip_param);
+	if (result != DOCA_SUCCESS)
+		return result;
+
+	result = doca_argp_param_create(&force_path_param);
+	if (result != DOCA_SUCCESS)
+		return result;
+	doca_argp_param_set_long_name(force_path_param, "force-path");
+	doca_argp_param_set_arguments(force_path_param, "<0|1>");
+	doca_argp_param_set_description(
+		force_path_param,
+		"Diagnostic: force path 0 or 1 (DOCA 3.x bypasses EGRESS_CLASSIFY entirely).");
+	doca_argp_param_set_callback(force_path_param, steer_force_path_callback);
+	doca_argp_param_set_type(force_path_param, DOCA_ARGP_TYPE_STRING);
+	result = doca_argp_register_param(force_path_param);
 	if (result != DOCA_SUCCESS)
 		return result;
 

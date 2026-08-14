@@ -59,6 +59,7 @@ DOCA_LOG_REGISTER(FLOW_STEER);
 #define ROCE_BTH_OPCODE_CNP 0x81u
 #define IP4_DSCP_ECN_CE 0x03	 /* ECN=11 (CE); set masked so DSCP is preserved */
 #define IP4_ECN_MASK 0x03	 /* the two ECN bits of the ToS byte */
+#define IP4_ECN_ECT0 0x02	 /* ECN=10 (ECT(0)) */
 /*
  * On-wire "current-path" marker. The two virtual paths are distinguished purely
  * by one bit of the IP ToS byte (DSCP+ECN is a *variant* field excluded from the
@@ -340,7 +341,7 @@ static void initialize_doca_flow(void)
 	err = doca_flow_cfg_set_pipe_queues(cfg, NB_QUEUES);
 	crash_if_unsuccessful(err, "doca_flow_cfg_set_pipe_queues");
 
-#if DOCA_VERSION_MAJOR >= 3
+#if STEER_HAS_PORT_RESOURCE_MODE
 	err = doca_flow_cfg_set_mode_args(cfg, "switch,hws");
 	crash_if_unsuccessful(err, "doca_flow_cfg_set_mode_args");
 
@@ -348,7 +349,13 @@ static void initialize_doca_flow(void)
 	err = doca_flow_cfg_set_resource_mode(cfg, DOCA_FLOW_RESOURCE_MODE_PORT);
 	crash_if_unsuccessful(err, "doca_flow_cfg_set_resource_mode");
 #else
+	/* DOCA 3.1 and 2.x allocate counters globally. DOCA 3.1 otherwise uses
+	 * the normal 3.x switch mode and must not enable the old isolated mode. */
+#if DOCA_VERSION_MAJOR >= 3
+	err = doca_flow_cfg_set_mode_args(cfg, "switch,hws");
+#else
 	err = doca_flow_cfg_set_mode_args(cfg, "switch,hws,isolated,disable_switch_rss");
+#endif
 	crash_if_unsuccessful(err, "doca_flow_cfg_set_mode_args");
 
 	err = doca_flow_cfg_set_nr_counters(cfg, NB_COUNTERS);
@@ -381,8 +388,10 @@ static struct doca_flow_port *port_start(struct doca_dev *dev, uint16_t flow_por
 #if DOCA_VERSION_MAJOR >= 3
 	err = doca_flow_port_cfg_set_actions_mem_size(cfg, 256 * DOCA_FLOW_MAX_ENTRY_ACTIONS_MEM_SIZE);
 	crash_if_unsuccessful(err, "doca_flow_port_cfg_set_actions_mem_size");
+#if STEER_HAS_PORT_RESOURCE_MODE
 	err = doca_flow_port_cfg_set_nr_resources(cfg, DOCA_FLOW_RESOURCE_COUNTER, 128);
 	crash_if_unsuccessful(err, "doca_flow_port_cfg_set_nr_resources (counter)");
+#endif
 #else
 	{
 		char port_id_str[8];
@@ -493,8 +502,7 @@ static struct doca_flow_port *rep_port_start(uint16_t dpdk_port_id)
  */
 static struct doca_flow_pipe *create_deliver_pipe(struct doca_flow_port *port, const char *name, uint16_t dest_port_id)
 {
-	struct doca_flow_match match = {0};
-	struct doca_flow_match match_mask = {0};
+	struct doca_flow_match match = {0}, match_mask = {0};
 	struct doca_flow_fwd fwd = {.type = DOCA_FLOW_FWD_PORT, .port_id = dest_port_id};
 	struct doca_flow_pipe_cfg *cfg;
 	struct doca_flow_pipe *pipe;
@@ -721,25 +729,153 @@ static struct doca_flow_pipe *create_path_demux_pipe(struct doca_flow_port *port
 	return pipe;
 }
 
-/* EGRESS_CLASSIFY (BASIC pipe): the low six parser_meta.random bits select one
- * of 64 persistent buckets. The pipe reserves another 64 rule slots because
- * HWS entry replacement temporarily consumes a new rule index. */
+#if STEER_USE_RANDOM_HASH_CLASSIFIER
+/* DOCA 3.x path action. Keep this identical to the validated ECN tutorial:
+ * one fixed full-byte action and one entry. EGRESS_CLASSIFY is action-free and
+ * chooses between the two pipes with a changeable per-bucket forward. */
+static struct doca_flow_pipe *create_path_rewrite_pipe(struct doca_flow_port *port, uint8_t path,
+						       struct doca_flow_pipe *next_pipe)
+{
+	struct doca_flow_match match = {0}, match_mask = {0};
+	struct doca_flow_actions actions = {0};
+	struct doca_flow_actions *actions_arr[1] = {&actions};
+	struct doca_flow_fwd fwd = {.type = DOCA_FLOW_FWD_PIPE, .next_pipe = next_pipe};
+	struct doca_flow_pipe_cfg *cfg;
+	struct doca_flow_pipe *pipe;
+	struct doca_flow_pipe_entry *entry;
+	struct entry_batch_status status = {0};
+	char name[32];
+	doca_error_t err;
+
+	match.outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;
+	match.outer.ip4.dscp_ecn = UINT8_MAX;
+	match_mask.outer.ip4.dscp_ecn = 0;
+	actions.outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;
+	actions.outer.ip4.dscp_ecn = UINT8_MAX;
+	snprintf(name, sizeof(name), "EGRESS_PATH%u_REWRITE", path);
+
+	err = doca_flow_pipe_cfg_create(&cfg, port);
+	crash_if_unsuccessful(err, "pipe_cfg_create (%s)", name);
+	crash_if_unsuccessful(doca_flow_pipe_cfg_set_name(cfg, name),
+	                      "pipe_cfg_set_name (%s)", name);
+	crash_if_unsuccessful(doca_flow_pipe_cfg_set_type(cfg, DOCA_FLOW_PIPE_BASIC),
+	                      "pipe_cfg_set_type (%s)", name);
+	crash_if_unsuccessful(doca_flow_pipe_cfg_set_domain(cfg, DOCA_FLOW_PIPE_DOMAIN_DEFAULT),
+	                      "pipe_cfg_set_domain (%s)", name);
+	crash_if_unsuccessful(doca_flow_pipe_cfg_set_is_root(cfg, false),
+	                      "pipe_cfg_set_is_root (%s)", name);
+	crash_if_unsuccessful(doca_flow_pipe_cfg_set_nr_entries(cfg, 1),
+	                      "pipe_cfg_set_nr_entries (%s)", name);
+	crash_if_unsuccessful(doca_flow_pipe_cfg_set_match(cfg, &match, &match_mask),
+	                      "pipe_cfg_set_match (%s)", name);
+	crash_if_unsuccessful(doca_flow_pipe_cfg_set_actions(cfg, actions_arr, NULL, NULL, 1),
+	                      "pipe_cfg_set_actions (%s)", name);
+	err = doca_flow_pipe_create(cfg, &fwd, NULL, &pipe);
+	crash_if_unsuccessful(err, "pipe_create (%s)", name);
+	doca_flow_pipe_cfg_destroy(cfg);
+
+	struct doca_flow_match entry_match = {0};
+	struct doca_flow_actions entry_actions = {0};
+	entry_actions.outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;
+	entry_actions.outer.ip4.dscp_ecn = PATH_DSCP_VAL(path) | IP4_ECN_ECT0;
+	err = steer_pipe_add_entry(0, pipe, &entry_match, 0, &entry_actions, NULL, NULL, 0,
+	                           &status, &entry);
+	crash_if_unsuccessful(err, "pipe_add_entry (%s)", name);
+	process_entries(port, &status, 1, name);
+	DOCA_LOG_INFO("%s ready: fixed dscp_ecn=0x%02x", name,
+	              entry_actions.outer.ip4.dscp_ecn);
+	return pipe;
+}
+#endif
+
+#if STEER_USE_RANDOM_HASH_CLASSIFIER
+/* DOCA 3.x update stage. RANDOM HASH writes its selected index to application
+ * scratch u32[4]; this single BASIC table maps that value to a changeable path
+ * forward. HASH internally uses part of u32[3], so u32[4] is intentional. */
+static struct doca_flow_pipe *create_classify_dispatch_pipe(
+	struct doca_flow_port *port, struct doca_flow_pipe *path_target[NB_PATHS],
+	struct doca_flow_pipe_entry *entries[PATH_SHARE_BUCKETS],
+	uint8_t bucket_path[PATH_SHARE_BUCKETS], int force_path)
+{
+	struct doca_flow_match match = {0}, match_mask = {0};
+	struct doca_flow_fwd fwd = {.type = DOCA_FLOW_FWD_CHANGEABLE};
+	struct doca_flow_pipe_cfg *cfg;
+	struct doca_flow_pipe *pipe;
+	doca_error_t err;
+
+	match.meta.u32[4] = UINT32_MAX;
+	match_mask.meta.u32[4] = UINT32_MAX;
+	err = doca_flow_pipe_cfg_create(&cfg, port);
+	crash_if_unsuccessful(err, "pipe_cfg_create (classify dispatch)");
+	crash_if_unsuccessful(doca_flow_pipe_cfg_set_name(cfg, "EGRESS_BUCKET_DISPATCH"),
+	                      "pipe_cfg_set_name (classify dispatch)");
+	crash_if_unsuccessful(doca_flow_pipe_cfg_set_type(cfg, DOCA_FLOW_PIPE_BASIC),
+	                      "pipe_cfg_set_type (classify dispatch)");
+	crash_if_unsuccessful(doca_flow_pipe_cfg_set_domain(cfg, DOCA_FLOW_PIPE_DOMAIN_DEFAULT),
+	                      "pipe_cfg_set_domain (classify dispatch)");
+	crash_if_unsuccessful(doca_flow_pipe_cfg_set_is_root(cfg, false),
+	                      "pipe_cfg_set_is_root (classify dispatch)");
+	/* Entry replacement temporarily needs a free rule index. */
+	crash_if_unsuccessful(doca_flow_pipe_cfg_set_nr_entries(cfg, PATH_SHARE_BUCKETS * 2),
+	                      "pipe_cfg_set_nr_entries (classify dispatch)");
+	crash_if_unsuccessful(doca_flow_pipe_cfg_set_match(cfg, &match, &match_mask),
+	                      "pipe_cfg_set_match (classify dispatch)");
+	err = doca_flow_pipe_create(cfg, &fwd, NULL, &pipe);
+	crash_if_unsuccessful(err, "pipe_create (classify dispatch)");
+	doca_flow_pipe_cfg_destroy(cfg);
+
+	memset(&g_classify_batch, 0, sizeof(g_classify_batch));
+	for (uint32_t idx = 0; idx < PATH_SHARE_BUCKETS; idx++) {
+		struct doca_flow_match entry_match = {0};
+		uint8_t path = force_path >= 0 ? (uint8_t)force_path
+		                                                  : (idx < PATH_SHARE_BUCKETS / 2 ? 0 : 1);
+		struct doca_flow_fwd entry_fwd = {
+			.type = DOCA_FLOW_FWD_PIPE,
+			.next_pipe = path_target[path],
+		};
+		uint32_t flags = idx == PATH_SHARE_BUCKETS - 1 ? 0 : STEER_WAIT_FOR_BATCH;
+
+		entry_match.meta.u32[4] = RTE_BE32(idx);
+		err = steer_pipe_add_entry(0, pipe, &entry_match, 0, NULL, NULL, &entry_fwd,
+		                           flags, &g_classify_batch, &entries[idx]);
+		crash_if_unsuccessful(err, "pipe_add_entry (dispatch bucket=%u)", idx);
+		bucket_path[idx] = path;
+	}
+	process_entries(port, &g_classify_batch, PATH_SHARE_BUCKETS, "classify dispatch entries");
+	DOCA_LOG_INFO("EGRESS_BUCKET_DISPATCH ready: meta.u32[4] bucket -> changeable path forward");
+	return pipe;
+}
+#endif
+
+/* EGRESS_CLASSIFY selects one of 64 persistent buckets independently for each
+ * packet. DOCA 3.x uses native RANDOM HASH with no match mask and a
+ * power-of-two entry count. The old BASIC parser_meta.random implementation is
+ * retained below only for the future DOCA 2.x port. */
 static struct doca_flow_pipe *create_classify_pipe(struct doca_flow_port *port, struct doca_flow_pipe *deliver_wire)
 {
+#if !STEER_USE_RANDOM_HASH_CLASSIFIER
 	struct doca_flow_match match_mask = {0};
 	struct doca_flow_actions set0 = {0}, set1 = {0};
 	struct doca_flow_actions set0_mask = {0}, set1_mask = {0};
 	struct doca_flow_actions *actions_arr[2] = {&set0, &set1};
 	struct doca_flow_actions *actions_masks_arr[2] = {&set0_mask, &set1_mask};
+#else
+	struct doca_flow_actions set_bucket = {0};
+	struct doca_flow_actions *actions_arr[1] = {&set_bucket};
+#endif
+#if !STEER_USE_RANDOM_HASH_CLASSIFIER
 	struct doca_flow_fwd fwd = {.type = DOCA_FLOW_FWD_PIPE, .next_pipe = deliver_wire};
+#else
+	struct doca_flow_fwd fwd = {.type = DOCA_FLOW_FWD_PIPE, .next_pipe = deliver_wire};
+#endif
 	struct doca_flow_pipe_cfg *cfg;
 	struct doca_flow_pipe *pipe;
 	doca_error_t err;
 
-	/* Per-packet random distribution, independent of all flow fields. */
+	/* DOCA 3.4 uses two fixed masked-write templates selected by the explicit
+	 * action_idx argument. Preserve this known-good encoding exactly. */
+#if !STEER_USE_RANDOM_HASH_CLASSIFIER
 	match_mask.parser_meta.random = RTE_BE16(PATH_SHARE_BUCKETS - 1);
-
-	/* Two masked-write templates; entry (bucket) idx selects idx0=path0, idx1=path1. */
 	set0.outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;
 	set0.outer.ip4.dscp_ecn = PATH_DSCP_VAL(0);
 	set0_mask.outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;
@@ -748,23 +884,43 @@ static struct doca_flow_pipe *create_classify_pipe(struct doca_flow_port *port, 
 	set1.outer.ip4.dscp_ecn = PATH_DSCP_VAL(1);
 	set1_mask.outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;
 	set1_mask.outer.ip4.dscp_ecn = PATH_DSCP_MASK;
+#endif
 
 	err = doca_flow_pipe_cfg_create(&cfg, port);
 	crash_if_unsuccessful(err, "pipe_cfg_create (classify)");
 	err = doca_flow_pipe_cfg_set_name(cfg, "EGRESS_CLASSIFY");
 	crash_if_unsuccessful(err, "pipe_cfg_set_name (classify)");
+#if !STEER_USE_RANDOM_HASH_CLASSIFIER
 	err = doca_flow_pipe_cfg_set_type(cfg, DOCA_FLOW_PIPE_BASIC);
+#else
+	err = doca_flow_pipe_cfg_set_type(cfg, DOCA_FLOW_PIPE_HASH);
+#endif
 	crash_if_unsuccessful(err, "pipe_cfg_set_type (classify)");
 	err = doca_flow_pipe_cfg_set_domain(cfg, DOCA_FLOW_PIPE_DOMAIN_DEFAULT);
 	crash_if_unsuccessful(err, "pipe_cfg_set_domain (classify)");
 	err = doca_flow_pipe_cfg_set_is_root(cfg, false);
 	crash_if_unsuccessful(err, "pipe_cfg_set_is_root (classify)");
-	err = doca_flow_pipe_cfg_set_nr_entries(cfg, PATH_SHARE_BUCKETS * 2);
+	err = doca_flow_pipe_cfg_set_nr_entries(cfg,
+#if !STEER_USE_RANDOM_HASH_CLASSIFIER
+	                                          PATH_SHARE_BUCKETS * 2
+#else
+	                                          PATH_SHARE_BUCKETS
+#endif
+	);
 	crash_if_unsuccessful(err, "pipe_cfg_set_nr_entries (classify)");
+#if !STEER_USE_RANDOM_HASH_CLASSIFIER
 	err = doca_flow_pipe_cfg_set_match(cfg, NULL, &match_mask);
 	crash_if_unsuccessful(err, "pipe_cfg_set_match (classify)");
 	err = doca_flow_pipe_cfg_set_actions(cfg, actions_arr, actions_masks_arr, NULL, 2);
 	crash_if_unsuccessful(err, "pipe_cfg_set_actions (classify)");
+#else
+	set_bucket.meta.u32[4] = UINT32_MAX;
+	err = doca_flow_pipe_cfg_set_hash_map_algorithm(
+		cfg, DOCA_FLOW_PIPE_HASH_MAP_ALGORITHM_RANDOM);
+	crash_if_unsuccessful(err, "pipe_cfg_set_hash_map_algorithm (classify random)");
+	err = doca_flow_pipe_cfg_set_actions(cfg, actions_arr, NULL, NULL, 1);
+	crash_if_unsuccessful(err, "pipe_cfg_set_actions (classify bucket metadata)");
+#endif
 	err = doca_flow_pipe_create(cfg, &fwd, NULL, &pipe);
 	crash_if_unsuccessful(err, "pipe_create (classify)");
 	doca_flow_pipe_cfg_destroy(cfg);
@@ -777,29 +933,56 @@ static struct doca_flow_pipe *create_classify_pipe(struct doca_flow_port *port, 
  */
 static void add_classify_entries(struct doca_flow_pipe *pipe, struct doca_flow_port *port,
 				 struct doca_flow_pipe_entry *entries[PATH_SHARE_BUCKETS],
-				 uint8_t bucket_path[PATH_SHARE_BUCKETS])
+				 uint8_t bucket_path[PATH_SHARE_BUCKETS], int force_path,
+				 struct doca_flow_pipe *path_target[NB_PATHS])
 {
 	doca_error_t err;
 
+#if !STEER_USE_RANDOM_HASH_CLASSIFIER
+	(void)path_target;
 	memset(&g_classify_batch, 0, sizeof(g_classify_batch));
-
 	for (uint32_t idx = 0; idx < PATH_SHARE_BUCKETS; idx++) {
 		struct doca_flow_match match = {0};
 		struct doca_flow_actions actions = {0};
 		uint32_t flags = (idx == PATH_SHARE_BUCKETS - 1) ? 0 : STEER_WAIT_FOR_BATCH;
-		uint8_t path = idx < PATH_SHARE_BUCKETS / 2 ? 0 : 1;
+		uint8_t path = force_path >= 0 ? (uint8_t)force_path
+		                                                  : (idx < PATH_SHARE_BUCKETS / 2 ? 0 : 1);
 
 		actions.outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;
 		actions.outer.ip4.dscp_ecn = PATH_DSCP_VAL(path);
 		match.parser_meta.random = RTE_BE16(idx);
-
-		err = steer_pipe_add_entry(0, pipe, &match, path, &actions, NULL, NULL, flags,
+		err = steer_pipe_add_entry(0, pipe, &match,
+		                           path,
+		                           &actions,
+		                           NULL,
+		                           NULL,
+		                           flags,
 					   &g_classify_batch, &entries[idx]);
 		crash_if_unsuccessful(err, "pipe_add_entry (classify bucket=%u)", idx);
 		bucket_path[idx] = path;
 	}
 	process_entries(port, &g_classify_batch, PATH_SHARE_BUCKETS, "classify entries");
-	DOCA_LOG_INFO("Classify random-bucket pipe ready: 64 persistent rules plus 64 update slots, initial ratio 32:32");
+	DOCA_LOG_INFO("Classify random-bucket pipe ready: BASIC parser_meta.random, "
+	              "64 persistent buckets, initial ratio 32:32");
+#else
+	(void)entries;
+	(void)bucket_path;
+	(void)force_path;
+	(void)path_target;
+	memset(&g_classify_batch, 0, sizeof(g_classify_batch));
+	for (uint32_t idx = 0; idx < PATH_SHARE_BUCKETS; idx++) {
+		struct doca_flow_actions actions = {0};
+		struct doca_flow_pipe_entry *hash_entry;
+		uint32_t flags = idx == PATH_SHARE_BUCKETS - 1 ? 0 : STEER_WAIT_FOR_BATCH;
+
+		actions.meta.u32[4] = RTE_BE32(idx);
+		err = steer_pipe_hash_add_entry(0, pipe, idx, 0, &actions, NULL, NULL,
+		                                      flags, &g_classify_batch, &hash_entry);
+		crash_if_unsuccessful(err, "pipe_hash_add_entry (classify bucket=%u)", idx);
+	}
+	process_entries(port, &g_classify_batch, PATH_SHARE_BUCKETS, "classify hash entries");
+	DOCA_LOG_INFO("Classify random-bucket pipe ready: HASH/random writes bucket to meta.u32[4]");
+#endif
 }
 
 /* EGRESS_ROCE_CHECK (non-root): admit only IPv4 RoCEv2 on UDP 4791 to
@@ -807,17 +990,27 @@ static void add_classify_entries(struct doca_flow_pipe *pipe, struct doca_flow_p
  * the random-bucket pipe and is delivered to the wire unchanged. */
 static struct doca_flow_pipe *create_roce_check_pipe(struct doca_flow_port *port, const char *name,
                                                      struct doca_flow_pipe *roce_target,
-                                                     struct doca_flow_pipe *bypass_target)
+                                                     struct doca_flow_pipe *bypass_target,
+						     bool roce_target_is_random_hash)
 {
 	struct doca_flow_match match = {0};
 	struct doca_flow_match match_mask = {0};
-	struct doca_flow_fwd fwd = {.type = DOCA_FLOW_FWD_PIPE, .next_pipe = roce_target};
+	struct doca_flow_fwd fwd = {0};
 	struct doca_flow_fwd fwd_miss = {.type = DOCA_FLOW_FWD_PIPE, .next_pipe = bypass_target};
 	struct doca_flow_pipe_cfg *cfg;
 	struct doca_flow_pipe *pipe;
 	struct doca_flow_pipe_entry *entry;
 	struct entry_batch_status status = {0};
 	doca_error_t err;
+
+	if (roce_target_is_random_hash) {
+		fwd.type = DOCA_FLOW_FWD_HASH_PIPE;
+		fwd.hash_pipe.pipe = roce_target;
+		fwd.hash_pipe.algorithm = DOCA_FLOW_PIPE_HASH_MAP_ALGORITHM_RANDOM;
+	} else {
+		fwd.type = DOCA_FLOW_FWD_PIPE;
+		fwd.next_pipe = roce_target;
+	}
 
 	match.outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;
 	match.outer.l4_type_ext = DOCA_FLOW_L4_TYPE_EXT_ROCE_V2;
@@ -923,8 +1116,8 @@ static struct doca_flow_pipe *create_qp1_flood_pipe(struct doca_flow_port *port,
 		};
 		struct doca_flow_pipe_entry *entry;
 		uint32_t flags = i == 0 ? STEER_WAIT_FOR_BATCH : 0;
-		err = doca_flow_pipe_hash_add_entry(0, pipe, i, 0, NULL, NULL, &entry_fwd, flags,
-		                                    &status, &entry);
+		err = steer_pipe_hash_add_entry(0, pipe, i, 0, NULL, NULL, &entry_fwd, flags,
+		                                  &status, &entry);
 		crash_if_unsuccessful(err, "pipe_hash_add_entry (%s clone=%u)", name, i);
 	}
 	process_entries(port, &status, 2, name);
@@ -996,6 +1189,85 @@ static void install_qp1_clone_paths(struct doca_flow_port *port,
 	struct doca_flow_pipe *sf_flood =
 		create_qp1_flood_pipe(port, "QP1_FLOOD_SF", deliver_wire, qp1_rss);
 	*sf_target = create_qp1_clone_check(port, "QP1_CHECK_SF", sf_flood, *sf_target);
+}
+
+/* Explicit ARP handling: wire requests reach both receiver SFs and replies
+ * from either SF reach wire, independent of IPv4/default-miss behavior. */
+static struct doca_flow_pipe *create_arp_flood_pipe(struct doca_flow_port *port)
+{
+	struct doca_flow_fwd fwd = {.type = DOCA_FLOW_FWD_PIPE, .next_pipe = NULL};
+	struct doca_flow_pipe_cfg *cfg;
+	struct doca_flow_pipe *pipe;
+	struct entry_batch_status status = {0};
+	doca_error_t err = doca_flow_pipe_cfg_create(&cfg, port);
+
+	crash_if_unsuccessful(err, "pipe_cfg_create (ARP flood)");
+	crash_if_unsuccessful(doca_flow_pipe_cfg_set_name(cfg, "ARP_FLOOD_TO_SFS"), "pipe_cfg_set_name (ARP flood)");
+	crash_if_unsuccessful(doca_flow_pipe_cfg_set_type(cfg, DOCA_FLOW_PIPE_HASH), "pipe_cfg_set_type (ARP flood)");
+	crash_if_unsuccessful(doca_flow_pipe_cfg_set_domain(cfg, DOCA_FLOW_PIPE_DOMAIN_DEFAULT), "pipe_cfg_set_domain (ARP flood)");
+	crash_if_unsuccessful(doca_flow_pipe_cfg_set_is_root(cfg, false), "pipe_cfg_set_is_root (ARP flood)");
+	crash_if_unsuccessful(doca_flow_pipe_cfg_set_nr_entries(cfg, NB_PATHS), "pipe_cfg_set_nr_entries (ARP flood)");
+	crash_if_unsuccessful(doca_flow_pipe_cfg_set_hash_map_algorithm(cfg, DOCA_FLOW_PIPE_HASH_MAP_ALGORITHM_FLOODING),
+	                      "pipe_cfg_set_hash_map_algorithm (ARP flood)");
+	err = doca_flow_pipe_create(cfg, &fwd, NULL, &pipe);
+	crash_if_unsuccessful(err, "pipe_create (ARP flood)");
+	doca_flow_pipe_cfg_destroy(cfg);
+
+	for (uint32_t path = 0; path < NB_PATHS; path++) {
+		struct doca_flow_fwd entry_fwd = {.type = DOCA_FLOW_FWD_PORT, .port_id = SF_PORT_ID + path};
+		struct doca_flow_pipe_entry *entry;
+		uint32_t flags = path == 0 ? STEER_WAIT_FOR_BATCH : 0;
+
+		err = steer_pipe_hash_add_entry(0, pipe, path, 0, NULL, NULL, &entry_fwd, flags, &status, &entry);
+		crash_if_unsuccessful(err, "pipe_hash_add_entry (ARP flood path=%u)", path);
+	}
+	process_entries(port, &status, NB_PATHS, "ARP flood entries");
+	return pipe;
+}
+
+static struct doca_flow_pipe *create_arp_check_pipe(struct doca_flow_port *port, const char *name,
+						     const struct doca_flow_fwd *arp_fwd,
+						     struct doca_flow_pipe *miss_target)
+{
+	struct doca_flow_match match = {0}, match_mask = {0}, entry_match = {0};
+	struct doca_flow_fwd fwd_miss = {.type = DOCA_FLOW_FWD_PIPE, .next_pipe = miss_target};
+	struct doca_flow_pipe_cfg *cfg;
+	struct doca_flow_pipe *pipe;
+	struct doca_flow_pipe_entry *entry;
+	struct entry_batch_status status = {0};
+	doca_error_t err;
+
+	match.outer.eth.type = UINT16_MAX;
+	match_mask.outer.eth.type = UINT16_MAX;
+	entry_match.outer.eth.type = RTE_BE16(RTE_ETHER_TYPE_ARP);
+	err = doca_flow_pipe_cfg_create(&cfg, port);
+	crash_if_unsuccessful(err, "pipe_cfg_create (%s)", name);
+	crash_if_unsuccessful(doca_flow_pipe_cfg_set_name(cfg, name), "pipe_cfg_set_name (%s)", name);
+	crash_if_unsuccessful(doca_flow_pipe_cfg_set_type(cfg, DOCA_FLOW_PIPE_BASIC), "pipe_cfg_set_type (%s)", name);
+	crash_if_unsuccessful(doca_flow_pipe_cfg_set_domain(cfg, DOCA_FLOW_PIPE_DOMAIN_DEFAULT), "pipe_cfg_set_domain (%s)", name);
+	crash_if_unsuccessful(doca_flow_pipe_cfg_set_is_root(cfg, false), "pipe_cfg_set_is_root (%s)", name);
+	crash_if_unsuccessful(doca_flow_pipe_cfg_set_nr_entries(cfg, 1), "pipe_cfg_set_nr_entries (%s)", name);
+	crash_if_unsuccessful(doca_flow_pipe_cfg_set_match(cfg, &match, &match_mask), "pipe_cfg_set_match (%s)", name);
+	err = doca_flow_pipe_create(cfg, arp_fwd, &fwd_miss, &pipe);
+	crash_if_unsuccessful(err, "pipe_create (%s)", name);
+	doca_flow_pipe_cfg_destroy(cfg);
+	err = steer_pipe_add_entry(0, pipe, &entry_match, 0, NULL, NULL, NULL, 0, &status, &entry);
+	crash_if_unsuccessful(err, "pipe_add_entry (%s)", name);
+	process_entries(port, &status, 1, name);
+	return pipe;
+}
+
+static void install_arp_paths(struct doca_flow_port *port, struct doca_flow_pipe **wire_target,
+			      struct doca_flow_pipe **sf_target)
+{
+	struct doca_flow_pipe *flood = create_arp_flood_pipe(port);
+	struct doca_flow_fwd wire_fwd = {.type = DOCA_FLOW_FWD_HASH_PIPE,
+		.hash_pipe = {.pipe = flood, .algorithm = DOCA_FLOW_PIPE_HASH_MAP_ALGORITHM_FLOODING}};
+	struct doca_flow_fwd sf_fwd = {.type = DOCA_FLOW_FWD_PORT, .port_id = WIRE_PORT_ID};
+
+	*wire_target = create_arp_check_pipe(port, "ARP_CHECK_WIRE", &wire_fwd, *wire_target);
+	*sf_target = create_arp_check_pipe(port, "ARP_CHECK_SF", &sf_fwd, *sf_target);
+	DOCA_LOG_INFO("ARP steering ready: wire -> SF0+SF1; SF replies -> wire");
 }
 
 /*
@@ -1333,6 +1605,8 @@ struct steer_state {
 	struct doca_flow_port *port;
 	struct doca_flow_port *sf_rep_port[NB_PATHS];
 	struct doca_flow_pipe *classify_pipe;
+	struct doca_flow_pipe *classify_dispatch_pipe;
+	struct doca_flow_pipe *classify_target[NB_PATHS];
 	struct doca_flow_pipe *cnp_count_pipe;
 	bool grouping_enabled;
 	struct doca_flow_pipe_entry *classify_entry[PATH_SHARE_BUCKETS];
@@ -1346,6 +1620,9 @@ struct steer_state {
 	uint8_t cnp_path[MAX_CNP_TRACKED_QPS];
 	struct doca_flow_pipe_entry *cnp_entry[MAX_CNP_TRACKED_QPS];
 	uint32_t cnp_entry_count;
+	uint64_t cnp_prev_pkts[NB_PATHS];
+	uint64_t cnp_prev_cycles;
+	bool cnp_delta_ready;
 	struct rate_flow_state rate_flow[MAX_RATE_FLOWS];
 	uint32_t rate_flow_count;
 	struct cm_request_state cm_request[MAX_CM_CONNECTIONS];
@@ -1353,6 +1630,7 @@ struct steer_state {
 	struct qpn_pair_state qpn_pair[MAX_CM_CONNECTIONS];
 	uint32_t qpn_pair_count;
 	uint64_t ingress_prev_bytes[NB_PATHS];
+	uint64_t ingress_prev_mark_pkts[NB_PATHS];
 	uint64_t ingress_prev_cycles;
 	bool ingress_throughput_ready;
 	atomic_flag rate_lock;
@@ -1365,6 +1643,7 @@ void steer_default_opts(struct steer_opts *opts)
 	memset(opts, 0, sizeof(*opts));
 	opts->sf_num = 0;
 	opts->role = STEER_ROLE_BOTH;
+	opts->force_path = -1;
 	opts->path_percent[0] = 100.0;
 	opts->path_percent[1] = 100.0;
 }
@@ -1373,6 +1652,8 @@ void steer_default_opts(struct steer_opts *opts)
  * assignment crosses the old/new boundary. No entry is added or removed. */
 static void apply_path_share(uint32_t path0_share)
 {
+	if (g_steer.opts.force_path >= 0)
+		return;
 	if (g_steer.classify_pipe == NULL || path0_share > PATH_SHARE_BUCKETS ||
 	    path0_share == g_steer.applied_path0_share)
 		return;
@@ -1384,9 +1665,19 @@ static void apply_path_share(uint32_t path0_share)
 			continue;
 
 		memset(&g_classify_batch, 0, sizeof(g_classify_batch));
+#if !STEER_USE_RANDOM_HASH_CLASSIFIER
 		doca_error_t err = steer_pipe_update_entry(0, g_steer.classify_pipe, wanted_path,
 							 NULL, NULL, NULL, STEER_NO_WAIT,
 							 g_steer.classify_entry[bucket]);
+#else
+		struct doca_flow_fwd fwd = {
+			.type = DOCA_FLOW_FWD_PIPE,
+			.next_pipe = g_steer.classify_target[wanted_path],
+		};
+		doca_error_t err = steer_pipe_update_entry(0, g_steer.classify_dispatch_pipe, 0,
+							 NULL, NULL, &fwd, STEER_NO_WAIT,
+							 g_steer.classify_entry[bucket]);
+#endif
 		if (err == DOCA_SUCCESS)
 			err = doca_flow_entries_process(g_steer.port, 0, 10000, 1);
 		if (err != DOCA_SUCCESS || g_classify_batch.failure ||
@@ -1507,28 +1798,66 @@ doca_error_t steer_start(const struct steer_opts *opts)
 			create_path_demux_pipe(g_steer.port, path_match, clear_path,
 			                       g_steer.path_demux_entry);
 		wire_target = create_roce_check_pipe(g_steer.port, "INGRESS_ROCE_CHECK",
-		                                     path_demux, receiver_target);
+		                                     path_demux, receiver_target, false);
 	}
 
 	if (do_egress) {
 		g_steer.grouping_enabled = true;
 		g_steer.cnp_count_pipe = create_cnp_count_pipe(g_steer.port, deliver_sf[0], wire_target);
 		wire_target = g_steer.cnp_count_pipe;
-		g_steer.classify_pipe = create_classify_pipe(g_steer.port, deliver_wire);
-		add_classify_entries(g_steer.classify_pipe, g_steer.port,
-		                     g_steer.classify_entry, g_steer.classify_bucket_path);
-		g_steer.applied_path0_share = PATH_SHARE_BUCKETS / 2;
+		struct doca_flow_pipe *classify_target = deliver_wire;
+#if STEER_USE_RANDOM_HASH_CLASSIFIER
+		for (uint8_t path = 0; path < NB_PATHS; path++)
+			g_steer.classify_target[path] =
+				create_path_rewrite_pipe(g_steer.port, path, deliver_wire);
+#else
+		g_steer.classify_target[0] = classify_target;
+		g_steer.classify_target[1] = classify_target;
+#endif
 
-		/* All admitted RoCE traffic is randomly assigned a DSCP path bit. */
-		sf_target = create_roce_check_pipe(g_steer.port, "EGRESS_ROCE_CHECK",
-		                                   g_steer.classify_pipe, deliver_wire);
+#if STEER_USE_RANDOM_HASH_CLASSIFIER
+		if (g_steer.opts.force_path >= 0) {
+			uint8_t forced = (uint8_t)g_steer.opts.force_path;
 
+			g_steer.applied_path0_share = forced == 0 ? PATH_SHARE_BUCKETS : 0;
+			DOCA_LOG_WARN("egress diagnostic: EGRESS_CLASSIFY bypassed; "
+			              "RoCE forwarded directly through path%u rewrite", forced);
+			sf_target = create_roce_check_pipe(g_steer.port, "EGRESS_ROCE_CHECK",
+			                                   g_steer.classify_target[forced], deliver_wire,
+			                                   false);
+		} else
+#endif
+		{
+#if STEER_USE_RANDOM_HASH_CLASSIFIER
+			g_steer.classify_dispatch_pipe = create_classify_dispatch_pipe(
+				g_steer.port, g_steer.classify_target, g_steer.classify_entry,
+				g_steer.classify_bucket_path, g_steer.opts.force_path);
+			classify_target = g_steer.classify_dispatch_pipe;
+#endif
+			g_steer.classify_pipe = create_classify_pipe(g_steer.port, classify_target);
+			add_classify_entries(g_steer.classify_pipe, g_steer.port,
+			                     g_steer.classify_entry, g_steer.classify_bucket_path,
+			                     g_steer.opts.force_path, g_steer.classify_target);
+			g_steer.applied_path0_share = g_steer.opts.force_path == 0 ? PATH_SHARE_BUCKETS
+			                              : g_steer.opts.force_path == 1 ? 0
+			                              : PATH_SHARE_BUCKETS / 2;
+			if (g_steer.opts.force_path >= 0)
+				DOCA_LOG_WARN("egress diagnostic: all classifier buckets forced to path%d",
+				              g_steer.opts.force_path);
+
+			/* All admitted RoCE traffic is randomly assigned a DSCP path bit. */
+			sf_target = create_roce_check_pipe(g_steer.port, "EGRESS_ROCE_CHECK",
+			                                   g_steer.classify_pipe, deliver_wire,
+			                                   STEER_USE_RANDOM_HASH_CLASSIFIER);
+		}
 	}
 
 	/* Both roles observe CM. Egress still uses sender/receiver pairing for its
 	 * diagnostics; ingress path eligibility is now static by destination IP. */
 	install_qp1_clone_paths(g_steer.port, receiver_target, deliver_wire,
 	                        &wire_target, &sf_target);
+	if (do_ingress)
+		install_arp_paths(g_steer.port, &wire_target, &sf_target);
 
 	create_port_demux_pipe(g_steer.port, sf_target, wire_target, nb_sf_ports);
 
@@ -1922,11 +2251,28 @@ void steer_poll(void)
 			    doca_flow_resource_query_entry(g_steer.cnp_entry[i], &q) == DOCA_SUCCESS)
 				cnp_by_path[g_steer.cnp_path[i]] += q.counter.total_pkts;
 		}
-		DOCA_LOG_INFO("sender received CNP counters: path0=%lu path1=%lu",
-		              cnp_by_path[0], cnp_by_path[1]);
+		uint64_t now_cycles = rte_get_timer_cycles();
+		if (g_steer.cnp_delta_ready && now_cycles > g_steer.cnp_prev_cycles) {
+			double seconds = (double)(now_cycles - g_steer.cnp_prev_cycles) /
+			                 (double)rte_get_timer_hz();
+			uint64_t delta0 = cnp_by_path[0] - g_steer.cnp_prev_pkts[0];
+			uint64_t delta1 = cnp_by_path[1] - g_steer.cnp_prev_pkts[1];
+			DOCA_LOG_INFO("sender received raw CNP: path0=%lu (+%lu, %.0f/s) "
+			              "path1=%lu (+%lu, %.0f/s)",
+			              cnp_by_path[0], delta0, (double)delta0 / seconds,
+			              cnp_by_path[1], delta1, (double)delta1 / seconds);
+		} else {
+			DOCA_LOG_INFO("sender received raw CNP baseline: path0=%lu path1=%lu",
+			              cnp_by_path[0], cnp_by_path[1]);
+		}
+		for (int path = 0; path < NB_PATHS; path++)
+			g_steer.cnp_prev_pkts[path] = cnp_by_path[path];
+		g_steer.cnp_prev_cycles = now_cycles;
+		g_steer.cnp_delta_ready = true;
 	}
 
 	uint64_t ingress_bytes[NB_PATHS] = {0};
+	uint64_t ingress_mark_pkts[NB_PATHS] = {0};
 	bool ingress_bytes_valid = true;
 	for (int i = 0; i < NB_PATHS; i++) {
 		if (g_steer.path_demux_entry[i] == NULL ||
@@ -1936,14 +2282,19 @@ void steer_poll(void)
 			ingress_bytes[i] = q.counter.total_bytes;
 		if (g_steer.mark_entry[i] &&
 		    doca_flow_resource_query_entry(g_steer.mark_entry[i], &q) == DOCA_SUCCESS)
-			DOCA_LOG_INFO("path%d selected-class CE marked: %lu pkts", i,
-			              q.counter.total_pkts);
+			ingress_mark_pkts[i] = q.counter.total_pkts;
 	}
 	if (ingress_bytes_valid) {
 		uint64_t now_cycles = rte_get_timer_cycles();
 		if (g_steer.ingress_throughput_ready && now_cycles > g_steer.ingress_prev_cycles) {
 			double seconds = (double)(now_cycles - g_steer.ingress_prev_cycles) /
 			                 (double)rte_get_timer_hz();
+			uint64_t mark_delta0 = ingress_mark_pkts[0] - g_steer.ingress_prev_mark_pkts[0];
+			uint64_t mark_delta1 = ingress_mark_pkts[1] - g_steer.ingress_prev_mark_pkts[1];
+			DOCA_LOG_INFO("ingress newly CE-marked: path0=%lu (+%lu, %.0f/s) "
+			              "path1=%lu (+%lu, %.0f/s)",
+			              ingress_mark_pkts[0], mark_delta0, (double)mark_delta0 / seconds,
+			              ingress_mark_pkts[1], mark_delta1, (double)mark_delta1 / seconds);
 			double path0_gbps = (double)(ingress_bytes[0] - g_steer.ingress_prev_bytes[0]) * 8.0 /
 			                    seconds / 1.0e9;
 			double path1_gbps = (double)(ingress_bytes[1] - g_steer.ingress_prev_bytes[1]) * 8.0 /
@@ -1951,8 +2302,10 @@ void steer_poll(void)
 			DOCA_LOG_INFO("ingress throughput: path0=%.3f Gbps path1=%.3f Gbps total=%.3f Gbps",
 			              path0_gbps, path1_gbps, path0_gbps + path1_gbps);
 		}
-		for (int i = 0; i < NB_PATHS; i++)
+		for (int i = 0; i < NB_PATHS; i++) {
 			g_steer.ingress_prev_bytes[i] = ingress_bytes[i];
+			g_steer.ingress_prev_mark_pkts[i] = ingress_mark_pkts[i];
+		}
 		g_steer.ingress_prev_cycles = now_cycles;
 		g_steer.ingress_throughput_ready = true;
 	}

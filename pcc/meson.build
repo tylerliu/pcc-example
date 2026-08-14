@@ -68,27 +68,13 @@ run_command(app_builds, pcc_app_dev_src_dir, app_device_build_dir, doca_lib_dir,
 	pcc_dev_stubs_keep_dir_path, enable_tx_counter_sampling, dpacc_mcpu_flag, check: true)
 pcc_rp_rtt_template_app = meson.get_compiler('c').find_library(pcc_app_name, dirs : pcc_dev_stubs_keep_dir_path, static: true)
 
-# Compile DOCA PCC Reaction Point Switch Telemetry DPA program
-pcc_app_name = 'pcc_rp_switch_telemetry_app'
-pcc_dev_stubs_keep_dir_path = app_device_build_dir + '/' + pcc_app_name
-run_command(app_builds, pcc_app_dev_src_dir, app_device_build_dir, doca_lib_dir, pcc_app_name,
-	pcc_dev_stubs_keep_dir_path, enable_tx_counter_sampling, dpacc_mcpu_flag, check: true)
-pcc_rp_switch_telemetry_app = meson.get_compiler('c').find_library(pcc_app_name, dirs : pcc_dev_stubs_keep_dir_path, static: true)
-
-# Compile DOCA PCC Notification Point Switch Telemetry DPA program
-pcc_app_name = 'pcc_np_switch_telemetry_app'
-pcc_dev_stubs_keep_dir_path = app_device_build_dir + '/' + pcc_app_name
-run_command(app_builds, pcc_app_dev_src_dir, app_device_build_dir, doca_lib_dir, pcc_app_name,
-	pcc_dev_stubs_keep_dir_path, enable_tx_counter_sampling, dpacc_mcpu_flag, check: true)
-pcc_np_switch_telemetry_app = meson.get_compiler('c').find_library(pcc_app_name, dirs : pcc_dev_stubs_keep_dir_path, static: true)
-
 # Build executable
 doca_pcc_test = executable(DOCA_PREFIX + APP_NAME,
 	host_srcs,
 	c_args : base_c_args,
 	include_directories: [app_inc_dirs, './host', '../doca-flow'],
 	install_dir : app_install_dir,
-	dependencies : [app_dependencies, steer_deps, pcc_rp_rtt_template_app, pcc_rp_switch_telemetry_app, pcc_np_switch_telemetry_app],
+	dependencies : [app_dependencies, steer_deps, pcc_rp_rtt_template_app],
 	link_with : steer_lib,
 	install: install_apps
 )

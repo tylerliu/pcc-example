@@ -83,6 +83,7 @@ static doca_error_t start_embedded_steering(char *prog_name, const struct pcc_co
 	steer_default_opts(&sopts);
 	sopts.role = STEER_ROLE_EGRESS;
 	sopts.sf_num = cfg->steer_sf_num;
+	sopts.force_path = cfg->steer_force_path_set ? cfg->steer_force_path : -1;
 	for (int path = 0; path < STEER_NB_PATHS; path++) {
 		sopts.path_ip[path] = cfg->steer_path_ip[path];
 		sopts.path_ip_set[path] = cfg->steer_path_ip_set[path];
@@ -130,16 +131,10 @@ int main(int argc, char **argv)
 
 	/* Set the default configuration values (Example values) */
 	cfg.wait_time = -1;
-	cfg.role = PCC_ROLE_RP;
 	cfg.app = pcc_rp_rtt_template_app;
 	memcpy(cfg.threads_list, default_pcc_rp_threads_list, sizeof(default_pcc_rp_threads_list));
 	cfg.threads_num = PCC_RP_THREADS_NUM_DEFAULT_VALUE;
-	cfg.probe_packet_format = PCC_DEV_PROBE_PACKET_CCMAD;
 	cfg.remote_sw_handler = false;
-	cfg.hop_limit = IFA2_HOP_LIMIT_DEFAULT_VALUE;
-	cfg.gns = IFA2_GNS_DEFAULT_VALUE;
-	cfg.gns_ignore_value = IFA2_GNS_IGNORE_DEFAULT_VALUE;
-	cfg.gns_ignore_mask = IFA2_GNS_IGNORE_DEFAULT_MASK;
 	strcpy(cfg.coredump_file, PCC_COREDUMP_FILE_DEFAULT_PATH);
 	log_level = LOG_LEVEL_INFO;
 
@@ -231,13 +226,6 @@ int main(int argc, char **argv)
 	result = doca_pcc_start(resources.doca_pcc);
 	if (result != DOCA_SUCCESS) {
 		PRINT_ERROR("Error: Failed to start PCC\n");
-		goto destroy_pcc;
-	}
-
-	/* Send request to device */
-	result = pcc_mailbox_send(&cfg, &resources);
-	if (result != DOCA_SUCCESS) {
-		PRINT_ERROR("Error: Failed to send mailbox request\n");
 		goto destroy_pcc;
 	}
 

@@ -38,7 +38,16 @@ For example, `1048576` (`1 << 20`) is the configured `NEW_FLOW_RATE` currently o
 
 `pcc/host/pcc_core.c` registers `rate_report_trace_handler()` with `doca_pcc_register_trace_handler()`.
 
-`struct doca_pcc_bin_report` is opaque in the public PCC API. Runtime validation on DOCA 3.4 showed that a PCC trace report is 64 bytes and has this effective layout:
+`struct doca_pcc_bin_report` is opaque in the public PCC API. It is 64 bytes in
+both supported 3.x ABIs, but its argument offset differs:
+
+- DOCA 3.1 uses the legacy FlexIO layout: message/sequence, combined
+  thread/timestamp metadata, then six arguments beginning at byte 16.
+- Runtime validation on DOCA 3.4 showed message/sequence, metadata, an internal
+  timestamp, then five arguments beginning at byte 24.
+
+The host selects the layout at compile time using `DOCA_VERSION_MAJOR/MINOR`.
+The effective DOCA 3.4 layout is:
 
 ```c
 struct pcc_trace_report {

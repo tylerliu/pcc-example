@@ -111,10 +111,36 @@ meson setup /tmp/pcc-flow-check doca-flow
 ninja -C /tmp/pcc-flow-check
 ```
 
-DOCA 3.x is built and hardware-tested on 3.4.0112. Compatibility wrappers in
-`doca_flow_compat.h` retain the DOCA 2.9 add/update and port-discovery API path;
+DOCA 3.x is built and hardware-tested on 3.4.0112. DOCA 3.1 source support uses
+the same device/representor setup and flooding-hash QP1 clone design, with
+`doca_flow_compat.h` adapting its older basic/hash entry signatures, entry
+flags, and global counter allocation. Compatibility wrappers also retain the
+DOCA 2.9 add/update and port-discovery API path;
 QP1 cloning is isolated in `install_qp1_clone_paths()` so its 2.9 backend can use
 mirror resources instead of the 3.x flooding hash pipe.
+
+The optional PCC DPA resources-file parser uses host APIs introduced in DOCA
+3.4. On DOCA 3.1, select execution units with the existing `--threads` option
+instead of the resources-file/application-key options.
+
+The PCC device build script also detects whether the SDK provides
+`dpa-app-attributes2blob`. DOCA 3.1 invokes `dpacc` without process attributes;
+newer SDKs generate the YAML attribute blob and pass `--dpa-proc-attr`. The
+3.1 path also selects the first `dpacc_mcpu` target (`nv-dpa-bf3` by default),
+because its compiler does not accept the newer comma-separated multi-target
+form.
+
+For the egress classifier, DOCA 3.1 and 3.4 use a native 64-entry RANDOM HASH pipe.
+Each immutable HASH entry writes its index to application scratch `meta.u32[4]`
+and forwards to one 64-entry BASIC dispatch pipe. Path-share changes update the
+dispatch entry's changeable forward; `u32[4]` avoids the scratch region used
+internally by HASH pipes. The previous 64-bucket `parser_meta.random` BASIC
+implementation remains in the DOCA 2.x compatibility branch but is disabled on
+3.x.
+
+Ingress installs explicit ARP steering before the IPv4/RoCE chains. ARP from
+wire is flooded to both receiver SFs, while ARP from either SF is forwarded to
+wire, so neighbor discovery does not depend on default-miss/FDB behavior.
 
 ### Future DOCA 2.7/2.9 port
 
@@ -136,6 +162,13 @@ Before using them on older SDKs, verify or replace the following:
   update completion and queue draining. Shutdown still completes. Re-test this
   behavior on the older SDK rather than carrying a version-specific workaround
   blindly.
+- Preserve the pre-HASH DOCA 3.1 classifier as a DOCA 2.x porting candidate:
+  one BASIC pipe masks the low six bits of `parser_meta.random`, declares the
+  field changeable in the non-NULL match template, and installs 64 exact bucket
+  entries. Each entry writes its path selection to `meta.u32[0]`; a following
+  COPY action transfers bit 0 to IPv4 `dscp_ecn` bit 2. This design caused
+  spurious CNPs on DOCA 3.1 and must not be re-enabled there, but older SDK HWS
+  implementations may require it when RANDOM HASH or HASH forwarding is absent.
 
 Keep the application-level pipeline and PCC grouping unchanged while porting;
 the intended compatibility boundary is `doca_flow_compat.h`, device/port setup,
@@ -181,25 +214,3 @@ On exit, rate callbacks are quiesced first. The proxy port owns every pipe, so
 one proxy flush removes the complete pipeline. The representor child ports are
 then stopped before their proxy parent. Empty representor ports are not flushed
 because that triggers a DOCA 3.4 dual-representor teardown failure.
-
-### Unresolved future work: updated classifier teardown
-
-On DOCA 3.4.0112, egress shutdown still logs several errors of this form after
-the path share has been changed dynamically:
-
-```text
-pipe 'EGRESS_CLASSIFY' entry remove completed with failure (queue=0)
-```
-
-The process exits normally and the ports are released. The problem is isolated
-to entries previously changed with `doca_flow_pipe_basic_update_entry()`; the
-ingress pipeline and an egress classifier that was never updated tear down
-cleanly. Explicit `NO_WAIT` update submission, processing each update
-completion, draining the operation queue after a transition, draining again
-before flush, removing per-entry counters, and child-before-parent port shutdown
-do not eliminate the messages.
-
-Treat this as unresolved SDK/update-lifecycle work. When revisiting it, test an
-explicit classifier-pipe recreation strategy and compare behavior on the target
-DOCA 2.7/2.9 SDK. Do not spend more time changing the general port teardown
-order unless new evidence shows a port ownership failure.

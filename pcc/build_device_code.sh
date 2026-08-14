@@ -34,8 +34,7 @@ set -e -x
 # arg4: Name of compiled DPA program
 # arg5: Absolute paths of directory to keep host stubs
 # arg6: Flag to indicate enabling TX counter sampling
-# arg7: Flag to indicate enabling updating CC rate from notification point RX bytes
-# arg8: DPACC MCPU flag
+# arg7: DPACC MCPU flag
 
 ####################
 ## Configurations ##
@@ -60,13 +59,12 @@ FLEXIO_INCLUDE="${MLNX_INSTALL_PATH}/flexio/include"
 # DOCA include list
 DOCA_APP_DEVICE_COMMON_DIR="${PCC_APP_DEVICE_SRC_DIR}/../../common/device"
 DOCA_APP_DEVICE_PCC_DIR="${PCC_APP_DEVICE_SRC_DIR}"
-DOCA_PCC_DEVICE_RP_ALGO_DIR="${DOCA_APP_DEVICE_PCC_DIR}/rp/algo"
 DOCA_INC_LIST="-I${DOCA_INSTALL_DIR}/include/ -I${DOCA_APP_DEVICE_PCC_DIR} -I${DOCA_APP_DEVICE_COMMON_DIR}"
 APPLICATION_DPA_ATTRIBUTES="${PCC_APP_DEVICE_SRC_DIR}/dpa_app_attributes.yaml"
 APPLICATION_DPA_ATTRIBUTES_BLOB="${APPLICATION_DEVICE_BUILD_DIR}/${PCC_APP_NAME}_attributes.blob"
 
 # Set source files
-if [ ${PCC_APP_NAME} = "pcc_rp_rtt_template_app" ]
+if [ "${PCC_APP_NAME}" = "pcc_rp_rtt_template_app" ]
 then
         DOCA_PCC_DEV_LIB_NAME="doca_pcc_dev"
         PCC_DEV_RP_RTT_TEMPLATE_DIR=${PCC_APP_DEVICE_SRC_DIR}/rp/rtt_template
@@ -74,30 +72,12 @@ then
         PCC_APP_DEVICE_ALGO_SRCS=`ls ${PCC_DEV_RP_RTT_TEMPLATE_DIR}/algo/*.c`
         PCC_DEVICE_SRC_FILES="${PCC_APP_DEVICE_SRCS} ${PCC_APP_DEVICE_ALGO_SRCS}"
         APP_INC_LIST="${DOCA_INC_LIST} -I${PCC_DEV_RP_RTT_TEMPLATE_DIR}/algo"
-        if [ ${AMALGAMATION_BUILD_MODE} = "true" ]; then
-                APP_INC_LIST="${APP_INC_LIST} -I${DOCA_PCC_DIR}/device/include/rp -I${DOCA_PCC_DIR}/device/adb_gen/"
-        fi
-elif [ ${PCC_APP_NAME} = "pcc_rp_switch_telemetry_app" ]
-then
-        DOCA_PCC_DEV_LIB_NAME="doca_pcc_dev"
-        PCC_DEV_RP_SWITCH_TELEM_DIR=${PCC_APP_DEVICE_SRC_DIR}/rp/switch_telemetry
-        PCC_APP_DEVICE_SRCS=`ls ${PCC_DEV_RP_SWITCH_TELEM_DIR}/*.c`
-        PCC_APP_DEVICE_ALGO_SRCS=`ls ${PCC_DEV_RP_SWITCH_TELEM_DIR}/algo/*.c`
-        PCC_DEVICE_SRC_FILES="${PCC_APP_DEVICE_SRCS} ${PCC_APP_DEVICE_ALGO_SRCS}"
-        APP_INC_LIST="${DOCA_INC_LIST} -I${PCC_DEV_RP_SWITCH_TELEM_DIR}/algo"
-        if [ ${AMALGAMATION_BUILD_MODE} = "true" ]; then
-                APP_INC_LIST="${APP_INC_LIST} -I${DOCA_PCC_DIR}/device/include/rp -I${DOCA_PCC_DIR}/device/adb_gen/"
-        fi
-elif [ ${PCC_APP_NAME} = "pcc_np_switch_telemetry_app" ]
-then
-        DOCA_PCC_DEV_LIB_NAME="doca_pcc_np_dev"
-        PCC_DEV_NP_SWITCH_TELEM_DIR=${PCC_APP_DEVICE_SRC_DIR}/np/switch_telemetry
-        PCC_APP_DEVICE_SRCS=${PCC_DEV_NP_SWITCH_TELEM_DIR}/np_switch_telemetry_dev_main.c
-        PCC_DEVICE_SRC_FILES="${PCC_APP_DEVICE_SRCS}"
-        APP_INC_LIST="${DOCA_INC_LIST}"
-        if [ ${AMALGAMATION_BUILD_MODE} = "true" ]; then
-                APP_INC_LIST="${APP_INC_LIST} -I${DOCA_PCC_DIR}/device/include/np"
-        fi
+	if [ "${AMALGAMATION_BUILD_MODE:-false}" = "true" ]; then
+		APP_INC_LIST="${APP_INC_LIST} -I${DOCA_PCC_DIR}/device/include/rp -I${DOCA_PCC_DIR}/device/adb_gen/"
+	fi
+else
+	echo "Unsupported PCC device application: ${PCC_APP_NAME}" >&2
+	exit 1
 fi
 
 # DPA Configurations
@@ -110,7 +90,7 @@ DEVICE_EXECS_STUB_FLAGS="-Wno-attributes -Wno-pedantic -Wno-implicit-function-de
 # App flags
 
 DOCA_PCC_SAMPLE_TX_BYTES=""
-if [ ${ENABLE_TX_COUNTER_SAMPLING} = "true" ]
+if [ "${ENABLE_TX_COUNTER_SAMPLING}" = "true" ]
 then
 	DOCA_PCC_SAMPLE_TX_BYTES="-DDOCA_PCC_SAMPLE_TX_BYTES"
 fi
@@ -152,8 +132,19 @@ function generate_prog_from_stubs()
 
 mkdir -p $APPLICATION_DEVICE_BUILD_DIR
 
-# Generate blob from device attributes file
-$DPA_APP_ATTRIBUTES2BLOB ${APPLICATION_DPA_ATTRIBUTES} ${APPLICATION_DPA_ATTRIBUTES_BLOB}
+# DPA application attributes were added after DOCA 3.1. Newer SDKs ship the
+# converter and require its blob on the dpacc command line; 3.1 has neither.
+DPA_PROC_ATTR_OPTION=""
+if [ -x "${DPA_APP_ATTRIBUTES2BLOB}" ]
+then
+	"${DPA_APP_ATTRIBUTES2BLOB}" "${APPLICATION_DPA_ATTRIBUTES}" "${APPLICATION_DPA_ATTRIBUTES_BLOB}"
+	DPA_PROC_ATTR_OPTION="--dpa-proc-attr=${APPLICATION_DPA_ATTRIBUTES_BLOB}"
+else
+	# DOCA 3.1 dpacc accepts one DPA architecture, whereas newer dpacc
+	# accepts the comma-separated multi-target value used by this project.
+	# Select the first configured architecture (nv-dpa-bf3 by default).
+	DPACC_MCPU_FLAG="${DPACC_MCPU_FLAG%%,*}"
+fi
 
 # Compile the DPA (kernel) device source code using the DPACC
 $DPACC \
@@ -168,7 +159,7 @@ $PCC_DEVICE_SRC_FILES \
 -device-libs="-L${DOCA_LIB_DIR} -l${DOCA_PCC_DEV_LIB_NAME}" \
 --app-name="${PCC_APP_NAME}" \
 --keep-dir="${PCC_DEV_STUBS_KEEP_DIR}" \
---dpa-proc-attr="${APPLICATION_DPA_ATTRIBUTES_BLOB}"
+${DPA_PROC_ATTR_OPTION}
 
 # generate device application program from auto-generated host stubs
 generate_prog_from_stubs "${PCC_DEVICE_SRC_FILES}"
