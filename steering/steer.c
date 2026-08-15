@@ -1376,20 +1376,15 @@ static struct doca_flow_pipe *create_legacy_roce_mirror_pipe(
 	doca_error_t err;
 
 	steer_set_roce_udp_match(&match, &match_mask, RTE_BE16(ROCE_UDP_PORT_NATIVE));
-	if (match_src_ip) {
-		match.outer.ip4.src_ip = UINT32_MAX;
-		match_mask.outer.ip4.src_ip = UINT32_MAX;
-	} else {
-		match.outer.ip4.dst_ip = UINT32_MAX;
-		match_mask.outer.ip4.dst_ip = UINT32_MAX;
-	}
+	(void)path_ip;
+	(void)match_src_ip;
 	err = doca_flow_pipe_cfg_create(&cfg, port);
 	crash_if_unsuccessful(err, "pipe_cfg_create (%s)", name);
 	crash_if_unsuccessful(doca_flow_pipe_cfg_set_name(cfg, name), "pipe_cfg_set_name (%s)", name);
 	crash_if_unsuccessful(doca_flow_pipe_cfg_set_type(cfg, DOCA_FLOW_PIPE_BASIC), "pipe_cfg_set_type (%s)", name);
 	crash_if_unsuccessful(doca_flow_pipe_cfg_set_domain(cfg, DOCA_FLOW_PIPE_DOMAIN_DEFAULT), "pipe_cfg_set_domain (%s)", name);
 	crash_if_unsuccessful(doca_flow_pipe_cfg_set_is_root(cfg, false), "pipe_cfg_set_is_root (%s)", name);
-	crash_if_unsuccessful(doca_flow_pipe_cfg_set_nr_entries(cfg, NB_PATHS), "pipe_cfg_set_nr_entries (%s)", name);
+	crash_if_unsuccessful(doca_flow_pipe_cfg_set_nr_entries(cfg, 1), "pipe_cfg_set_nr_entries (%s)", name);
 	crash_if_unsuccessful(doca_flow_pipe_cfg_set_match(
 		cfg, &match, steer_roce_udp_match_mask(&match_mask)), "pipe_cfg_set_match (%s)", name);
 	crash_if_unsuccessful(doca_flow_pipe_cfg_set_monitor(cfg, &monitor), "pipe_cfg_set_monitor (%s)", name);
@@ -1397,23 +1392,19 @@ static struct doca_flow_pipe *create_legacy_roce_mirror_pipe(
 	crash_if_unsuccessful(err, "pipe_create (%s)", name);
 	doca_flow_pipe_cfg_destroy(cfg);
 
-	for (uint8_t path = 0; path < NB_PATHS; path++) {
+	{
 		struct doca_flow_match entry_match = {0};
 		struct doca_flow_monitor entry_monitor = monitor;
-		uint32_t flags = path + 1 < NB_PATHS ? STEER_WAIT_FOR_BATCH : 0;
 #if !STEER_HAS_ROCE_MATCH
 		entry_match = match;
 #endif
-		if (match_src_ip)
-			entry_match.outer.ip4.src_ip = path_ip[path];
-		else
-			entry_match.outer.ip4.dst_ip = path_ip[path];
 		err = steer_pipe_add_entry(0, pipe, &entry_match, 0, NULL, &entry_monitor, NULL,
-			flags, &status, &path_entry[path]);
-		crash_if_unsuccessful(err, "pipe_add_entry (%s path%u)", name, path);
+			0, &status, &path_entry[0]);
+		crash_if_unsuccessful(err, "pipe_add_entry (%s)", name);
 	}
-	process_entries(port, &status, NB_PATHS, name);
-	DOCA_LOG_INFO("%s ready: path-IP-specific QP1 candidates", name);
+	path_entry[1] = NULL;
+	process_entries(port, &status, 1, name);
+	DOCA_LOG_INFO("%s ready: all wire-ingress RoCEv2 packets cloned", name);
 	return pipe;
 }
 #endif
@@ -1472,8 +1463,8 @@ static void install_qp1_clone_paths(struct doca_flow_port *port,
 	(void)sf_original;
 	(void)sf_target;
 	(void)sf_entry;
-	DOCA_LOG_WARN("DOCA 2.x observes only wire-ingress UDP 4791 per path IP; "
-	              "the first ACK/CNP learns the PCC sender QPN and retires that mirror");
+	DOCA_LOG_WARN("DOCA 2.x clones all wire-ingress UDP 4791; "
+	              "ACK/CNP destination QPN and source IP identify sender QPN and path");
 #endif
 }
 
@@ -1968,6 +1959,7 @@ struct steer_state {
 	uint64_t dpdk_freed_pkts;
 	uint64_t dpdk_roce_pkts;
 	uint64_t dpdk_feedback_pkts;
+	uint64_t dpdk_feedback_path_pkts[NB_PATHS];
 	uint64_t dpdk_qp1_pkts;
 	uint64_t dpdk_unknown_path_pkts;
 	uint64_t dpdk_learned_qpns;
@@ -2577,6 +2569,7 @@ static void learn_ingress_feedback_qpn(uint32_t sender_qpn, uint32_t source_ip)
 		g_steer.dpdk_unknown_path_pkts++;
 		return;
 	}
+	g_steer.dpdk_feedback_path_pkts[path]++;
 	sender_qpn &= 0x00FFFFFFu;
 	if (sender_qpn <= 1)
 		return;
@@ -2723,11 +2716,12 @@ void steer_poll(void)
 #if DOCA_VERSION_MAJOR < 3
 	if (g_steer.dpdk_rx_pkts != 0)
 		DOCA_LOG_INFO("DPDK ingress clones: rx=%lu freed=%lu outstanding=%lu bursts=%lu full=%lu "
-		              "roce=%lu feedback=%lu qp1=%lu unknown-path=%lu learned-qpn=%lu",
+		              "roce=%lu feedback=%lu path0=%lu path1=%lu qp1=%lu unknown-path=%lu learned-qpn=%lu",
 		              g_steer.dpdk_rx_pkts, g_steer.dpdk_freed_pkts,
 		              g_steer.dpdk_rx_pkts - g_steer.dpdk_freed_pkts,
 		              g_steer.dpdk_rx_bursts, g_steer.dpdk_full_bursts,
 		              g_steer.dpdk_roce_pkts, g_steer.dpdk_feedback_pkts,
+		              g_steer.dpdk_feedback_path_pkts[0], g_steer.dpdk_feedback_path_pkts[1],
 		              g_steer.dpdk_qp1_pkts, g_steer.dpdk_unknown_path_pkts,
 		              g_steer.dpdk_learned_qpns);
 #endif
