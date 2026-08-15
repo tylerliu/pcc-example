@@ -159,6 +159,10 @@ version-specific backends:
   software parser. This is functionally correct but may be expensive at line
   rate; hardware validation should measure RX clone load before considering a
   direct `rte_flow` IB-BTH rule.
+  The shared mirror targets a fixed-size, bidirectional BASIC pipe, which then
+  forwards to DPDK RSS queue 0; switch-mode mirrors cannot target RSS directly
+  or target a resizable/non-bidirectional pipe. Packet registers are not
+  expected to survive the mirror copy.
 - Receiver ARP fan-out uses shared mirror resource 3 to deliver wire ARP to
   both SFs.
 - Exact hardware CNP counters are disabled because the same public BTH matcher

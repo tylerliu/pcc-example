@@ -1235,6 +1235,49 @@ static struct doca_flow_pipe *create_qp1_clone_check(struct doca_flow_port *port
 #endif /* DOCA_VERSION_MAJOR >= 3 */
 
 #if DOCA_VERSION_MAJOR < 3
+/* A DOCA 2 shared-mirror target cannot forward directly to RSS. Terminate the
+ * mirror copy in a BASIC pipe whose normal forwarding action is RSS queue 0. */
+static struct doca_flow_pipe *create_legacy_qp1_rss_pipe(
+	struct doca_flow_port *port)
+{
+	struct doca_flow_match match = {0};
+	struct doca_flow_fwd fwd = {0};
+	struct doca_flow_pipe_cfg *cfg;
+	struct doca_flow_pipe *pipe;
+	struct doca_flow_pipe_entry *entry;
+	struct entry_batch_status status = {0};
+	uint16_t queues[1] = {QP1_CLONE_QUEUE};
+	doca_error_t err;
+
+	match.parser_meta.outer_l3_type = DOCA_FLOW_L3_META_IPV4;
+	steer_fwd_set_rss(&fwd, queues, 1, DOCA_FLOW_RSS_IPV4 | DOCA_FLOW_RSS_UDP);
+	err = doca_flow_pipe_cfg_create(&cfg, port);
+	crash_if_unsuccessful(err, "pipe_cfg_create (QP1_RSS)");
+	crash_if_unsuccessful(doca_flow_pipe_cfg_set_name(cfg, "QP1_RSS"),
+	                      "pipe_cfg_set_name (QP1_RSS)");
+	crash_if_unsuccessful(doca_flow_pipe_cfg_set_type(cfg, DOCA_FLOW_PIPE_BASIC),
+	                      "pipe_cfg_set_type (QP1_RSS)");
+	crash_if_unsuccessful(doca_flow_pipe_cfg_set_domain(cfg, DOCA_FLOW_PIPE_DOMAIN_DEFAULT),
+	                      "pipe_cfg_set_domain (QP1_RSS)");
+	crash_if_unsuccessful(doca_flow_pipe_cfg_set_is_root(cfg, false),
+	                      "pipe_cfg_set_is_root (QP1_RSS)");
+	crash_if_unsuccessful(doca_flow_pipe_cfg_set_dir_info(
+		cfg, DOCA_FLOW_DIRECTION_BIDIRECTIONAL),
+		"pipe_cfg_set_dir_info (QP1_RSS)");
+	crash_if_unsuccessful(doca_flow_pipe_cfg_set_nr_entries(cfg, 1),
+	                      "pipe_cfg_set_nr_entries (QP1_RSS)");
+	crash_if_unsuccessful(doca_flow_pipe_cfg_set_match(cfg, &match, NULL),
+	                      "pipe_cfg_set_match (QP1_RSS)");
+	err = doca_flow_pipe_create(cfg, &fwd, NULL, &pipe);
+	crash_if_unsuccessful(err, "pipe_create (QP1_RSS)");
+	doca_flow_pipe_cfg_destroy(cfg);
+	err = steer_pipe_add_entry(0, pipe, &match, 0, NULL, NULL, NULL, 0,
+	                           &status, &entry);
+	crash_if_unsuccessful(err, "pipe_add_entry (QP1_RSS)");
+	process_entries(port, &status, 1, "QP1_RSS");
+	return pipe;
+}
+
 static void configure_legacy_mirror(struct doca_flow_port *port, uint32_t mirror_id,
                                     const struct doca_flow_fwd *clone_fwd,
                                     const struct doca_flow_fwd *original_fwd)
@@ -1313,12 +1356,14 @@ static void install_qp1_clone_paths(struct doca_flow_port *port,
 		create_qp1_flood_pipe(port, "QP1_FLOOD_SF", deliver_wire, qp1_rss);
 	*sf_target = create_qp1_clone_check(port, "QP1_CHECK_SF", sf_flood, *sf_target);
 #else
-	uint16_t queues[1] = {QP1_CLONE_QUEUE};
-	struct doca_flow_fwd clone_fwd = {0};
+	struct doca_flow_pipe *qp1_rss = create_legacy_qp1_rss_pipe(port);
+	struct doca_flow_fwd clone_fwd = {
+		.type = DOCA_FLOW_FWD_PIPE,
+		.next_pipe = qp1_rss,
+	};
 
 	(void)deliver_sf;
 	(void)deliver_wire;
-	steer_fwd_set_rss(&clone_fwd, queues, 1, DOCA_FLOW_RSS_IPV4 | DOCA_FLOW_RSS_UDP);
 	struct doca_flow_fwd wire_original = {.type = DOCA_FLOW_FWD_PIPE, .next_pipe = *wire_target};
 	struct doca_flow_fwd sf_original = {.type = DOCA_FLOW_FWD_PIPE, .next_pipe = *sf_target};
 
