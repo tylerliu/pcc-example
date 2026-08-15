@@ -742,7 +742,6 @@ static struct doca_flow_pipe *create_legacy_small_random_table(
 	struct doca_flow_fwd fwd = {.type = DOCA_FLOW_FWD_PIPE, .next_pipe = NULL};
 	struct doca_flow_pipe_cfg *cfg;
 	struct doca_flow_pipe *pipe;
-	struct entry_batch_status status = {0};
 	doca_error_t err;
 
 	/* Follow the DOCA 2.9 flow_random sample: a HASH pipe distributes the
@@ -766,16 +765,17 @@ static struct doca_flow_pipe *create_legacy_small_random_table(
 	crash_if_unsuccessful(err, "pipe_create (legacy random hash)");
 	doca_flow_pipe_cfg_destroy(cfg);
 
+	memset(&g_classify_batch, 0, sizeof(g_classify_batch));
 	for (uint32_t bucket = 0; bucket < nr_entries; bucket++) {
 		struct doca_flow_fwd entry_fwd = {.type = DOCA_FLOW_FWD_PIPE,
 			.next_pipe = path_target[bucket < nr_entries / 2 ? 0 : 1]};
 		uint32_t flags = bucket + 1 < nr_entries ? STEER_WAIT_FOR_BATCH : 0;
 
 		err = steer_pipe_hash_add_entry(0, pipe, bucket, 0, NULL, NULL, &entry_fwd,
-			flags, &status, &bucket_entry[bucket]);
+			flags, &g_classify_batch, &bucket_entry[bucket]);
 		crash_if_unsuccessful(err, "pipe_hash_add_entry (legacy random bucket %u)", bucket);
 	}
-	process_entries(port, &status, nr_entries, "legacy random hash entries");
+	process_entries(port, &g_classify_batch, nr_entries, "legacy random hash entries");
 	DOCA_LOG_INFO("Legacy random HASH ready: %u bits, %u entries, initial ratio 50:50",
 		random_bits, nr_entries);
 	return pipe;
@@ -2009,7 +2009,14 @@ static void apply_path_share(uint32_t path0_share)
 			continue;
 
 		memset(&g_classify_batch, 0, sizeof(g_classify_batch));
-#if !STEER_USE_RANDOM_HASH_CLASSIFIER
+#if STEER_LEGACY_SINGLE_RANDOM
+		struct doca_flow_fwd fwd = {
+			.type = DOCA_FLOW_FWD_PIPE,
+			.next_pipe = g_steer.classify_target[wanted_path],
+		};
+		doca_error_t err = steer_pipe_update_entry(0, g_steer.classify_pipe, 0,
+			NULL, NULL, &fwd, STEER_NO_WAIT, g_steer.legacy_random_entry[bucket]);
+#elif !STEER_USE_RANDOM_HASH_CLASSIFIER
 		struct doca_flow_actions actions = {0};
 
 		actions.outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;
@@ -2190,9 +2197,15 @@ doca_error_t steer_start(const struct steer_opts *opts)
 			create_path_rewrite_pipe(g_steer.port, 1, sf_target,
 			                         &g_steer.path_rewrite_entry[1]);
 		struct doca_flow_pipe *path_target[NB_PATHS] = {path0_rewrite, path1_rewrite};
-		sf_target = create_legacy_small_random_table(g_steer.port, path_target, 6,
+		g_steer.classify_target[0] = path0_rewrite;
+		g_steer.classify_target[1] = path1_rewrite;
+		g_steer.classify_pipe = create_legacy_small_random_table(g_steer.port, path_target, 6,
 			g_steer.legacy_random_entry);
+		sf_target = g_steer.classify_pipe;
+		for (uint32_t bucket = 0; bucket < PATH_SHARE_BUCKETS; bucket++)
+			g_steer.classify_bucket_path[bucket] = bucket < PATH_SHARE_BUCKETS / 2 ? 0 : 1;
 		g_steer.applied_path0_share = PATH_SHARE_BUCKETS / 2;
+		g_steer.grouping_enabled = true;
 #else
 		g_steer.grouping_enabled = true;
 		g_steer.cnp_count_pipe = create_cnp_count_pipe(g_steer.port, deliver_sf[0], wire_target);
