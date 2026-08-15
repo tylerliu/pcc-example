@@ -2075,7 +2075,7 @@ doca_error_t steer_start(const struct steer_opts *opts)
 	/* PORT_DEMUX targets default to plain delivery; the active role overrides. */
 	struct doca_flow_pipe *wire_target = receiver_target; /* wire-ingress fate */
 	struct doca_flow_pipe *sf_target = deliver_wire;  /* SF-egress fate */
-#if DOCA_VERSION_MAJOR < 3
+#if DOCA_VERSION_MAJOR < 3 && DOCA_VERSION_MINOR < 9
 	if (do_egress)
 		install_qp1_clone_paths(g_steer.port, receiver_target, deliver_wire,
 		                        &wire_target, &sf_target);
@@ -2108,6 +2108,10 @@ doca_error_t steer_start(const struct steer_opts *opts)
 	}
 
 	if (do_egress) {
+#if DOCA_VERSION_MAJOR < 3 && DOCA_VERSION_MINOR >= 9
+		DOCA_LOG_WARN("DOCA 2.9 baseline diagnostic: QP1 cloning and egress "
+		              "classification/rewrite are disabled; SF and wire use plain delivery");
+#else
 		g_steer.grouping_enabled = true;
 		g_steer.cnp_count_pipe = create_cnp_count_pipe(g_steer.port, deliver_sf[0], wire_target);
 		wire_target = g_steer.cnp_count_pipe;
@@ -2157,6 +2161,7 @@ doca_error_t steer_start(const struct steer_opts *opts)
 			                                   g_steer.classify_pipe, egress_delivery_target,
 			                                   STEER_USE_RANDOM_HASH_CLASSIFIER);
 		}
+#endif
 	}
 
 	/* Sender/receiver pairing is consumed only by egress path grouping. */
