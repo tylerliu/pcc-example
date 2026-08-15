@@ -2109,9 +2109,9 @@ doca_error_t steer_start(const struct steer_opts *opts)
 
 	if (do_egress) {
 #if DOCA_VERSION_MAJOR < 3 && DOCA_VERSION_MINOR >= 9
-		DOCA_LOG_WARN("DOCA 2.9 baseline diagnostic: QP1 cloning and egress "
-		              "classification/rewrite are disabled; SF and wire use plain delivery");
-#else
+		DOCA_LOG_WARN("DOCA 2.9 diagnostic: QP1 cloning disabled; "
+		              "egress classification/rewrite enabled");
+#endif
 		g_steer.grouping_enabled = true;
 		g_steer.cnp_count_pipe = create_cnp_count_pipe(g_steer.port, deliver_sf[0], wire_target);
 		wire_target = g_steer.cnp_count_pipe;
@@ -2161,7 +2161,6 @@ doca_error_t steer_start(const struct steer_opts *opts)
 			                                   g_steer.classify_pipe, egress_delivery_target,
 			                                   STEER_USE_RANDOM_HASH_CLASSIFIER);
 		}
-#endif
 	}
 
 	/* Sender/receiver pairing is consumed only by egress path grouping. */
