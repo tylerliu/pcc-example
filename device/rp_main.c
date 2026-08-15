@@ -311,7 +311,9 @@ skip_flow_summary:
 
 	/* Both rate state and its QPN identity live in the PCC-provided per-QP
 	 * algorithm context. */
+#if DOCA_VERSION_MAJOR >= 3
 	uint32_t prev_rate = rtt_ctxt->cur_rate;
+#endif
 
 	switch (attr->algo_slot) {
 	case 0: {
@@ -350,12 +352,15 @@ skip_flow_summary:
 		 * each QP's initial rate reaches the host even when its worker receives
 		 * no later PCC event. Subsequent changes use the per-worker cadence below.
 		 */
+#if DOCA_VERSION_MAJOR >= 3
 		uint32_t is_startup_report = first_observed_flow || prev_rate == 0;
 		doca_pcc_dev_trace_5(PCC_RATE_REPORT_FORMAT_ID, qpn, steering_rate,
 				     ev_type, rtt_ctxt->rtt, now);
-		rtt_ctxt->last_reported_rate = steering_rate;
 		if (is_startup_report)
 			doca_pcc_dev_trace_flush();
+#endif
+		/* DOCA 2.x has already published this update through rate_mailbox_store(). */
+		rtt_ctxt->last_reported_rate = steering_rate;
 	}
 
 skip_rate_report:
