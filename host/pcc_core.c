@@ -842,6 +842,14 @@ static doca_error_t steer_force_path_callback(void *param, void *config)
 	return DOCA_SUCCESS;
 }
 
+static doca_error_t steer_no_path_rewrite_callback(void *param, void *config)
+{
+	struct pcc_config *cfg = config;
+
+	cfg->steer_no_path_rewrite = *((bool *)param);
+	return DOCA_SUCCESS;
+}
+
 #if DOCA_VERSION_MAJOR >= 3
 /*
  * ARGP Callback - PF device for embedded steering (DOCA 3.x, -a/--steer-dev).
@@ -1060,6 +1068,7 @@ doca_error_t register_pcc_params(void)
 	}
 
 	struct doca_argp_param *path0_ip_param, *path1_ip_param, *force_path_param;
+	struct doca_argp_param *no_path_rewrite_param;
 	result = doca_argp_param_create(&path0_ip_param);
 	if (result != DOCA_SUCCESS)
 		return result;
@@ -1094,6 +1103,20 @@ doca_error_t register_pcc_params(void)
 	doca_argp_param_set_callback(force_path_param, steer_force_path_callback);
 	doca_argp_param_set_type(force_path_param, DOCA_ARGP_TYPE_STRING);
 	result = doca_argp_register_param(force_path_param);
+	if (result != DOCA_SUCCESS)
+		return result;
+
+	result = doca_argp_param_create(&no_path_rewrite_param);
+	if (result != DOCA_SUCCESS)
+		return result;
+	doca_argp_param_set_long_name(no_path_rewrite_param, "no-path-rewrite");
+	doca_argp_param_set_arguments(no_path_rewrite_param, "<bool>");
+	doca_argp_param_set_description(
+		no_path_rewrite_param,
+		"Diagnostic: keep feedback cloning/grouping but bypass egress path classification and DSCP rewrite.");
+	doca_argp_param_set_callback(no_path_rewrite_param, steer_no_path_rewrite_callback);
+	doca_argp_param_set_type(no_path_rewrite_param, DOCA_ARGP_TYPE_BOOLEAN);
+	result = doca_argp_register_param(no_path_rewrite_param);
 	if (result != DOCA_SUCCESS)
 		return result;
 

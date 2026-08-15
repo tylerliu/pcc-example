@@ -60,6 +60,7 @@ struct steer_opts {
 	uint32_t path_ip[STEER_NB_PATHS];	      /* receiver IPv4 addresses, network byte order */
 	bool path_ip_set[STEER_NB_PATHS];
 	int force_path;                           /* diagnostic: -1 dynamic; 3.x bypasses classifier for 0/1 */
+	bool no_path_rewrite;                      /* diagnostic: bypass egress classification/rewrite */
 	const char *devargs;			      /* optional probe devargs (default dv_flow_en=2,fdb_def_rule_en=1) */
 };
 

@@ -2227,6 +2227,12 @@ doca_error_t steer_start(const struct steer_opts *opts)
 	}
 
 	if (do_egress) {
+		if (g_steer.opts.no_path_rewrite) {
+			g_steer.grouping_enabled = true;
+			g_steer.applied_path0_share = PATH_SHARE_BUCKETS / 2;
+			DOCA_LOG_WARN("egress diagnostic: path classifier and DSCP rewrite bypassed; "
+			              "feedback cloning and PCC grouping remain enabled");
+		} else {
 #if STEER_LEGACY_SINGLE_RANDOM
 		DOCA_LOG_WARN("DOCA 2.x: immutable 64-bucket random HASH plus metadata dispatch enabled");
 		struct doca_flow_pipe *path0_rewrite =
@@ -2299,6 +2305,7 @@ doca_error_t steer_start(const struct steer_opts *opts)
 			                                   STEER_USE_RANDOM_HASH_CLASSIFIER);
 		}
 #endif
+		}
 	}
 
 	/* Sender/receiver pairing is consumed only by egress path grouping. */

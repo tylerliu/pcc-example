@@ -88,6 +88,7 @@ static doca_error_t start_embedded_steering(char *prog_name, const struct pcc_co
 	sopts.role = STEER_ROLE_EGRESS;
 	sopts.sf_num = cfg->steer_sf_num;
 	sopts.force_path = cfg->steer_force_path_set ? cfg->steer_force_path : -1;
+	sopts.no_path_rewrite = cfg->steer_no_path_rewrite;
 	for (int path = 0; path < STEER_NB_PATHS; path++) {
 		sopts.path_ip[path] = cfg->steer_path_ip[path];
 		sopts.path_ip_set[path] = cfg->steer_path_ip_set[path];

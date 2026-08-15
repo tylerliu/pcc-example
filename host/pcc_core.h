@@ -105,6 +105,7 @@ struct pcc_config {
 	bool steer_path_ip_set[2];
 	int steer_force_path;
 	bool steer_force_path_set;
+	bool steer_no_path_rewrite;
 	char dpa_resources_file[MAX_ARG_SIZE];		 /* DPA resources yaml file path */
 	char dpa_application_key[MAX_ARG_SIZE];		 /* DPA application file name */
 };
