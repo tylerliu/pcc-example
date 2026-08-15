@@ -53,7 +53,6 @@ DOCA_LOG_REGISTER(FLOW_STEER);
 #define QP1_QPN 1u
 #define QP1_CLONE_QUEUE 0u
 #define QP1_RX_BURST 32u
-#define QP1_RX_MAX_BURSTS 16u
 #define QP1_WIRE_MIRROR_ID 1u
 #define QP1_SF_MIRROR_ID 2u
 #define ARP_MIRROR_ID 3u
@@ -2613,7 +2612,7 @@ static void poll_qp1_clones(void)
 {
 	if (g_dpdk_rx_port_id == UINT16_MAX)
 		return;
-	for (uint32_t burst = 0; burst < QP1_RX_MAX_BURSTS; burst++) {
+	for (;;) {
 		struct rte_mbuf *packets[QP1_RX_BURST];
 		uint16_t received = rte_eth_rx_burst(g_dpdk_rx_port_id, QP1_CLONE_QUEUE, packets,
 		                                          QP1_RX_BURST);
