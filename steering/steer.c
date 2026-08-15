@@ -696,10 +696,11 @@ static struct doca_flow_pipe *create_random_sample_pipe(struct doca_flow_port *p
 	struct entry_batch_status status = {0};
 	doca_error_t err;
 
-	/* EGRESS_CLASSIFY consumes random bit 0 as the path selector. Sampling that
-	 * same bit makes path1 (bit0==1) unable to match value zero and doubles the
-	 * conditional probability on path0. Use only the higher random bits. */
+	/* The 3.x classifier consumes random bit 0. The DOCA 2.9 backend uses
+	 * this sampler as the classifier itself, so it may use the low bit. */
+#if !STEER_LEGACY_MATCH_ONLY_DIAG
 	random_mask = (uint16_t)(random_mask << 1);
+#endif
 	match.parser_meta.random = 0;
 	match_mask.parser_meta.random = random_mask;
 
@@ -791,8 +792,9 @@ static struct doca_flow_pipe *create_path_demux_pipe(struct doca_flow_port *port
 	return pipe;
 }
 
-#if STEER_USE_RANDOM_HASH_CLASSIFIER
-/* DOCA 3.x path action. Keep this identical to the validated ECN tutorial:
+/* Fixed path action. The separate action pipe is valid on both backends and
+ * follows the validated ECN tutorial encoding.
+ * Keep this identical to the validated ECN tutorial:
  * one fixed full-byte action and one entry. EGRESS_CLASSIFY is action-free and
  * chooses between the two pipes with a changeable per-bucket forward. */
 static struct doca_flow_pipe *create_path_rewrite_pipe(struct doca_flow_port *port, uint8_t path,
@@ -848,7 +850,6 @@ static struct doca_flow_pipe *create_path_rewrite_pipe(struct doca_flow_port *po
 	              entry_actions.outer.ip4.dscp_ecn);
 	return pipe;
 }
-#endif
 
 #if STEER_USE_RANDOM_HASH_CLASSIFIER
 /* DOCA 3.x update stage. RANDOM HASH writes its selected index to application
@@ -2117,10 +2118,14 @@ doca_error_t steer_start(const struct steer_opts *opts)
 
 	if (do_egress) {
 #if STEER_LEGACY_MATCH_ONLY_DIAG
-		DOCA_LOG_WARN("DOCA 2.9 diagnostic: QP1 cloning and classifier/rewrite disabled; "
-		              "tutorial-style one-entry random hit/miss enabled");
-		sf_target = create_random_sample_pipe(g_steer.port, "EGRESS_RANDOM_DIAG",
-		                                      deliver_wire, deliver_wire, 1);
+		DOCA_LOG_WARN("DOCA 2.9 staged restore: QP1 cloning disabled; "
+		              "tutorial-style 50/50 random path rewrite enabled");
+		struct doca_flow_pipe *path0_rewrite =
+			create_path_rewrite_pipe(g_steer.port, 0, deliver_wire);
+		struct doca_flow_pipe *path1_rewrite =
+			create_path_rewrite_pipe(g_steer.port, 1, deliver_wire);
+		sf_target = create_random_sample_pipe(g_steer.port, "EGRESS_RANDOM_PATH",
+		                                      path0_rewrite, path1_rewrite, 1);
 #else
 		g_steer.grouping_enabled = true;
 		g_steer.cnp_count_pipe = create_cnp_count_pipe(g_steer.port, deliver_sf[0], wire_target);
