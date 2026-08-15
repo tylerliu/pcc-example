@@ -100,7 +100,7 @@ DOCA_LOG_REGISTER(FLOW_STEER);
  * (same technique as the tutorial doca_flow_ecn.c / DOCA flow_random sample).
  */
 #define RANDOM_FIELD_WIDTH 16
-#define LEGACY_RANDOM_BUCKETS 8
+#define LEGACY_RANDOM_BUCKETS 64
 
 /* Log at CRIT level and terminate if err != DOCA_SUCCESS -- mirrors rte_exit(). */
 static __attribute__((format(printf, 2, 3))) void crash_if_unsuccessful(doca_error_t err, const char *fmt, ...)
@@ -751,7 +751,7 @@ static struct doca_flow_pipe *create_legacy_small_random_table(
 	match_mask.parser_meta.random = UINT16_MAX;
 	err = doca_flow_pipe_cfg_create(&cfg, port);
 	crash_if_unsuccessful(err, "pipe_cfg_create (legacy random hash)");
-	err = doca_flow_pipe_cfg_set_name(cfg, "EGRESS_RANDOM_PATH_HASH_3BIT");
+	err = doca_flow_pipe_cfg_set_name(cfg, "EGRESS_RANDOM_PATH_HASH_6BIT");
 	crash_if_unsuccessful(err, "pipe_cfg_set_name (legacy random hash)");
 	err = doca_flow_pipe_cfg_set_type(cfg, DOCA_FLOW_PIPE_HASH);
 	crash_if_unsuccessful(err, "pipe_cfg_set_type (legacy random hash)");
@@ -2193,7 +2193,7 @@ doca_error_t steer_start(const struct steer_opts *opts)
 			create_path_rewrite_pipe(g_steer.port, 1, sf_target,
 			                         &g_steer.path_rewrite_entry[1]);
 		struct doca_flow_pipe *path_target[NB_PATHS] = {path0_rewrite, path1_rewrite};
-		sf_target = create_legacy_small_random_table(g_steer.port, path_target, 3,
+		sf_target = create_legacy_small_random_table(g_steer.port, path_target, 6,
 			g_steer.legacy_random_entry);
 		g_steer.applied_path0_share = PATH_SHARE_BUCKETS / 2;
 #else
@@ -2662,17 +2662,20 @@ void steer_poll(void)
 #if DOCA_VERSION_MAJOR < 3
 		uint64_t bucket_pkts[LEGACY_RANDOM_BUCKETS] = {0};
 		uint64_t matched = 0;
+		uint64_t bucket_min = UINT64_MAX, bucket_max = 0;
 		for (uint32_t bucket = 0; bucket < LEGACY_RANDOM_BUCKETS; bucket++) {
 			if (g_steer.legacy_random_entry[bucket] != NULL &&
 			    steer_query_entry(g_steer.legacy_random_entry[bucket], &q) == DOCA_SUCCESS)
 				bucket_pkts[bucket] = q.total_pkts;
 			matched += bucket_pkts[bucket];
+			if (bucket_pkts[bucket] < bucket_min)
+				bucket_min = bucket_pkts[bucket];
+			if (bucket_pkts[bucket] > bucket_max)
+				bucket_max = bucket_pkts[bucket];
 		}
 		uint64_t assigned_total = assigned[0] + assigned[1];
-		DOCA_LOG_INFO("egress random buckets: 0=%lu 1=%lu 2=%lu 3=%lu",
-			bucket_pkts[0], bucket_pkts[1], bucket_pkts[2], bucket_pkts[3]);
-		DOCA_LOG_INFO("egress random buckets: 4=%lu 5=%lu 6=%lu 7=%lu miss=%lu",
-			bucket_pkts[4], bucket_pkts[5], bucket_pkts[6], bucket_pkts[7],
+		DOCA_LOG_INFO("egress random HASH: buckets=%u min=%lu max=%lu matched=%lu miss=%lu",
+			LEGACY_RANDOM_BUCKETS, bucket_min, bucket_max, matched,
 			assigned_total > matched ? assigned_total - matched : 0);
 #endif
 	}
