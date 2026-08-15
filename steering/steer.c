@@ -1442,7 +1442,7 @@ static void install_qp1_clone_paths(struct doca_flow_port *port,
 		.port_id = WIRE_PORT_ID,
 	};
 
-#if DOCA_VERSION_MINOR < 9
+
 	configure_legacy_mirror(port, QP1_SF_MIRROR_ID, &clone_fwd, &sf_original);
 	configure_legacy_mirror(port, QP1_WIRE_MIRROR_ID, &clone_fwd, &wire_original);
 	*wire_target = create_legacy_roce_mirror_pipe(port, "QP1_MIRROR_WIRE",
@@ -1453,12 +1453,6 @@ static void install_qp1_clone_paths(struct doca_flow_port *port,
 	                                              QP1_SF_MIRROR_ID);
 	DOCA_LOG_WARN("DOCA 2.x QP1 observation mirrors all IPv4 UDP 4791 packets; "
 	              "software accepts only QP1 RDMA-CM packets");
-#else
-	(void)wire_original;
-	(void)sf_original;
-	DOCA_LOG_WARN("DOCA 2.9 diagnostic: QP1 mirrors disabled; "
-	              "testing egress classifier/rewrite without cloning");
-#endif
 #endif
 }
 
@@ -2149,7 +2143,7 @@ doca_error_t steer_start(const struct steer_opts *opts)
 	/* PORT_DEMUX targets default to plain delivery; the active role overrides. */
 	struct doca_flow_pipe *wire_target = receiver_target; /* wire-ingress fate */
 	struct doca_flow_pipe *sf_target = deliver_wire;  /* SF-egress fate */
-#if DOCA_VERSION_MAJOR < 3 && DOCA_VERSION_MINOR < 9
+#if DOCA_VERSION_MAJOR < 3
 	if (do_egress)
 		install_qp1_clone_paths(g_steer.port, receiver_target, deliver_wire,
 		                        &wire_target, &sf_target);
@@ -2183,13 +2177,7 @@ doca_error_t steer_start(const struct steer_opts *opts)
 
 	if (do_egress) {
 #if STEER_LEGACY_SINGLE_RANDOM
-#if DOCA_VERSION_MINOR < 9
-		DOCA_LOG_WARN("DOCA 2.7 staged restore: QP1 cloning enabled; "
-		              "64-bucket random HASH path rewrite enabled");
-#else
-		DOCA_LOG_WARN("DOCA 2.9 staged restore: QP1 cloning disabled; "
-		              "64-bucket random HASH path rewrite enabled");
-#endif
+		DOCA_LOG_WARN("DOCA 2.x: QP1 cloning and 64-bucket random HASH path rewrite enabled");
 		struct doca_flow_pipe *path0_rewrite =
 			create_path_rewrite_pipe(g_steer.port, 0, sf_target,
 			                         &g_steer.path_rewrite_entry[0]);
