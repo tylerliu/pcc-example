@@ -1085,7 +1085,8 @@ static struct doca_flow_pipe *create_roce_check_pipe(struct doca_flow_port *port
 	crash_if_unsuccessful(err, "pipe_cfg_set_is_root (RoCE check)");
 	err = doca_flow_pipe_cfg_set_nr_entries(cfg, 1);
 	crash_if_unsuccessful(err, "pipe_cfg_set_nr_entries (RoCE check)");
-	err = doca_flow_pipe_cfg_set_match(cfg, &match, &match_mask);
+	err = doca_flow_pipe_cfg_set_match(cfg, &match,
+	                                  steer_roce_udp_match_mask(&match_mask));
 	crash_if_unsuccessful(err, "pipe_cfg_set_match (RoCE check)");
 
 	err = doca_flow_pipe_create(cfg, &fwd, &fwd_miss, &pipe);
@@ -1093,6 +1094,10 @@ static struct doca_flow_pipe *create_roce_check_pipe(struct doca_flow_port *port
 	doca_flow_pipe_cfg_destroy(cfg);
 
 	struct doca_flow_match entry_match = {0};
+#if !STEER_HAS_ROCE_MATCH
+	/* Fixed DOCA 2.x template fields must also be present on the entry. */
+	entry_match = match;
+#endif
 
 	err = steer_pipe_add_entry(0, pipe, &entry_match, 0, NULL, NULL, NULL, 0, &status, &entry);
 	crash_if_unsuccessful(err, "pipe_add_entry (RoCE check)");
@@ -1265,11 +1270,16 @@ static struct doca_flow_pipe *create_legacy_roce_mirror_pipe(
 	crash_if_unsuccessful(doca_flow_pipe_cfg_set_domain(cfg, DOCA_FLOW_PIPE_DOMAIN_DEFAULT), "pipe_cfg_set_domain (%s)", name);
 	crash_if_unsuccessful(doca_flow_pipe_cfg_set_is_root(cfg, false), "pipe_cfg_set_is_root (%s)", name);
 	crash_if_unsuccessful(doca_flow_pipe_cfg_set_nr_entries(cfg, 1), "pipe_cfg_set_nr_entries (%s)", name);
-	crash_if_unsuccessful(doca_flow_pipe_cfg_set_match(cfg, &match, &match_mask), "pipe_cfg_set_match (%s)", name);
+	crash_if_unsuccessful(doca_flow_pipe_cfg_set_match(
+		cfg, &match, steer_roce_udp_match_mask(&match_mask)),
+		"pipe_cfg_set_match (%s)", name);
 	crash_if_unsuccessful(doca_flow_pipe_cfg_set_monitor(cfg, &monitor), "pipe_cfg_set_monitor (%s)", name);
 	err = doca_flow_pipe_create(cfg, &fwd, &fwd, &pipe);
 	crash_if_unsuccessful(err, "pipe_create (%s)", name);
 	doca_flow_pipe_cfg_destroy(cfg);
+#if !STEER_HAS_ROCE_MATCH
+	entry_match = match;
+#endif
 	err = steer_pipe_add_entry(0, pipe, &entry_match, 0, NULL, &entry_monitor, NULL, 0,
 	                           &status, &entry);
 	crash_if_unsuccessful(err, "pipe_add_entry (%s)", name);

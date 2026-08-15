@@ -123,6 +123,20 @@ static inline void steer_set_roce_udp_match(struct doca_flow_match *match,
 #endif
 }
 
+/* DOCA 2.x treats even an all-zero parser-meta mask as an explicit ptype
+ * mask, which HWS does not support. Protocol and UDP-port values are fixed in
+ * the pipe template there, so no mask is required. */
+static inline struct doca_flow_match *steer_roce_udp_match_mask(
+	struct doca_flow_match *mask)
+{
+#if STEER_HAS_ROCE_MATCH
+	return mask;
+#else
+	(void)mask;
+	return NULL;
+#endif
+}
+
 struct steer_resource_query {
 	uint64_t total_bytes;
 	uint64_t total_pkts;
