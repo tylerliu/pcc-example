@@ -731,21 +731,24 @@ static struct doca_flow_pipe *create_random_sample_pipe(struct doca_flow_port *p
 }
 
 #if DOCA_VERSION_MAJOR < 3
-/* Small DOCA 2.x action-free random table; rewrites remain in separate pipes. */
+/* DOCA 2.x random HASH is immutable after creation. Each bucket writes its
+ * index to scratch metadata; a downstream BASIC dispatch pipe owns the
+ * changeable path forwarding. */
 static struct doca_flow_pipe *create_legacy_small_random_table(
-	struct doca_flow_port *port, struct doca_flow_pipe *path_target[NB_PATHS],
+	struct doca_flow_port *port, struct doca_flow_pipe *dispatch_target,
 	uint8_t random_bits, struct doca_flow_pipe_entry *bucket_entry[LEGACY_RANDOM_BUCKETS])
 {
 	const uint32_t nr_entries = 1u << random_bits;
 	struct doca_flow_match match_mask = {0};
-	struct doca_flow_fwd fwd = {.type = DOCA_FLOW_FWD_PIPE, .next_pipe = NULL};
+	struct doca_flow_actions set_bucket = {0};
+	struct doca_flow_actions *actions_arr[1] = {&set_bucket};
+	struct doca_flow_fwd fwd = {.type = DOCA_FLOW_FWD_PIPE, .next_pipe = dispatch_target};
 	struct doca_flow_pipe_cfg *cfg;
 	struct doca_flow_pipe *pipe;
 	doca_error_t err;
 
-	/* Follow the DOCA 2.9 flow_random sample: a HASH pipe distributes the
-	 * complete parser random value across an exhaustive power-of-two table. */
 	match_mask.parser_meta.random = UINT16_MAX;
+	set_bucket.meta.u32[4] = UINT32_MAX;
 	err = doca_flow_pipe_cfg_create(&cfg, port);
 	crash_if_unsuccessful(err, "pipe_cfg_create (legacy random hash)");
 	err = doca_flow_pipe_cfg_set_name(cfg, "EGRESS_RANDOM_PATH_HASH_6BIT");
@@ -760,22 +763,24 @@ static struct doca_flow_pipe *create_legacy_small_random_table(
 	crash_if_unsuccessful(err, "pipe_cfg_set_nr_entries (legacy random hash)");
 	err = doca_flow_pipe_cfg_set_match(cfg, NULL, &match_mask);
 	crash_if_unsuccessful(err, "pipe_cfg_set_match (legacy random hash)");
+	err = doca_flow_pipe_cfg_set_actions(cfg, actions_arr, NULL, NULL, 1);
+	crash_if_unsuccessful(err, "pipe_cfg_set_actions (legacy bucket metadata)");
 	err = doca_flow_pipe_create(cfg, &fwd, NULL, &pipe);
 	crash_if_unsuccessful(err, "pipe_create (legacy random hash)");
 	doca_flow_pipe_cfg_destroy(cfg);
 
 	memset(&g_classify_batch, 0, sizeof(g_classify_batch));
 	for (uint32_t bucket = 0; bucket < nr_entries; bucket++) {
-		struct doca_flow_fwd entry_fwd = {.type = DOCA_FLOW_FWD_PIPE,
-			.next_pipe = path_target[bucket < nr_entries / 2 ? 0 : 1]};
+		struct doca_flow_actions actions = {0};
 		uint32_t flags = bucket + 1 < nr_entries ? STEER_WAIT_FOR_BATCH : 0;
 
-		err = steer_pipe_hash_add_entry(0, pipe, bucket, 0, NULL, NULL, &entry_fwd,
+		actions.meta.u32[4] = RTE_BE32(bucket);
+		err = steer_pipe_hash_add_entry(0, pipe, bucket, 0, &actions, NULL, NULL,
 			flags, &g_classify_batch, &bucket_entry[bucket]);
 		crash_if_unsuccessful(err, "pipe_hash_add_entry (legacy random bucket %u)", bucket);
 	}
 	process_entries(port, &g_classify_batch, nr_entries, "legacy random hash entries");
-	DOCA_LOG_INFO("Legacy random HASH ready: %u bits, %u entries, initial ratio 50:50",
+	DOCA_LOG_INFO("Legacy random HASH ready: %u bits, %u immutable metadata buckets",
 		random_bits, nr_entries);
 	return pipe;
 }
@@ -906,8 +911,8 @@ static struct doca_flow_pipe *create_path_rewrite_pipe(struct doca_flow_port *po
 	return pipe;
 }
 
-#if STEER_USE_RANDOM_HASH_CLASSIFIER
-/* DOCA 3.x update stage. RANDOM HASH writes its selected index to application
+#if STEER_USE_RANDOM_HASH_CLASSIFIER || STEER_LEGACY_SINGLE_RANDOM
+/* Metadata update stage. RANDOM HASH writes its selected index to application
  * scratch u32[4]; this single BASIC table maps that value to a changeable path
  * forward. HASH internally uses part of u32[3], so u32[4] is intentional. */
 static struct doca_flow_pipe *create_classify_dispatch_pipe(
@@ -2032,8 +2037,8 @@ static void apply_path_share(uint32_t path0_share)
 			.type = DOCA_FLOW_FWD_PIPE,
 			.next_pipe = g_steer.classify_target[wanted_path],
 		};
-		doca_error_t err = steer_pipe_update_entry(0, g_steer.classify_pipe, 0,
-			NULL, NULL, &fwd, STEER_NO_WAIT, g_steer.legacy_random_entry[bucket]);
+		doca_error_t err = steer_pipe_update_entry(0, g_steer.classify_dispatch_pipe, 0,
+			NULL, NULL, &fwd, STEER_NO_WAIT, g_steer.classify_entry[bucket]);
 #elif !STEER_USE_RANDOM_HASH_CLASSIFIER
 		struct doca_flow_actions actions = {0};
 
@@ -2203,7 +2208,7 @@ doca_error_t steer_start(const struct steer_opts *opts)
 
 	if (do_egress) {
 #if STEER_LEGACY_SINGLE_RANDOM
-		DOCA_LOG_WARN("DOCA 2.x: QP1 cloning and 64-bucket random HASH path rewrite enabled");
+		DOCA_LOG_WARN("DOCA 2.x: immutable 64-bucket random HASH plus metadata dispatch enabled");
 		struct doca_flow_pipe *path0_rewrite =
 			create_path_rewrite_pipe(g_steer.port, 0, sf_target,
 			                         &g_steer.path_rewrite_entry[0]);
@@ -2213,11 +2218,13 @@ doca_error_t steer_start(const struct steer_opts *opts)
 		struct doca_flow_pipe *path_target[NB_PATHS] = {path0_rewrite, path1_rewrite};
 		g_steer.classify_target[0] = path0_rewrite;
 		g_steer.classify_target[1] = path1_rewrite;
-		g_steer.classify_pipe = create_legacy_small_random_table(g_steer.port, path_target, 6,
+		g_steer.classify_dispatch_pipe = create_classify_dispatch_pipe(
+			g_steer.port, path_target, g_steer.classify_entry,
+			g_steer.classify_bucket_path, g_steer.opts.force_path);
+		g_steer.classify_pipe = create_legacy_small_random_table(
+			g_steer.port, g_steer.classify_dispatch_pipe, 6,
 			g_steer.legacy_random_entry);
 		sf_target = g_steer.classify_pipe;
-		for (uint32_t bucket = 0; bucket < PATH_SHARE_BUCKETS; bucket++)
-			g_steer.classify_bucket_path[bucket] = bucket < PATH_SHARE_BUCKETS / 2 ? 0 : 1;
 		g_steer.applied_path0_share = PATH_SHARE_BUCKETS / 2;
 		g_steer.grouping_enabled = true;
 #else
