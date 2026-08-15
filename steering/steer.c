@@ -1465,16 +1465,15 @@ static void install_qp1_clone_paths(struct doca_flow_port *port,
 	};
 
 
-	configure_legacy_mirror(port, QP1_SF_MIRROR_ID, &clone_fwd, &sf_original);
 	configure_legacy_mirror(port, QP1_WIRE_MIRROR_ID, &clone_fwd, &wire_original);
 	*wire_target = create_legacy_roce_mirror_pipe(port, "QP1_MIRROR_WIRE",
 	                                                SF_PORT_ID, *wire_target,
 	                                                QP1_WIRE_MIRROR_ID, path_ip, true, wire_entry);
-	*sf_target = create_legacy_roce_mirror_pipe(port, "QP1_MIRROR_SF",
-	                                              WIRE_PORT_ID, *sf_target,
-	                                              QP1_SF_MIRROR_ID, path_ip, false, sf_entry);
-	DOCA_LOG_WARN("DOCA 2.x QP1 observation mirrors UDP 4791 per configured path IP until CM is learned; "
-	              "software accepts only QP1 RDMA-CM packets");
+	(void)sf_original;
+	(void)sf_target;
+	(void)sf_entry;
+	DOCA_LOG_WARN("DOCA 2.x observes only wire-ingress UDP 4791 per path IP; "
+	              "the first ACK/CNP learns the PCC sender QPN and retires that mirror");
 #endif
 }
 
@@ -2550,6 +2549,67 @@ static void complete_cm_mapping(uint32_t remote_comm_id, uint32_t responder_qpn)
 		retire_legacy_qp1_mirror_entry(g_steer.legacy_qp1_wire_entry, path, "wire-ingress");
 }
 
+#if DOCA_VERSION_MAJOR < 3
+static void learn_ingress_feedback_qpn(uint32_t sender_qpn, uint32_t source_ip)
+{
+	uint8_t path = 0;
+	bool path_known = false;
+	bool changed = false;
+
+	for (uint8_t i = 0; i < NB_PATHS; i++) {
+		if (g_steer.opts.path_ip_set[i] &&
+		    rte_be_to_cpu_32(g_steer.opts.path_ip[i]) == source_ip) {
+			path = i;
+			path_known = true;
+			break;
+		}
+	}
+	if (!path_known)
+		return;
+	sender_qpn &= 0x00FFFFFFu;
+	if (sender_qpn <= 1)
+		return;
+
+	while (atomic_flag_test_and_set_explicit(&g_steer.rate_lock, memory_order_acquire))
+		;
+	struct qpn_pair_state *pair = NULL;
+	for (uint32_t i = 0; i < g_steer.qpn_pair_count; i++) {
+		if (g_steer.qpn_pair[i].initiator_qpn == sender_qpn) {
+			pair = &g_steer.qpn_pair[i];
+			break;
+		}
+	}
+	if (pair == NULL && g_steer.qpn_pair_count < MAX_CM_CONNECTIONS)
+		pair = &g_steer.qpn_pair[g_steer.qpn_pair_count++];
+	if (pair != NULL &&
+	    (pair->initiator_qpn != sender_qpn || pair->path != path)) {
+		pair->initiator_qpn = sender_qpn;
+		pair->responder_qpn = sender_qpn;
+		pair->path = path;
+		changed = true;
+	}
+	for (uint32_t i = 0; i < g_steer.rate_flow_count; i++) {
+		struct rate_flow_state *flow = &g_steer.rate_flow[i];
+		if (flow->qpn == sender_qpn) {
+			flow->receiver_qpn = sender_qpn;
+			flow->path = path;
+			flow->classified = true;
+			break;
+		}
+	}
+	atomic_flag_clear_explicit(&g_steer.rate_lock, memory_order_release);
+
+	if (pair == NULL) {
+		DOCA_LOG_WARN("QPN mapping table full; cannot learn feedback QPN 0x%06x", sender_qpn);
+		return;
+	}
+	if (changed)
+		DOCA_LOG_INFO("ingress feedback grouping: PCC sender QPN 0x%06x "
+		              "source IP=0x%08x -> path%u", sender_qpn, source_ip, path);
+	retire_legacy_qp1_mirror_entry(g_steer.legacy_qp1_wire_entry, path, "wire-ingress");
+}
+#endif
+
 static void parse_qp1_clone(struct rte_mbuf *mbuf)
 {
 	uint8_t scratch[512];
@@ -2578,8 +2638,17 @@ static void parse_qp1_clone(struct rte_mbuf *mbuf)
 		return;
 	const uint8_t *bth = udp + sizeof(struct rte_udp_hdr);
 	uint32_t destination_qpn = ((uint32_t)bth[5] << 16) | ((uint32_t)bth[6] << 8) | bth[7];
-	if (destination_qpn != QP1_QPN)
+	if (destination_qpn != QP1_QPN) {
+#if DOCA_VERSION_MAJOR < 3
+		learn_ingress_feedback_qpn(destination_qpn, read_be32(ip + 12));
+#endif
 		return;
+	}
+
+#if DOCA_VERSION_MAJOR < 3
+	/* QP1 is unnecessary on 2.x: wait for an ACK/CNP carrying the sender QPN. */
+	return;
+#endif
 
 	/* UD QP1: BTH(12), DETH(8), then the 24-byte MAD header. */
 	const uint8_t *mad = bth + 20;
