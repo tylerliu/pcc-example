@@ -100,6 +100,7 @@ DOCA_LOG_REGISTER(FLOW_STEER);
  * (same technique as the tutorial doca_flow_ecn.c / DOCA flow_random sample).
  */
 #define RANDOM_FIELD_WIDTH 16
+#define LEGACY_RANDOM_BUCKETS 8
 
 /* Log at CRIT level and terminate if err != DOCA_SUCCESS -- mirrors rte_exit(). */
 static __attribute__((format(printf, 2, 3))) void crash_if_unsuccessful(doca_error_t err, const char *fmt, ...)
@@ -734,13 +735,14 @@ static struct doca_flow_pipe *create_random_sample_pipe(struct doca_flow_port *p
 /* Small DOCA 2.x action-free random table; rewrites remain in separate pipes. */
 static struct doca_flow_pipe *create_legacy_small_random_table(
 	struct doca_flow_port *port, struct doca_flow_pipe *path_target[NB_PATHS],
-	uint8_t random_bits)
+	uint8_t random_bits, struct doca_flow_pipe_entry *bucket_entry[LEGACY_RANDOM_BUCKETS])
 {
 	const uint32_t nr_entries = 1u << random_bits;
 	const uint16_t random_mask = (uint16_t)(nr_entries - 1);
 	struct doca_flow_match match = {0}, match_mask = {0};
 	struct doca_flow_fwd fwd = {.type = DOCA_FLOW_FWD_CHANGEABLE};
 	struct doca_flow_fwd fwd_miss = {.type = DOCA_FLOW_FWD_PIPE, .next_pipe = path_target[1]};
+	struct doca_flow_monitor monitor = {.counter_type = DOCA_FLOW_RESOURCE_TYPE_NON_SHARED};
 	struct doca_flow_pipe_cfg *cfg;
 	struct doca_flow_pipe *pipe;
 	struct entry_batch_status status = {0};
@@ -762,6 +764,8 @@ static struct doca_flow_pipe *create_legacy_small_random_table(
 	crash_if_unsuccessful(err, "pipe_cfg_set_nr_entries (legacy random table)");
 	err = doca_flow_pipe_cfg_set_match(cfg, &match, &match_mask);
 	crash_if_unsuccessful(err, "pipe_cfg_set_match (legacy random table)");
+	err = doca_flow_pipe_cfg_set_monitor(cfg, &monitor);
+	crash_if_unsuccessful(err, "pipe_cfg_set_monitor (legacy random table)");
 	err = doca_flow_pipe_create(cfg, &fwd, &fwd_miss, &pipe);
 	crash_if_unsuccessful(err, "pipe_create (legacy random table)");
 	doca_flow_pipe_cfg_destroy(cfg);
@@ -770,11 +774,10 @@ static struct doca_flow_pipe *create_legacy_small_random_table(
 		struct doca_flow_match entry_match = {0};
 		struct doca_flow_fwd entry_fwd = {.type = DOCA_FLOW_FWD_PIPE,
 			.next_pipe = path_target[bucket < nr_entries / 2 ? 0 : 1]};
-		struct doca_flow_pipe_entry *entry;
-
 		entry_match.parser_meta.random = (uint16_t)bucket;
-		err = steer_pipe_add_entry(0, pipe, &entry_match, 0, NULL, NULL, &entry_fwd,
-			bucket + 1 < nr_entries ? STEER_WAIT_FOR_BATCH : 0, &status, &entry);
+		err = steer_pipe_add_entry(0, pipe, &entry_match, 0, NULL, &monitor, &entry_fwd,
+			bucket + 1 < nr_entries ? STEER_WAIT_FOR_BATCH : 0, &status,
+			&bucket_entry[bucket]);
 		crash_if_unsuccessful(err, "pipe_add_entry (legacy random bucket %u)", bucket);
 	}
 	process_entries(port, &status, nr_entries, "legacy random table entries");
@@ -1920,6 +1923,7 @@ struct steer_state {
 	struct doca_flow_pipe *classify_dispatch_pipe;
 	struct doca_flow_pipe *classify_target[NB_PATHS];
 	struct doca_flow_pipe_entry *path_rewrite_entry[NB_PATHS];
+	struct doca_flow_pipe_entry *legacy_random_entry[LEGACY_RANDOM_BUCKETS];
 	struct doca_flow_pipe *cnp_count_pipe;
 	bool grouping_enabled;
 	struct doca_flow_pipe_entry *classify_entry[PATH_SHARE_BUCKETS];
@@ -2191,7 +2195,8 @@ doca_error_t steer_start(const struct steer_opts *opts)
 			create_path_rewrite_pipe(g_steer.port, 1, sf_target,
 			                         &g_steer.path_rewrite_entry[1]);
 		struct doca_flow_pipe *path_target[NB_PATHS] = {path0_rewrite, path1_rewrite};
-		sf_target = create_legacy_small_random_table(g_steer.port, path_target, 3);
+		sf_target = create_legacy_small_random_table(g_steer.port, path_target, 3,
+			g_steer.legacy_random_entry);
 		g_steer.applied_path0_share = PATH_SHARE_BUCKETS / 2;
 #else
 		g_steer.grouping_enabled = true;
@@ -2656,6 +2661,22 @@ void steer_poll(void)
 		DOCA_LOG_INFO("egress assigned counters: path0=%lu path1=%lu ratio=%u:%u buckets",
 		              assigned[0], assigned[1], g_steer.applied_path0_share,
 		              PATH_SHARE_BUCKETS - g_steer.applied_path0_share);
+#if DOCA_VERSION_MAJOR < 3
+		uint64_t bucket_pkts[LEGACY_RANDOM_BUCKETS] = {0};
+		uint64_t matched = 0;
+		for (uint32_t bucket = 0; bucket < LEGACY_RANDOM_BUCKETS; bucket++) {
+			if (g_steer.legacy_random_entry[bucket] != NULL &&
+			    steer_query_entry(g_steer.legacy_random_entry[bucket], &q) == DOCA_SUCCESS)
+				bucket_pkts[bucket] = q.total_pkts;
+			matched += bucket_pkts[bucket];
+		}
+		uint64_t assigned_total = assigned[0] + assigned[1];
+		DOCA_LOG_INFO("egress random buckets: 0=%lu 1=%lu 2=%lu 3=%lu",
+			bucket_pkts[0], bucket_pkts[1], bucket_pkts[2], bucket_pkts[3]);
+		DOCA_LOG_INFO("egress random buckets: 4=%lu 5=%lu 6=%lu 7=%lu miss=%lu",
+			bucket_pkts[4], bucket_pkts[5], bucket_pkts[6], bucket_pkts[7],
+			assigned_total > matched ? assigned_total - matched : 0);
+#endif
 	}
 	if (g_steer.cnp_count_pipe != NULL) {
 		uint64_t cnp_by_path[NB_PATHS] = {0};
