@@ -284,7 +284,10 @@ int main(int argc, char **argv)
 				PRINT_WARNING("Warning: failed to poll PCC rate reports: %s\n",
 				              doca_error_get_descr(tmp_result));
 			steer_poll();
-			sleep(1);
+			for (uint32_t i = 0; i < 100 && !host_stop; i++) {
+				steer_poll_rx();
+				usleep(10000);
+			}
 		} else {
 			PRINT_INFO("Info: Waiting on DOCA PCC\n");
 			result = doca_pcc_wait(resources.doca_pcc, cfg.wait_time);

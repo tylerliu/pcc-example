@@ -305,8 +305,12 @@ int main(int argc, char **argv)
 	DOCA_LOG_INFO("doca_flow_steer running -- Ctrl-C to stop");
 
 	while (g_running) {
-		sleep(1);
-		steer_poll();
+		for (uint32_t i = 0; i < 100 && g_running; i++) {
+			steer_poll_rx();
+			usleep(10000);
+		}
+		if (g_running)
+			steer_poll();
 	}
 
 	DOCA_LOG_INFO("stopping steering");

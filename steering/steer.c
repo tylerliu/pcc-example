@@ -2707,14 +2707,20 @@ static void poll_qp1_clones(void)
 	}
 }
 
+void steer_poll_rx(void)
+{
+	if (g_steer.started)
+		poll_qp1_clones();
+}
+
 void steer_poll(void)
 {
 	if (!g_steer.started)
 		return;
-	poll_qp1_clones();
+	steer_poll_rx();
 
 #if DOCA_VERSION_MAJOR < 3
-	if (g_steer.dpdk_rx_pkts != 0)
+	if (g_steer.dpdk_rx_pkts != 0) {
 		DOCA_LOG_INFO("DPDK ingress clones: rx=%lu freed=%lu outstanding=%lu bursts=%lu full=%lu "
 		              "roce=%lu feedback=%lu path0=%lu path1=%lu qp1=%lu unknown-path=%lu learned-qpn=%lu",
 		              g_steer.dpdk_rx_pkts, g_steer.dpdk_freed_pkts,
@@ -2724,6 +2730,17 @@ void steer_poll(void)
 		              g_steer.dpdk_feedback_path_pkts[0], g_steer.dpdk_feedback_path_pkts[1],
 		              g_steer.dpdk_qp1_pkts, g_steer.dpdk_unknown_path_pkts,
 		              g_steer.dpdk_learned_qpns);
+		struct rte_eth_stats stats = {0};
+		int stats_rc = rte_eth_stats_get(g_dpdk_rx_port_id, &stats);
+		if (stats_rc == 0)
+			DOCA_LOG_INFO("DPDK RX driver stats: ipackets=%lu imissed=%lu ierrors=%lu "
+			              "rx_nombuf=%lu q%u_errors=%lu",
+			              stats.ipackets, stats.imissed, stats.ierrors, stats.rx_nombuf,
+			              QP1_CLONE_QUEUE, stats.q_errors[QP1_CLONE_QUEUE]);
+		else
+			DOCA_LOG_WARN("rte_eth_stats_get(port=%u) failed: %d",
+			              g_dpdk_rx_port_id, stats_rc);
+	}
 #endif
 
 	if (g_steer.grouping_enabled) {

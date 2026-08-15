@@ -91,6 +91,9 @@ doca_error_t steer_start(const struct steer_opts *opts);
  */
 void steer_update_pcc_rate(uint32_t qpn, uint32_t rate);
 
+/* Drain cloned packets without running the one-second control/statistics work. */
+void steer_poll_rx(void);
+
 /* Calculate/apply the PCC path share and log counters. */
 void steer_poll(void);
 
