@@ -276,6 +276,25 @@ static void probe_open_dev(struct doca_dev *dev, const char *device_pci_addr, co
 
 #endif
 
+#if DOCA_VERSION_MAJOR < 3
+static uint16_t find_pf_dpdk_port_id(void)
+{
+	uint16_t port_id;
+
+	RTE_ETH_FOREACH_DEV(port_id) {
+		struct rte_eth_dev_info dev_info = {0};
+
+		if (rte_eth_dev_info_get(port_id, &dev_info) < 0)
+			continue;
+		if (dev_info.dev_flags == NULL ||
+		    (*dev_info.dev_flags & RTE_ETH_DEV_REPRESENTOR) == 0)
+			return port_id;
+	}
+	DOCA_LOG_CRIT("No non-representor PF ethdev found for the eSwitch proxy");
+	exit(EXIT_FAILURE);
+}
+#endif
+
 /*
  * DPDK must be configured and started before DOCA Flow (HWS requirement), and
  * needs at least one RX queue to start. Isolated mode: no ingress goes to RSS
@@ -284,9 +303,14 @@ static void probe_open_dev(struct doca_dev *dev, const char *device_pci_addr, co
 static void configure_and_start_dpdk_port(struct doca_dev *dev)
 {
 	uint16_t first_port_id;
+#if DOCA_VERSION_MAJOR < 3
+	(void)dev;
+	first_port_id = find_pf_dpdk_port_id();
+#else
 	doca_error_t err = doca_dpdk_get_first_port_id(dev, &first_port_id);
 
 	crash_if_unsuccessful(err, "doca_dpdk_get_first_port_id");
+#endif
 	g_dpdk_rx_port_id = first_port_id;
 
 	struct rte_mempool *mp = rte_pktmbuf_pool_create("mbuf_pool", 8192, 0, 0, RTE_MBUF_DEFAULT_BUF_SIZE,
@@ -1918,11 +1942,11 @@ doca_error_t steer_start(const struct steer_opts *opts)
 			return DOCA_ERROR_INVALID_VALUE;
 		}
 		snprintf(probe_args, sizeof(probe_args),
-		         "dv_flow_en=2,fdb_def_rule_en=1,representor=sf[%u,%u]",
+		         "dv_flow_en=2,fdb_def_rule_en=1,repr_matching_en=0,representor=sf[%u,%u]",
 		         opts->sf_num, opts->path1_sf_num);
 	} else {
 		snprintf(probe_args, sizeof(probe_args),
-		         "dv_flow_en=2,fdb_def_rule_en=1,representor=sf%u", opts->sf_num);
+		         "dv_flow_en=2,fdb_def_rule_en=1,repr_matching_en=0,representor=sf%u", opts->sf_num);
 	}
 	struct doca_dev *dev = opts->dev;
 	if (dev != NULL)
