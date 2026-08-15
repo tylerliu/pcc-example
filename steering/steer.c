@@ -1962,6 +1962,15 @@ struct steer_state {
 	uint64_t ingress_prev_mark_pkts[NB_PATHS];
 	uint64_t ingress_prev_cycles;
 	bool ingress_throughput_ready;
+	uint64_t dpdk_rx_bursts;
+	uint64_t dpdk_full_bursts;
+	uint64_t dpdk_rx_pkts;
+	uint64_t dpdk_freed_pkts;
+	uint64_t dpdk_roce_pkts;
+	uint64_t dpdk_feedback_pkts;
+	uint64_t dpdk_qp1_pkts;
+	uint64_t dpdk_unknown_path_pkts;
+	uint64_t dpdk_learned_qpns;
 	atomic_flag rate_lock;
 };
 
@@ -2564,8 +2573,10 @@ static void learn_ingress_feedback_qpn(uint32_t sender_qpn, uint32_t source_ip)
 			break;
 		}
 	}
-	if (!path_known)
+	if (!path_known) {
+		g_steer.dpdk_unknown_path_pkts++;
 		return;
+	}
 	sender_qpn &= 0x00FFFFFFu;
 	if (sender_qpn <= 1)
 		return;
@@ -2603,10 +2614,11 @@ static void learn_ingress_feedback_qpn(uint32_t sender_qpn, uint32_t source_ip)
 		DOCA_LOG_WARN("QPN mapping table full; cannot learn feedback QPN 0x%06x", sender_qpn);
 		return;
 	}
-	if (changed)
+	if (changed) {
+		g_steer.dpdk_learned_qpns++;
 		DOCA_LOG_INFO("ingress feedback grouping: PCC sender QPN 0x%06x "
 		              "source IP=0x%08x -> path%u", sender_qpn, source_ip, path);
-	retire_legacy_qp1_mirror_entry(g_steer.legacy_qp1_wire_entry, path, "wire-ingress");
+	}
 }
 #endif
 
@@ -2636,14 +2648,17 @@ static void parse_qp1_clone(struct rte_mbuf *mbuf)
 	const uint8_t *udp = ip + ip_header_len;
 	if (read_be16(udp + 2) != ROCE_UDP_PORT_NATIVE)
 		return;
+	g_steer.dpdk_roce_pkts++;
 	const uint8_t *bth = udp + sizeof(struct rte_udp_hdr);
 	uint32_t destination_qpn = ((uint32_t)bth[5] << 16) | ((uint32_t)bth[6] << 8) | bth[7];
 	if (destination_qpn != QP1_QPN) {
 #if DOCA_VERSION_MAJOR < 3
+		g_steer.dpdk_feedback_pkts++;
 		learn_ingress_feedback_qpn(destination_qpn, read_be32(ip + 12));
 #endif
 		return;
 	}
+	g_steer.dpdk_qp1_pkts++;
 
 #if DOCA_VERSION_MAJOR < 3
 	/* QP1 is unnecessary on 2.x: wait for an ACK/CNP carrying the sender QPN. */
@@ -2685,9 +2700,14 @@ static void poll_qp1_clones(void)
 		struct rte_mbuf *packets[QP1_RX_BURST];
 		uint16_t received = rte_eth_rx_burst(g_dpdk_rx_port_id, QP1_CLONE_QUEUE, packets,
 		                                          QP1_RX_BURST);
+		g_steer.dpdk_rx_bursts++;
+		g_steer.dpdk_rx_pkts += received;
+		if (received == QP1_RX_BURST)
+			g_steer.dpdk_full_bursts++;
 		for (uint16_t i = 0; i < received; i++) {
 			parse_qp1_clone(packets[i]);
 			rte_pktmbuf_free(packets[i]);
+			g_steer.dpdk_freed_pkts++;
 		}
 		if (received < QP1_RX_BURST)
 			break;
@@ -2699,6 +2719,18 @@ void steer_poll(void)
 	if (!g_steer.started)
 		return;
 	poll_qp1_clones();
+
+#if DOCA_VERSION_MAJOR < 3
+	if (g_steer.dpdk_rx_pkts != 0)
+		DOCA_LOG_INFO("DPDK ingress clones: rx=%lu freed=%lu outstanding=%lu bursts=%lu full=%lu "
+		              "roce=%lu feedback=%lu qp1=%lu unknown-path=%lu learned-qpn=%lu",
+		              g_steer.dpdk_rx_pkts, g_steer.dpdk_freed_pkts,
+		              g_steer.dpdk_rx_pkts - g_steer.dpdk_freed_pkts,
+		              g_steer.dpdk_rx_bursts, g_steer.dpdk_full_bursts,
+		              g_steer.dpdk_roce_pkts, g_steer.dpdk_feedback_pkts,
+		              g_steer.dpdk_qp1_pkts, g_steer.dpdk_unknown_path_pkts,
+		              g_steer.dpdk_learned_qpns);
+#endif
 
 	if (g_steer.grouping_enabled) {
 		uint64_t reduced_sum[NB_PATHS] = {0};
