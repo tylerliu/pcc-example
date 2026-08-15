@@ -1320,7 +1320,7 @@ static struct doca_flow_pipe *create_legacy_qp1_rss_pipe(
 	uint16_t queues[1] = {QP1_CLONE_QUEUE};
 	doca_error_t err;
 
-	match.parser_meta.outer_l3_type = DOCA_FLOW_L3_META_IPV4;
+	match.outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;
 	match.outer.ip4.src_ip = UINT32_MAX;
 	match_mask.outer.ip4.src_ip = UINT32_MAX;
 	steer_fwd_set_rss(&fwd, queues, 1, DOCA_FLOW_RSS_IPV4 | DOCA_FLOW_RSS_UDP);
