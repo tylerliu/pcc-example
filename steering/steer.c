@@ -1297,13 +1297,14 @@ static void configure_legacy_mirror(struct doca_flow_port *port, uint32_t mirror
 }
 
 static struct doca_flow_pipe *create_legacy_roce_mirror_pipe(
-	struct doca_flow_port *port, const char *name, struct doca_flow_pipe *normal_target,
-	uint32_t mirror_id)
+	struct doca_flow_port *port, const char *name, uint16_t original_port,
+	struct doca_flow_pipe *miss_target, uint32_t mirror_id)
 {
 	struct doca_flow_match match = {0}, match_mask = {0}, entry_match = {0};
 	struct doca_flow_monitor monitor = {.shared_mirror_id = mirror_id};
 	struct doca_flow_monitor entry_monitor = monitor;
-	struct doca_flow_fwd fwd = {.type = DOCA_FLOW_FWD_PIPE, .next_pipe = normal_target};
+	struct doca_flow_fwd fwd = {.type = DOCA_FLOW_FWD_PORT, .port_id = original_port};
+	struct doca_flow_fwd fwd_miss = {.type = DOCA_FLOW_FWD_PIPE, .next_pipe = miss_target};
 	struct doca_flow_pipe_cfg *cfg;
 	struct doca_flow_pipe *pipe;
 	struct doca_flow_pipe_entry *entry;
@@ -1322,7 +1323,7 @@ static struct doca_flow_pipe *create_legacy_roce_mirror_pipe(
 		cfg, &match, steer_roce_udp_match_mask(&match_mask)),
 		"pipe_cfg_set_match (%s)", name);
 	crash_if_unsuccessful(doca_flow_pipe_cfg_set_monitor(cfg, &monitor), "pipe_cfg_set_monitor (%s)", name);
-	err = doca_flow_pipe_create(cfg, &fwd, &fwd, &pipe);
+	err = doca_flow_pipe_create(cfg, &fwd, &fwd_miss, &pipe);
 	crash_if_unsuccessful(err, "pipe_create (%s)", name);
 	doca_flow_pipe_cfg_destroy(cfg);
 #if !STEER_HAS_ROCE_MATCH
@@ -1364,15 +1365,26 @@ static void install_qp1_clone_paths(struct doca_flow_port *port,
 
 	(void)deliver_sf;
 	(void)deliver_wire;
-	struct doca_flow_fwd wire_original = {.type = DOCA_FLOW_FWD_PIPE, .next_pipe = *wire_target};
-	struct doca_flow_fwd sf_original = {.type = DOCA_FLOW_FWD_PIPE, .next_pipe = *sf_target};
+	/* DOCA 2.7 requires an explicit original destination on the shared
+	 * mirror. Use terminal ports here: QP1 management packets must not depend
+	 * on the egress rewrite chain in order to establish the RDMA connection. */
+	struct doca_flow_fwd wire_original = {
+		.type = DOCA_FLOW_FWD_PORT,
+		.port_id = SF_PORT_ID,
+	};
+	struct doca_flow_fwd sf_original = {
+		.type = DOCA_FLOW_FWD_PORT,
+		.port_id = WIRE_PORT_ID,
+	};
 
 	configure_legacy_mirror(port, QP1_WIRE_MIRROR_ID, &clone_fwd, &wire_original);
 	configure_legacy_mirror(port, QP1_SF_MIRROR_ID, &clone_fwd, &sf_original);
 	*wire_target = create_legacy_roce_mirror_pipe(port, "QP1_MIRROR_WIRE",
-	                                                *wire_target, QP1_WIRE_MIRROR_ID);
+	                                                SF_PORT_ID, *wire_target,
+	                                                QP1_WIRE_MIRROR_ID);
 	*sf_target = create_legacy_roce_mirror_pipe(port, "QP1_MIRROR_SF",
-	                                              *sf_target, QP1_SF_MIRROR_ID);
+	                                              WIRE_PORT_ID, *sf_target,
+	                                              QP1_SF_MIRROR_ID);
 	DOCA_LOG_WARN("DOCA 2.x QP1 observation mirrors all IPv4 UDP 4791 packets; "
 	              "software accepts only QP1 RDMA-CM packets");
 #endif
@@ -2056,6 +2068,11 @@ doca_error_t steer_start(const struct steer_opts *opts)
 	/* PORT_DEMUX targets default to plain delivery; the active role overrides. */
 	struct doca_flow_pipe *wire_target = receiver_target; /* wire-ingress fate */
 	struct doca_flow_pipe *sf_target = deliver_wire;  /* SF-egress fate */
+#if DOCA_VERSION_MAJOR < 3
+	if (do_egress)
+		install_qp1_clone_paths(g_steer.port, receiver_target, deliver_wire,
+		                        &wire_target, &sf_target);
+#endif
 
 	if (do_ingress) {
 		/* Ingress: choose the virtual path first, then run that path's
@@ -2087,11 +2104,12 @@ doca_error_t steer_start(const struct steer_opts *opts)
 		g_steer.grouping_enabled = true;
 		g_steer.cnp_count_pipe = create_cnp_count_pipe(g_steer.port, deliver_sf[0], wire_target);
 		wire_target = g_steer.cnp_count_pipe;
-		struct doca_flow_pipe *classify_target = deliver_wire;
+		struct doca_flow_pipe *egress_delivery_target = sf_target;
+		struct doca_flow_pipe *classify_target = egress_delivery_target;
 #if STEER_USE_RANDOM_HASH_CLASSIFIER
 		for (uint8_t path = 0; path < NB_PATHS; path++)
 			g_steer.classify_target[path] =
-				create_path_rewrite_pipe(g_steer.port, path, deliver_wire);
+				create_path_rewrite_pipe(g_steer.port, path, egress_delivery_target);
 #else
 		g_steer.classify_target[0] = classify_target;
 		g_steer.classify_target[1] = classify_target;
@@ -2105,7 +2123,7 @@ doca_error_t steer_start(const struct steer_opts *opts)
 			DOCA_LOG_WARN("egress diagnostic: EGRESS_CLASSIFY bypassed; "
 			              "RoCE forwarded directly through path%u rewrite", forced);
 			sf_target = create_roce_check_pipe(g_steer.port, "EGRESS_ROCE_CHECK",
-			                                   g_steer.classify_target[forced], deliver_wire,
+			                                   g_steer.classify_target[forced], egress_delivery_target,
 			                                   false);
 		} else
 #endif
@@ -2129,15 +2147,16 @@ doca_error_t steer_start(const struct steer_opts *opts)
 
 			/* All admitted RoCE traffic is randomly assigned a DSCP path bit. */
 			sf_target = create_roce_check_pipe(g_steer.port, "EGRESS_ROCE_CHECK",
-			                                   g_steer.classify_pipe, deliver_wire,
+			                                   g_steer.classify_pipe, egress_delivery_target,
 			                                   STEER_USE_RANDOM_HASH_CLASSIFIER);
 		}
 	}
 
-	/* Both roles observe CM. Egress still uses sender/receiver pairing for its
-	 * diagnostics; ingress path eligibility is now static by destination IP. */
+	/* Sender/receiver pairing is consumed only by egress path grouping. */
+#if DOCA_VERSION_MAJOR >= 3
 	install_qp1_clone_paths(g_steer.port, receiver_target, deliver_wire,
 	                        &wire_target, &sf_target);
+#endif
 	if (do_ingress)
 		install_arp_paths(g_steer.port, &wire_target, &sf_target);
 
