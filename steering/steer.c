@@ -1302,7 +1302,7 @@ static struct doca_flow_pipe *create_legacy_roce_mirror_pipe(
 {
 	struct doca_flow_match match = {0}, match_mask = {0}, entry_match = {0};
 	struct doca_flow_monitor monitor = {.shared_mirror_id = mirror_id};
-	struct doca_flow_monitor entry_monitor = {0};
+	struct doca_flow_monitor entry_monitor = monitor;
 	struct doca_flow_fwd fwd = {.type = DOCA_FLOW_FWD_PIPE, .next_pipe = normal_target};
 	struct doca_flow_pipe_cfg *cfg;
 	struct doca_flow_pipe *pipe;
@@ -1428,7 +1428,7 @@ static struct doca_flow_pipe *create_arp_check_pipe(struct doca_flow_port *port,
 	struct entry_batch_status status = {0};
 #if DOCA_VERSION_MAJOR < 3
 	struct doca_flow_monitor monitor = {.shared_mirror_id = mirror_id};
-	struct doca_flow_monitor entry_monitor = {0};
+	struct doca_flow_monitor entry_monitor = monitor;
 #endif
 	doca_error_t err;
 

@@ -67,9 +67,9 @@ static struct flow_rate_entry flow_rate_table[MAX_TRACKED_FLOWS];
 static uint32_t flow_rate_table_size = 0;
 #if DOCA_VERSION_MAJOR >= 3
 static uint32_t last_rate_print_ts = 0;
+#endif
 static uint64_t rate_reports_total = 0;
 static uint64_t rate_reports_since_print = 0;
-#endif
 
 static struct flow_rate_entry *find_or_create_flow(uint32_t qpn)
 {
@@ -608,8 +608,6 @@ doca_error_t pcc_poll_rate_reports(struct pcc_resources *resources)
 	    response->count > PCC_RATE_MAILBOX_MAX_FLOWS)
 		return DOCA_ERROR_BAD_STATE;
 
-	printf("--- Per-flow rate snapshot (DOCA 2 mailbox, flows=%u dropped=%u) ---\n",
-	       response->count, response->dropped);
 	for (uint32_t i = 0; i < response->count; i++) {
 		struct flow_rate_entry *entry = find_or_create_flow(response->flow[i].qpn);
 
@@ -619,10 +617,22 @@ doca_error_t pcc_poll_rate_reports(struct pcc_resources *resources)
 			entry->last_rate = response->flow[i].rate;
 		}
 		steer_update_pcc_rate(response->flow[i].qpn, response->flow[i].rate);
-		printf("  QPN 0x%x: rate=%u\n", response->flow[i].qpn, response->flow[i].rate);
+	}
+	rate_reports_since_print += response->count;
+	rate_reports_total += response->count;
+	printf("--- Per-flow rate averages (received=%llu total=%llu) ---\n",
+	       (unsigned long long)rate_reports_since_print,
+	       (unsigned long long)rate_reports_total);
+	for (uint32_t i = 0; i < flow_rate_table_size; i++) {
+		const struct flow_rate_entry *entry = &flow_rate_table[i];
+		uint32_t avg = (uint32_t)(entry->rate_sum / entry->count);
+
+		printf("  QPN 0x%x: avg_rate=%u last_rate=%u updates=%u\n",
+		       entry->qpn, avg, entry->last_rate, entry->count);
 	}
 	printf("---\n");
 	fflush(stdout);
+	rate_reports_since_print = 0;
 #else
 	(void)resources;
 #endif
