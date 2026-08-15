@@ -257,4 +257,14 @@ static inline doca_error_t steer_pipe_hash_add_entry(uint16_t queue, struct doca
 #endif
 }
 
+static inline doca_error_t steer_pipe_remove_entry(uint16_t queue, uint32_t flags,
+                                                   struct doca_flow_pipe_entry *entry)
+{
+#if DOCA_VERSION_MAJOR < 3 && DOCA_VERSION_MINOR < 9
+	return doca_flow_pipe_rm_entry(queue, flags, entry);
+#else
+	return doca_flow_pipe_remove_entry(queue, flags, entry);
+#endif
+}
+
 #endif /* DOCA_FLOW_COMPAT_H_ */

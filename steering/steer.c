@@ -1363,41 +1363,58 @@ static void configure_legacy_mirror(struct doca_flow_port *port, uint32_t mirror
 
 static struct doca_flow_pipe *create_legacy_roce_mirror_pipe(
 	struct doca_flow_port *port, const char *name, uint16_t original_port,
-	struct doca_flow_pipe *miss_target, uint32_t mirror_id)
+	struct doca_flow_pipe *miss_target, uint32_t mirror_id,
+	const uint32_t path_ip[NB_PATHS], bool match_src_ip,
+	struct doca_flow_pipe_entry *path_entry[NB_PATHS])
 {
-	struct doca_flow_match match = {0}, match_mask = {0}, entry_match = {0};
+	struct doca_flow_match match = {0}, match_mask = {0};
 	struct doca_flow_monitor monitor = {.shared_mirror_id = mirror_id};
-	struct doca_flow_monitor entry_monitor = monitor;
 	struct doca_flow_fwd fwd = {.type = DOCA_FLOW_FWD_PORT, .port_id = original_port};
 	struct doca_flow_fwd fwd_miss = {.type = DOCA_FLOW_FWD_PIPE, .next_pipe = miss_target};
 	struct doca_flow_pipe_cfg *cfg;
 	struct doca_flow_pipe *pipe;
-	struct doca_flow_pipe_entry *entry;
 	struct entry_batch_status status = {0};
 	doca_error_t err;
 
 	steer_set_roce_udp_match(&match, &match_mask, RTE_BE16(ROCE_UDP_PORT_NATIVE));
+	if (match_src_ip) {
+		match.outer.ip4.src_ip = UINT32_MAX;
+		match_mask.outer.ip4.src_ip = UINT32_MAX;
+	} else {
+		match.outer.ip4.dst_ip = UINT32_MAX;
+		match_mask.outer.ip4.dst_ip = UINT32_MAX;
+	}
 	err = doca_flow_pipe_cfg_create(&cfg, port);
 	crash_if_unsuccessful(err, "pipe_cfg_create (%s)", name);
 	crash_if_unsuccessful(doca_flow_pipe_cfg_set_name(cfg, name), "pipe_cfg_set_name (%s)", name);
 	crash_if_unsuccessful(doca_flow_pipe_cfg_set_type(cfg, DOCA_FLOW_PIPE_BASIC), "pipe_cfg_set_type (%s)", name);
 	crash_if_unsuccessful(doca_flow_pipe_cfg_set_domain(cfg, DOCA_FLOW_PIPE_DOMAIN_DEFAULT), "pipe_cfg_set_domain (%s)", name);
 	crash_if_unsuccessful(doca_flow_pipe_cfg_set_is_root(cfg, false), "pipe_cfg_set_is_root (%s)", name);
-	crash_if_unsuccessful(doca_flow_pipe_cfg_set_nr_entries(cfg, 1), "pipe_cfg_set_nr_entries (%s)", name);
+	crash_if_unsuccessful(doca_flow_pipe_cfg_set_nr_entries(cfg, NB_PATHS), "pipe_cfg_set_nr_entries (%s)", name);
 	crash_if_unsuccessful(doca_flow_pipe_cfg_set_match(
-		cfg, &match, steer_roce_udp_match_mask(&match_mask)),
-		"pipe_cfg_set_match (%s)", name);
+		cfg, &match, steer_roce_udp_match_mask(&match_mask)), "pipe_cfg_set_match (%s)", name);
 	crash_if_unsuccessful(doca_flow_pipe_cfg_set_monitor(cfg, &monitor), "pipe_cfg_set_monitor (%s)", name);
 	err = doca_flow_pipe_create(cfg, &fwd, &fwd_miss, &pipe);
 	crash_if_unsuccessful(err, "pipe_create (%s)", name);
 	doca_flow_pipe_cfg_destroy(cfg);
+
+	for (uint8_t path = 0; path < NB_PATHS; path++) {
+		struct doca_flow_match entry_match = {0};
+		struct doca_flow_monitor entry_monitor = monitor;
+		uint32_t flags = path + 1 < NB_PATHS ? STEER_WAIT_FOR_BATCH : 0;
 #if !STEER_HAS_ROCE_MATCH
-	entry_match = match;
+		entry_match = match;
 #endif
-	err = steer_pipe_add_entry(0, pipe, &entry_match, 0, NULL, &entry_monitor, NULL, 0,
-	                           &status, &entry);
-	crash_if_unsuccessful(err, "pipe_add_entry (%s)", name);
-	process_entries(port, &status, 1, name);
+		if (match_src_ip)
+			entry_match.outer.ip4.src_ip = path_ip[path];
+		else
+			entry_match.outer.ip4.dst_ip = path_ip[path];
+		err = steer_pipe_add_entry(0, pipe, &entry_match, 0, NULL, &entry_monitor, NULL,
+			flags, &status, &path_entry[path]);
+		crash_if_unsuccessful(err, "pipe_add_entry (%s path%u)", name, path);
+	}
+	process_entries(port, &status, NB_PATHS, name);
+	DOCA_LOG_INFO("%s ready: path-IP-specific QP1 candidates", name);
 	return pipe;
 }
 #endif
@@ -1410,9 +1427,15 @@ static void install_qp1_clone_paths(struct doca_flow_port *port,
                                     struct doca_flow_pipe *deliver_sf,
                                     struct doca_flow_pipe *deliver_wire,
                                     struct doca_flow_pipe **wire_target,
-                                    struct doca_flow_pipe **sf_target)
+                                    struct doca_flow_pipe **sf_target,
+                                    const uint32_t path_ip[NB_PATHS],
+                                    struct doca_flow_pipe_entry *wire_entry[NB_PATHS],
+                                    struct doca_flow_pipe_entry *sf_entry[NB_PATHS])
 {
 #if DOCA_VERSION_MAJOR >= 3
+	(void)path_ip;
+	(void)wire_entry;
+	(void)sf_entry;
 	struct doca_flow_pipe *qp1_rss = create_qp1_rss_pipe(port, "QP1_RSS", QP1_CLONE_QUEUE);
 	struct doca_flow_pipe *wire_flood =
 		create_qp1_flood_pipe(port, "QP1_FLOOD_WIRE", deliver_sf, qp1_rss);
@@ -1447,11 +1470,11 @@ static void install_qp1_clone_paths(struct doca_flow_port *port,
 	configure_legacy_mirror(port, QP1_WIRE_MIRROR_ID, &clone_fwd, &wire_original);
 	*wire_target = create_legacy_roce_mirror_pipe(port, "QP1_MIRROR_WIRE",
 	                                                SF_PORT_ID, *wire_target,
-	                                                QP1_WIRE_MIRROR_ID);
+	                                                QP1_WIRE_MIRROR_ID, path_ip, true, wire_entry);
 	*sf_target = create_legacy_roce_mirror_pipe(port, "QP1_MIRROR_SF",
 	                                              WIRE_PORT_ID, *sf_target,
-	                                              QP1_SF_MIRROR_ID);
-	DOCA_LOG_WARN("DOCA 2.x QP1 observation mirrors all IPv4 UDP 4791 packets; "
+	                                              QP1_SF_MIRROR_ID, path_ip, false, sf_entry);
+	DOCA_LOG_WARN("DOCA 2.x QP1 observation mirrors UDP 4791 per configured path IP until CM is learned; "
 	              "software accepts only QP1 RDMA-CM packets");
 #endif
 }
@@ -1913,6 +1936,8 @@ struct steer_state {
 	struct doca_flow_pipe *classify_target[NB_PATHS];
 	struct doca_flow_pipe_entry *path_rewrite_entry[NB_PATHS];
 	struct doca_flow_pipe_entry *legacy_random_entry[LEGACY_RANDOM_BUCKETS];
+	struct doca_flow_pipe_entry *legacy_qp1_wire_entry[NB_PATHS];
+	struct doca_flow_pipe_entry *legacy_qp1_sf_entry[NB_PATHS];
 	struct doca_flow_pipe *cnp_count_pipe;
 	bool grouping_enabled;
 	struct doca_flow_pipe_entry *classify_entry[PATH_SHARE_BUCKETS];
@@ -2146,7 +2171,9 @@ doca_error_t steer_start(const struct steer_opts *opts)
 #if DOCA_VERSION_MAJOR < 3
 	if (do_egress)
 		install_qp1_clone_paths(g_steer.port, receiver_target, deliver_wire,
-		                        &wire_target, &sf_target);
+		                        &wire_target, &sf_target, g_steer.opts.path_ip,
+		                        g_steer.legacy_qp1_wire_entry,
+		                        g_steer.legacy_qp1_sf_entry);
 #endif
 
 	if (do_ingress) {
@@ -2251,7 +2278,9 @@ doca_error_t steer_start(const struct steer_opts *opts)
 	/* Sender/receiver pairing is consumed only by egress path grouping. */
 #if DOCA_VERSION_MAJOR >= 3
 	install_qp1_clone_paths(g_steer.port, receiver_target, deliver_wire,
-	                        &wire_target, &sf_target);
+	                        &wire_target, &sf_target, g_steer.opts.path_ip,
+		                        g_steer.legacy_qp1_wire_entry,
+		                        g_steer.legacy_qp1_sf_entry);
 #endif
 	if (do_ingress)
 		install_arp_paths(g_steer.port, &wire_target, &sf_target);
@@ -2384,6 +2413,29 @@ static void install_sender_cnp_entry(uint32_t sender_qpn, uint32_t receiver_qpn,
 #endif
 }
 
+static void retire_legacy_qp1_mirror_entry(
+	struct doca_flow_pipe_entry *entries[NB_PATHS], uint8_t path, const char *direction)
+{
+#if DOCA_VERSION_MAJOR < 3
+	if (path >= NB_PATHS || entries[path] == NULL)
+		return;
+	doca_error_t err = steer_pipe_remove_entry(0, STEER_NO_WAIT, entries[path]);
+	if (err == DOCA_SUCCESS)
+		err = doca_flow_entries_process(g_steer.port, 0, 10000, 1);
+	if (err != DOCA_SUCCESS) {
+		DOCA_LOG_WARN("failed retiring path%u %s QP1 mirror entry: %s",
+			path, direction, doca_error_get_descr(err));
+		return;
+	}
+	entries[path] = NULL;
+	DOCA_LOG_INFO("retired path%u %s QP1 mirror entry", path, direction);
+#else
+	(void)entries;
+	(void)path;
+	(void)direction;
+#endif
+}
+
 static void remember_cm_request(uint32_t comm_id, uint32_t initiator_qpn, uint32_t receiver_ip)
 {
 	uint8_t path = 0;
@@ -2432,6 +2484,8 @@ static void remember_cm_request(uint32_t comm_id, uint32_t initiator_qpn, uint32
 	if (path_known)
 		DOCA_LOG_INFO("RDMA-CM REQ grouping: sender QPN 0x%06x receiver IP=0x%08x -> path%u",
 		              initiator_qpn, receiver_ip, path);
+	if (path_known)
+		retire_legacy_qp1_mirror_entry(g_steer.legacy_qp1_sf_entry, path, "SF-egress");
 	else
 		DOCA_LOG_WARN("RDMA-CM REQ sender QPN 0x%06x receiver IP=0x%08x is not configured",
 		              initiator_qpn, receiver_ip);
@@ -2493,6 +2547,8 @@ static void complete_cm_mapping(uint32_t remote_comm_id, uint32_t responder_qpn)
 		              initiator_qpn, responder_qpn, path);
 	if (initiator_qpn != 0 && path_known)
 		install_sender_cnp_entry(initiator_qpn, responder_qpn, path);
+	if (initiator_qpn != 0 && path_known)
+		retire_legacy_qp1_mirror_entry(g_steer.legacy_qp1_wire_entry, path, "wire-ingress");
 }
 
 static void parse_qp1_clone(struct rte_mbuf *mbuf)
