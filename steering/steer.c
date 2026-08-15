@@ -60,6 +60,11 @@ DOCA_LOG_REGISTER(FLOW_STEER);
 /* Shared-resource IDs start at 1 on the DOCA 2 backend, while the resource
  * count is an exclusive upper bound and therefore includes unused slot 0. */
 #define LEGACY_SHARED_MIRRORS (ARP_MIRROR_ID + 1u)
+#if DOCA_VERSION_MAJOR < 3 && DOCA_VERSION_MINOR >= 9
+#define STEER_LEGACY_MATCH_ONLY_DIAG 1
+#else
+#define STEER_LEGACY_MATCH_ONLY_DIAG 0
+#endif
 #define IB_MGMT_CLASS_CM 0x07u
 #define IB_CM_ATTR_REQ 0x0010u
 #define IB_CM_ATTR_REP 0x0013u
@@ -933,7 +938,8 @@ static struct doca_flow_pipe *create_classify_pipe(struct doca_flow_port *port, 
 	 * action_idx argument. Preserve this known-good encoding exactly. */
 #if !STEER_USE_RANDOM_HASH_CLASSIFIER
 	match.parser_meta.random = UINT16_MAX;
-	match_mask.parser_meta.random = RTE_BE16(PATH_SHARE_BUCKETS - 1);
+	/* parser_meta.random is host-order metadata, not an on-wire field. */
+	match_mask.parser_meta.random = PATH_SHARE_BUCKETS - 1;
 	set0.outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;
 	set0.outer.ip4.dscp_ecn = PATH_DSCP_VAL(0);
 	set0_mask.outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;
@@ -969,8 +975,10 @@ static struct doca_flow_pipe *create_classify_pipe(struct doca_flow_port *port, 
 #if !STEER_USE_RANDOM_HASH_CLASSIFIER
 	err = doca_flow_pipe_cfg_set_match(cfg, &match, &match_mask);
 	crash_if_unsuccessful(err, "pipe_cfg_set_match (classify)");
+#if !STEER_LEGACY_MATCH_ONLY_DIAG
 	err = doca_flow_pipe_cfg_set_actions(cfg, actions_arr, actions_masks_arr, NULL, 2);
 	crash_if_unsuccessful(err, "pipe_cfg_set_actions (classify)");
+#endif
 #else
 	set_bucket.meta.u32[4] = UINT32_MAX;
 	err = doca_flow_pipe_cfg_set_hash_map_algorithm(
@@ -1008,10 +1016,10 @@ static void add_classify_entries(struct doca_flow_pipe *pipe, struct doca_flow_p
 
 		actions.outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;
 		actions.outer.ip4.dscp_ecn = PATH_DSCP_VAL(path);
-		match.parser_meta.random = RTE_BE16(idx);
+		match.parser_meta.random = idx;
 		err = steer_pipe_add_entry(0, pipe, &match,
 		                           path,
-		                           &actions,
+		                           STEER_LEGACY_MATCH_ONLY_DIAG ? NULL : &actions,
 		                           NULL,
 		                           NULL,
 		                           flags,
@@ -2108,12 +2116,10 @@ doca_error_t steer_start(const struct steer_opts *opts)
 	}
 
 	if (do_egress) {
-#if DOCA_VERSION_MAJOR < 3 && DOCA_VERSION_MINOR >= 9
-		DOCA_LOG_WARN("DOCA 2.9 diagnostic: QP1 cloning and classifier/rewrite disabled; "
-		              "EGRESS_ROCE_CHECK passthrough enabled");
-		sf_target = create_roce_check_pipe(g_steer.port, "EGRESS_ROCE_CHECK",
-		                                   deliver_wire, deliver_wire, false);
-#else
+#if STEER_LEGACY_MATCH_ONLY_DIAG
+		DOCA_LOG_WARN("DOCA 2.9 diagnostic: QP1 cloning and DSCP rewrite disabled; "
+		              "64-bucket BASIC random matching enabled");
+#endif
 		g_steer.grouping_enabled = true;
 		g_steer.cnp_count_pipe = create_cnp_count_pipe(g_steer.port, deliver_sf[0], wire_target);
 		wire_target = g_steer.cnp_count_pipe;
@@ -2163,7 +2169,6 @@ doca_error_t steer_start(const struct steer_opts *opts)
 			                                   g_steer.classify_pipe, egress_delivery_target,
 			                                   STEER_USE_RANDOM_HASH_CLASSIFIER);
 		}
-#endif
 	}
 
 	/* Sender/receiver pairing is consumed only by egress path grouping. */
