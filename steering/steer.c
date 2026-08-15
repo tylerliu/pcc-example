@@ -750,7 +750,7 @@ static struct doca_flow_pipe *create_legacy_small_random_table(
 	match_mask.parser_meta.random = random_mask;
 	err = doca_flow_pipe_cfg_create(&cfg, port);
 	crash_if_unsuccessful(err, "pipe_cfg_create (legacy random table)");
-	err = doca_flow_pipe_cfg_set_name(cfg, "EGRESS_RANDOM_PATH_2BIT");
+	err = doca_flow_pipe_cfg_set_name(cfg, "EGRESS_RANDOM_PATH_3BIT");
 	crash_if_unsuccessful(err, "pipe_cfg_set_name (legacy random table)");
 	err = doca_flow_pipe_cfg_set_type(cfg, DOCA_FLOW_PIPE_BASIC);
 	crash_if_unsuccessful(err, "pipe_cfg_set_type (legacy random table)");
@@ -2191,7 +2191,7 @@ doca_error_t steer_start(const struct steer_opts *opts)
 			create_path_rewrite_pipe(g_steer.port, 1, sf_target,
 			                         &g_steer.path_rewrite_entry[1]);
 		struct doca_flow_pipe *path_target[NB_PATHS] = {path0_rewrite, path1_rewrite};
-		sf_target = create_legacy_small_random_table(g_steer.port, path_target, 2);
+		sf_target = create_legacy_small_random_table(g_steer.port, path_target, 3);
 		g_steer.applied_path0_share = PATH_SHARE_BUCKETS / 2;
 #else
 		g_steer.grouping_enabled = true;
