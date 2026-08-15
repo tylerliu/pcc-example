@@ -106,15 +106,20 @@ static inline void steer_set_roce_udp_match(struct doca_flow_match *match,
                                              struct doca_flow_match *mask,
                                              doca_be16_t dst_port)
 {
-	match->outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;
 #if STEER_HAS_ROCE_MATCH
+	match->outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;
 	match->outer.l4_type_ext = DOCA_FLOW_L4_TYPE_EXT_ROCE_V2;
 	match->outer.roce_v2.udp.l4_port.dst_port = dst_port;
 	mask->outer.roce_v2.udp.l4_port.dst_port = UINT16_MAX;
 #else
+	/* DOCA 2.x selects IPv4/UDP through parser metadata. Keep UDP 4791
+	 * fixed in the template; marking it changeable with only a mask creates
+	 * an invalid protocol-only HWS item. */
+	match->parser_meta.outer_l3_type = DOCA_FLOW_L3_META_IPV4;
+	match->parser_meta.outer_l4_type = DOCA_FLOW_L4_META_UDP;
 	match->outer.l4_type_ext = DOCA_FLOW_L4_TYPE_EXT_UDP;
 	match->outer.udp.l4_port.dst_port = dst_port;
-	mask->outer.udp.l4_port.dst_port = UINT16_MAX;
+	(void)mask;
 #endif
 }
 

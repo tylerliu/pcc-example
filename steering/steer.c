@@ -908,7 +908,7 @@ static struct doca_flow_pipe *create_classify_dispatch_pipe(
 static struct doca_flow_pipe *create_classify_pipe(struct doca_flow_port *port, struct doca_flow_pipe *deliver_wire)
 {
 #if !STEER_USE_RANDOM_HASH_CLASSIFIER
-	struct doca_flow_match match_mask = {0};
+	struct doca_flow_match match = {0}, match_mask = {0};
 	struct doca_flow_actions set0 = {0}, set1 = {0};
 	struct doca_flow_actions set0_mask = {0}, set1_mask = {0};
 	struct doca_flow_actions *actions_arr[2] = {&set0, &set1};
@@ -929,6 +929,7 @@ static struct doca_flow_pipe *create_classify_pipe(struct doca_flow_port *port, 
 	/* DOCA 3.4 uses two fixed masked-write templates selected by the explicit
 	 * action_idx argument. Preserve this known-good encoding exactly. */
 #if !STEER_USE_RANDOM_HASH_CLASSIFIER
+	match.parser_meta.random = UINT16_MAX;
 	match_mask.parser_meta.random = RTE_BE16(PATH_SHARE_BUCKETS - 1);
 	set0.outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;
 	set0.outer.ip4.dscp_ecn = PATH_DSCP_VAL(0);
@@ -963,7 +964,7 @@ static struct doca_flow_pipe *create_classify_pipe(struct doca_flow_port *port, 
 	);
 	crash_if_unsuccessful(err, "pipe_cfg_set_nr_entries (classify)");
 #if !STEER_USE_RANDOM_HASH_CLASSIFIER
-	err = doca_flow_pipe_cfg_set_match(cfg, NULL, &match_mask);
+	err = doca_flow_pipe_cfg_set_match(cfg, &match, &match_mask);
 	crash_if_unsuccessful(err, "pipe_cfg_set_match (classify)");
 	err = doca_flow_pipe_cfg_set_actions(cfg, actions_arr, actions_masks_arr, NULL, 2);
 	crash_if_unsuccessful(err, "pipe_cfg_set_actions (classify)");
