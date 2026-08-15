@@ -54,8 +54,9 @@ DOCA_LOG_REGISTER(FLOW_STEER);
 #define QP1_CLONE_QUEUE 0u
 #define QP1_RX_BURST 32u
 #define QP1_RX_MAX_BURSTS 16u
-#define QP1_MIRROR_ID 1u
-#define ARP_MIRROR_ID 2u
+#define QP1_WIRE_MIRROR_ID 1u
+#define QP1_SF_MIRROR_ID 2u
+#define ARP_MIRROR_ID 3u
 /* Shared-resource IDs start at 1 on the DOCA 2 backend, while the resource
  * count is an exclusive upper bound and therefore includes unused slot 0. */
 #define LEGACY_SHARED_MIRRORS (ARP_MIRROR_ID + 1u)
@@ -1235,7 +1236,8 @@ static struct doca_flow_pipe *create_qp1_clone_check(struct doca_flow_port *port
 
 #if DOCA_VERSION_MAJOR < 3
 static void configure_legacy_mirror(struct doca_flow_port *port, uint32_t mirror_id,
-                                    const struct doca_flow_fwd *clone_fwd)
+                                    const struct doca_flow_fwd *clone_fwd,
+                                    const struct doca_flow_fwd *original_fwd)
 {
 	struct doca_flow_mirror_target target = {.fwd = *clone_fwd};
 	struct doca_flow_shared_resource_cfg cfg = {0};
@@ -1244,6 +1246,7 @@ static void configure_legacy_mirror(struct doca_flow_port *port, uint32_t mirror
 	cfg.domain = DOCA_FLOW_PIPE_DOMAIN_DEFAULT;
 	cfg.mirror_cfg.nr_targets = 1;
 	cfg.mirror_cfg.target = &target;
+	steer_mirror_set_original_fwd(&cfg, original_fwd);
 	err = steer_shared_resource_set_cfg(DOCA_FLOW_SHARED_RESOURCE_MIRROR, mirror_id, &cfg);
 	crash_if_unsuccessful(err, "doca_flow_shared_resource_set_cfg (mirror %u)", mirror_id);
 	err = doca_flow_shared_resources_bind(DOCA_FLOW_SHARED_RESOURCE_MIRROR, &mirror_id, 1, port);
@@ -1316,11 +1319,15 @@ static void install_qp1_clone_paths(struct doca_flow_port *port,
 	(void)deliver_sf;
 	(void)deliver_wire;
 	steer_fwd_set_rss(&clone_fwd, queues, 1, DOCA_FLOW_RSS_IPV4 | DOCA_FLOW_RSS_UDP);
-	configure_legacy_mirror(port, QP1_MIRROR_ID, &clone_fwd);
+	struct doca_flow_fwd wire_original = {.type = DOCA_FLOW_FWD_PIPE, .next_pipe = *wire_target};
+	struct doca_flow_fwd sf_original = {.type = DOCA_FLOW_FWD_PIPE, .next_pipe = *sf_target};
+
+	configure_legacy_mirror(port, QP1_WIRE_MIRROR_ID, &clone_fwd, &wire_original);
+	configure_legacy_mirror(port, QP1_SF_MIRROR_ID, &clone_fwd, &sf_original);
 	*wire_target = create_legacy_roce_mirror_pipe(port, "QP1_MIRROR_WIRE",
-	                                                *wire_target, QP1_MIRROR_ID);
+	                                                *wire_target, QP1_WIRE_MIRROR_ID);
 	*sf_target = create_legacy_roce_mirror_pipe(port, "QP1_MIRROR_SF",
-	                                              *sf_target, QP1_MIRROR_ID);
+	                                              *sf_target, QP1_SF_MIRROR_ID);
 	DOCA_LOG_WARN("DOCA 2.x QP1 observation mirrors all IPv4 UDP 4791 packets; "
 	              "software accepts only QP1 RDMA-CM packets");
 #endif
@@ -1428,7 +1435,7 @@ static void install_arp_paths(struct doca_flow_port *port, struct doca_flow_pipe
 	struct doca_flow_fwd path0_fwd = {.type = DOCA_FLOW_FWD_PORT, .port_id = SF_PORT_ID};
 	struct doca_flow_fwd wire_fwd = {.type = DOCA_FLOW_FWD_PORT, .port_id = WIRE_PORT_ID};
 
-	configure_legacy_mirror(port, ARP_MIRROR_ID, &clone_fwd);
+	configure_legacy_mirror(port, ARP_MIRROR_ID, &clone_fwd, &path0_fwd);
 	*wire_target = create_arp_check_pipe(port, "ARP_CHECK_WIRE", &path0_fwd,
 	                                     *wire_target, ARP_MIRROR_ID);
 	*sf_target = create_arp_check_pipe(port, "ARP_CHECK_SF", &wire_fwd,

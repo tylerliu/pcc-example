@@ -137,6 +137,23 @@ static inline struct doca_flow_match *steer_roce_udp_match_mask(
 #endif
 }
 
+#if DOCA_VERSION_MAJOR < 3
+/* DOCA 2.7 requires the mirror resource to carry the original-packet
+ * destination. DOCA 2.9 rejects that field and falls back to the pipe entry
+ * forwarding instead. */
+static inline void steer_mirror_set_original_fwd(
+	struct doca_flow_shared_resource_cfg *cfg,
+	const struct doca_flow_fwd *original_fwd)
+{
+#if DOCA_VERSION_MINOR < 9
+	cfg->mirror_cfg.fwd = *original_fwd;
+#else
+	(void)cfg;
+	(void)original_fwd;
+#endif
+}
+#endif
+
 struct steer_resource_query {
 	uint64_t total_bytes;
 	uint64_t total_pkts;
