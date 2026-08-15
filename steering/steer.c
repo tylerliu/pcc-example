@@ -730,6 +730,60 @@ static struct doca_flow_pipe *create_random_sample_pipe(struct doca_flow_port *p
 	return pipe;
 }
 
+#if DOCA_VERSION_MAJOR < 3
+/* Small DOCA 2.x action-free random table; rewrites remain in separate pipes. */
+static struct doca_flow_pipe *create_legacy_small_random_table(
+	struct doca_flow_port *port, struct doca_flow_pipe *path_target[NB_PATHS],
+	uint8_t random_bits)
+{
+	const uint32_t nr_entries = 1u << random_bits;
+	const uint16_t random_mask = (uint16_t)(nr_entries - 1);
+	struct doca_flow_match match = {0}, match_mask = {0};
+	struct doca_flow_fwd fwd = {.type = DOCA_FLOW_FWD_CHANGEABLE};
+	struct doca_flow_fwd fwd_miss = {.type = DOCA_FLOW_FWD_PIPE, .next_pipe = path_target[1]};
+	struct doca_flow_pipe_cfg *cfg;
+	struct doca_flow_pipe *pipe;
+	struct entry_batch_status status = {0};
+	doca_error_t err;
+
+	match.parser_meta.random = UINT16_MAX;
+	match_mask.parser_meta.random = random_mask;
+	err = doca_flow_pipe_cfg_create(&cfg, port);
+	crash_if_unsuccessful(err, "pipe_cfg_create (legacy random table)");
+	err = doca_flow_pipe_cfg_set_name(cfg, "EGRESS_RANDOM_PATH_2BIT");
+	crash_if_unsuccessful(err, "pipe_cfg_set_name (legacy random table)");
+	err = doca_flow_pipe_cfg_set_type(cfg, DOCA_FLOW_PIPE_BASIC);
+	crash_if_unsuccessful(err, "pipe_cfg_set_type (legacy random table)");
+	err = doca_flow_pipe_cfg_set_domain(cfg, DOCA_FLOW_PIPE_DOMAIN_DEFAULT);
+	crash_if_unsuccessful(err, "pipe_cfg_set_domain (legacy random table)");
+	err = doca_flow_pipe_cfg_set_is_root(cfg, false);
+	crash_if_unsuccessful(err, "pipe_cfg_set_is_root (legacy random table)");
+	err = doca_flow_pipe_cfg_set_nr_entries(cfg, nr_entries);
+	crash_if_unsuccessful(err, "pipe_cfg_set_nr_entries (legacy random table)");
+	err = doca_flow_pipe_cfg_set_match(cfg, &match, &match_mask);
+	crash_if_unsuccessful(err, "pipe_cfg_set_match (legacy random table)");
+	err = doca_flow_pipe_create(cfg, &fwd, &fwd_miss, &pipe);
+	crash_if_unsuccessful(err, "pipe_create (legacy random table)");
+	doca_flow_pipe_cfg_destroy(cfg);
+
+	for (uint32_t bucket = 0; bucket < nr_entries; bucket++) {
+		struct doca_flow_match entry_match = {0};
+		struct doca_flow_fwd entry_fwd = {.type = DOCA_FLOW_FWD_PIPE,
+			.next_pipe = path_target[bucket < nr_entries / 2 ? 0 : 1]};
+		struct doca_flow_pipe_entry *entry;
+
+		entry_match.parser_meta.random = (uint16_t)bucket;
+		err = steer_pipe_add_entry(0, pipe, &entry_match, 0, NULL, NULL, &entry_fwd,
+			bucket + 1 < nr_entries ? STEER_WAIT_FOR_BATCH : 0, &status, &entry);
+		crash_if_unsuccessful(err, "pipe_add_entry (legacy random bucket %u)", bucket);
+	}
+	process_entries(port, &status, nr_entries, "legacy random table entries");
+	DOCA_LOG_INFO("Legacy random path table ready: %u bits, %u entries, initial ratio 50:50",
+		random_bits, nr_entries);
+	return pipe;
+}
+#endif
+
 /*
  * INGRESS_PATH_DEMUX (non-root): classify looped-back wire ingress by the DSCP
  * path bit (written at egress) into two independent path-specific destination-IP markers.
@@ -2136,8 +2190,8 @@ doca_error_t steer_start(const struct steer_opts *opts)
 		struct doca_flow_pipe *path1_rewrite =
 			create_path_rewrite_pipe(g_steer.port, 1, sf_target,
 			                         &g_steer.path_rewrite_entry[1]);
-		sf_target = create_random_sample_pipe(g_steer.port, "EGRESS_RANDOM_PATH",
-		                                      path0_rewrite, path1_rewrite, 1);
+		struct doca_flow_pipe *path_target[NB_PATHS] = {path0_rewrite, path1_rewrite};
+		sf_target = create_legacy_small_random_table(g_steer.port, path_target, 2);
 		g_steer.applied_path0_share = PATH_SHARE_BUCKETS / 2;
 #else
 		g_steer.grouping_enabled = true;
