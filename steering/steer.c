@@ -60,10 +60,10 @@ DOCA_LOG_REGISTER(FLOW_STEER);
 /* Shared-resource IDs start at 1 on the DOCA 2 backend, while the resource
  * count is an exclusive upper bound and therefore includes unused slot 0. */
 #define LEGACY_SHARED_MIRRORS (ARP_MIRROR_ID + 1u)
-#if DOCA_VERSION_MAJOR < 3 && DOCA_VERSION_MINOR >= 9
-#define STEER_LEGACY_MATCH_ONLY_DIAG 1
+#if DOCA_VERSION_MAJOR < 3
+#define STEER_LEGACY_SINGLE_RANDOM 1
 #else
-#define STEER_LEGACY_MATCH_ONLY_DIAG 0
+#define STEER_LEGACY_SINGLE_RANDOM 0
 #endif
 #define IB_MGMT_CLASS_CM 0x07u
 #define IB_CM_ATTR_REQ 0x0010u
@@ -698,7 +698,7 @@ static struct doca_flow_pipe *create_random_sample_pipe(struct doca_flow_port *p
 
 	/* The 3.x classifier consumes random bit 0. The DOCA 2.9 backend uses
 	 * this sampler as the classifier itself, so it may use the low bit. */
-#if !STEER_LEGACY_MATCH_ONLY_DIAG
+#if !STEER_LEGACY_SINGLE_RANDOM
 	random_mask = (uint16_t)(random_mask << 1);
 #endif
 	match.parser_meta.random = 0;
@@ -798,11 +798,13 @@ static struct doca_flow_pipe *create_path_demux_pipe(struct doca_flow_port *port
  * one fixed full-byte action and one entry. EGRESS_CLASSIFY is action-free and
  * chooses between the two pipes with a changeable per-bucket forward. */
 static struct doca_flow_pipe *create_path_rewrite_pipe(struct doca_flow_port *port, uint8_t path,
-						       struct doca_flow_pipe *next_pipe)
+						       struct doca_flow_pipe *next_pipe,
+						       struct doca_flow_pipe_entry **entry_out)
 {
 	struct doca_flow_match match = {0}, match_mask = {0};
 	struct doca_flow_actions actions = {0};
 	struct doca_flow_actions *actions_arr[1] = {&actions};
+	struct doca_flow_monitor monitor = {.counter_type = DOCA_FLOW_RESOURCE_TYPE_NON_SHARED};
 	struct doca_flow_fwd fwd = {.type = DOCA_FLOW_FWD_PIPE, .next_pipe = next_pipe};
 	struct doca_flow_pipe_cfg *cfg;
 	struct doca_flow_pipe *pipe;
@@ -834,6 +836,8 @@ static struct doca_flow_pipe *create_path_rewrite_pipe(struct doca_flow_port *po
 	                      "pipe_cfg_set_match (%s)", name);
 	crash_if_unsuccessful(doca_flow_pipe_cfg_set_actions(cfg, actions_arr, NULL, NULL, 1),
 	                      "pipe_cfg_set_actions (%s)", name);
+	crash_if_unsuccessful(doca_flow_pipe_cfg_set_monitor(cfg, &monitor),
+	                      "pipe_cfg_set_monitor (%s)", name);
 	err = doca_flow_pipe_create(cfg, &fwd, NULL, &pipe);
 	crash_if_unsuccessful(err, "pipe_create (%s)", name);
 	doca_flow_pipe_cfg_destroy(cfg);
@@ -842,8 +846,8 @@ static struct doca_flow_pipe *create_path_rewrite_pipe(struct doca_flow_port *po
 	struct doca_flow_actions entry_actions = {0};
 	entry_actions.outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;
 	entry_actions.outer.ip4.dscp_ecn = PATH_DSCP_VAL(path) | IP4_ECN_ECT0;
-	err = steer_pipe_add_entry(0, pipe, &entry_match, 0, &entry_actions, NULL, NULL, 0,
-	                           &status, &entry);
+	err = steer_pipe_add_entry(0, pipe, &entry_match, 0, &entry_actions, &monitor, NULL, 0,
+	                           &status, entry_out != NULL ? entry_out : &entry);
 	crash_if_unsuccessful(err, "pipe_add_entry (%s)", name);
 	process_entries(port, &status, 1, name);
 	DOCA_LOG_INFO("%s ready: fixed dscp_ecn=0x%02x", name,
@@ -976,7 +980,7 @@ static struct doca_flow_pipe *create_classify_pipe(struct doca_flow_port *port, 
 #if !STEER_USE_RANDOM_HASH_CLASSIFIER
 	err = doca_flow_pipe_cfg_set_match(cfg, &match, &match_mask);
 	crash_if_unsuccessful(err, "pipe_cfg_set_match (classify)");
-#if !STEER_LEGACY_MATCH_ONLY_DIAG
+#if !STEER_LEGACY_SINGLE_RANDOM
 	err = doca_flow_pipe_cfg_set_actions(cfg, actions_arr, actions_masks_arr, NULL, 2);
 	crash_if_unsuccessful(err, "pipe_cfg_set_actions (classify)");
 #endif
@@ -1020,7 +1024,7 @@ static void add_classify_entries(struct doca_flow_pipe *pipe, struct doca_flow_p
 		match.parser_meta.random = idx;
 		err = steer_pipe_add_entry(0, pipe, &match,
 		                           path,
-		                           STEER_LEGACY_MATCH_ONLY_DIAG ? NULL : &actions,
+		                           STEER_LEGACY_SINGLE_RANDOM ? NULL : &actions,
 		                           NULL,
 		                           NULL,
 		                           flags,
@@ -1861,6 +1865,7 @@ struct steer_state {
 	struct doca_flow_pipe *classify_pipe;
 	struct doca_flow_pipe *classify_dispatch_pipe;
 	struct doca_flow_pipe *classify_target[NB_PATHS];
+	struct doca_flow_pipe_entry *path_rewrite_entry[NB_PATHS];
 	struct doca_flow_pipe *cnp_count_pipe;
 	bool grouping_enabled;
 	struct doca_flow_pipe_entry *classify_entry[PATH_SHARE_BUCKETS];
@@ -2117,15 +2122,23 @@ doca_error_t steer_start(const struct steer_opts *opts)
 	}
 
 	if (do_egress) {
-#if STEER_LEGACY_MATCH_ONLY_DIAG
+#if STEER_LEGACY_SINGLE_RANDOM
+#if DOCA_VERSION_MINOR < 9
+		DOCA_LOG_WARN("DOCA 2.7 staged restore: QP1 cloning enabled; "
+		              "tutorial-style 50/50 random path rewrite enabled");
+#else
 		DOCA_LOG_WARN("DOCA 2.9 staged restore: QP1 cloning disabled; "
 		              "tutorial-style 50/50 random path rewrite enabled");
+#endif
 		struct doca_flow_pipe *path0_rewrite =
-			create_path_rewrite_pipe(g_steer.port, 0, deliver_wire);
+			create_path_rewrite_pipe(g_steer.port, 0, sf_target,
+			                         &g_steer.path_rewrite_entry[0]);
 		struct doca_flow_pipe *path1_rewrite =
-			create_path_rewrite_pipe(g_steer.port, 1, deliver_wire);
+			create_path_rewrite_pipe(g_steer.port, 1, sf_target,
+			                         &g_steer.path_rewrite_entry[1]);
 		sf_target = create_random_sample_pipe(g_steer.port, "EGRESS_RANDOM_PATH",
 		                                      path0_rewrite, path1_rewrite, 1);
+		g_steer.applied_path0_share = PATH_SHARE_BUCKETS / 2;
 #else
 		g_steer.grouping_enabled = true;
 		g_steer.cnp_count_pipe = create_cnp_count_pipe(g_steer.port, deliver_sf[0], wire_target);
@@ -2135,7 +2148,8 @@ doca_error_t steer_start(const struct steer_opts *opts)
 #if STEER_USE_RANDOM_HASH_CLASSIFIER
 		for (uint8_t path = 0; path < NB_PATHS; path++)
 			g_steer.classify_target[path] =
-				create_path_rewrite_pipe(g_steer.port, path, egress_delivery_target);
+				create_path_rewrite_pipe(g_steer.port, path, egress_delivery_target,
+			                         &g_steer.path_rewrite_entry[path]);
 #else
 		g_steer.classify_target[0] = classify_target;
 		g_steer.classify_target[1] = classify_target;
@@ -2579,6 +2593,16 @@ void steer_poll(void)
 	}
 
 	struct steer_resource_query q;
+	if (g_steer.path_rewrite_entry[0] != NULL || g_steer.path_rewrite_entry[1] != NULL) {
+		uint64_t assigned[NB_PATHS] = {0};
+		for (uint8_t path = 0; path < NB_PATHS; path++)
+			if (g_steer.path_rewrite_entry[path] != NULL &&
+			    steer_query_entry(g_steer.path_rewrite_entry[path], &q) == DOCA_SUCCESS)
+				assigned[path] = q.total_pkts;
+		DOCA_LOG_INFO("egress assigned counters: path0=%lu path1=%lu ratio=%u:%u buckets",
+		              assigned[0], assigned[1], g_steer.applied_path0_share,
+		              PATH_SHARE_BUCKETS - g_steer.applied_path0_share);
+	}
 	if (g_steer.cnp_count_pipe != NULL) {
 		uint64_t cnp_by_path[NB_PATHS] = {0};
 		for (uint32_t i = 0; i < g_steer.cnp_entry_count; i++) {
