@@ -2117,9 +2117,11 @@ doca_error_t steer_start(const struct steer_opts *opts)
 
 	if (do_egress) {
 #if STEER_LEGACY_MATCH_ONLY_DIAG
-		DOCA_LOG_WARN("DOCA 2.9 diagnostic: QP1 cloning and DSCP rewrite disabled; "
-		              "64-bucket BASIC random matching enabled");
-#endif
+		DOCA_LOG_WARN("DOCA 2.9 diagnostic: QP1 cloning and classifier/rewrite disabled; "
+		              "tutorial-style one-entry random hit/miss enabled");
+		sf_target = create_random_sample_pipe(g_steer.port, "EGRESS_RANDOM_DIAG",
+		                                      deliver_wire, deliver_wire, 1);
+#else
 		g_steer.grouping_enabled = true;
 		g_steer.cnp_count_pipe = create_cnp_count_pipe(g_steer.port, deliver_sf[0], wire_target);
 		wire_target = g_steer.cnp_count_pipe;
@@ -2169,6 +2171,7 @@ doca_error_t steer_start(const struct steer_opts *opts)
 			                                   g_steer.classify_pipe, egress_delivery_target,
 			                                   STEER_USE_RANDOM_HASH_CLASSIFIER);
 		}
+#endif
 	}
 
 	/* Sender/receiver pairing is consumed only by egress path grouping. */
