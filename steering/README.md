@@ -153,13 +153,13 @@ version-specific backends:
   64-entry BASIC pipe. Live updates supply the full rewrite action as required
   by the 2.x entry-update API. The 3.x native RANDOM HASH plus metadata-dispatch
   implementation remains unchanged.
-- QP1 observation uses shared mirror resource 0 and one DPDK RX queue. The
+- QP1 observation uses shared mirror resource 1 and one DPDK RX queue. The
   public 2.x Flow API cannot match BTH destination QPN, so the first-pass
   backend mirrors all IPv4 UDP/4791 packets and rejects non-QP1 packets in the
   software parser. This is functionally correct but may be expensive at line
   rate; hardware validation should measure RX clone load before considering a
   direct `rte_flow` IB-BTH rule.
-- Receiver ARP fan-out uses shared mirror resource 1 to deliver wire ARP to
+- Receiver ARP fan-out uses shared mirror resource 2 to deliver wire ARP to
   both SFs.
 - Exact hardware CNP counters are disabled because the same public BTH matcher
   is unavailable. PCC-side CNP statistics remain available.

@@ -54,9 +54,11 @@ DOCA_LOG_REGISTER(FLOW_STEER);
 #define QP1_CLONE_QUEUE 0u
 #define QP1_RX_BURST 32u
 #define QP1_RX_MAX_BURSTS 16u
-#define QP1_MIRROR_ID 0u
-#define ARP_MIRROR_ID 1u
-#define LEGACY_SHARED_MIRRORS 2u
+#define QP1_MIRROR_ID 1u
+#define ARP_MIRROR_ID 2u
+/* Shared-resource IDs start at 1 on the DOCA 2 backend, while the resource
+ * count is an exclusive upper bound and therefore includes unused slot 0. */
+#define LEGACY_SHARED_MIRRORS (ARP_MIRROR_ID + 1u)
 #define IB_MGMT_CLASS_CM 0x07u
 #define IB_CM_ATTR_REQ 0x0010u
 #define IB_CM_ATTR_REP 0x0013u
