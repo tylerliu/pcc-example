@@ -74,12 +74,16 @@ static void sigint_handler(int dummy)
  * on the receiver's PF. EAL is initialized with a minimal argv; the device and
  * SF representor are opened by DOCA argp (-a/-r) and passed in via cfg.
  */
-static doca_error_t start_embedded_steering(char *prog_name, const struct pcc_config *cfg)
+static doca_error_t start_embedded_steering(char *prog_name, const struct pcc_config *cfg,
+                                                   struct doca_dev *pcc_dev)
 {
 	struct steer_opts sopts;
 	doca_error_t result;
 
-	(void)prog_name; /* used only on the DOCA 2.9 EAL-init path below */
+	(void)prog_name; /* used only on the DOCA 2.x EAL-init path below */
+#if DOCA_VERSION_MAJOR >= 3
+	(void)pcc_dev;
+#endif
 	steer_default_opts(&sopts);
 	sopts.role = STEER_ROLE_EGRESS;
 	sopts.sf_num = cfg->steer_sf_num;
@@ -98,6 +102,8 @@ static doca_error_t start_embedded_steering(char *prog_name, const struct pcc_co
 	}
 	/* EAL was already initialized in main() (before argp opened the -r device). */
 #else
+	sopts.dev = pcc_dev;
+	memcpy(sopts.device_pci_addr, cfg->steer_pci_addr, sizeof(sopts.device_pci_addr));
 	char *eal_argv[1] = {prog_name};
 
 	result = steer_eal_init(1, eal_argv, steer_eal_prefix_for_role(sopts.role));
@@ -126,7 +132,9 @@ int main(int argc, char **argv)
 	doca_pcc_process_state_t process_status;
 	doca_error_t result, tmp_result;
 	int exit_status = EXIT_FAILURE;
+#if DOCA_VERSION_MAJOR > 2 || (DOCA_VERSION_MAJOR == 2 && DOCA_VERSION_MINOR >= 8)
 	bool enable_debug = false;
+#endif
 	struct doca_log_backend *sdk_log;
 
 	/* Set the default configuration values (Example values) */
@@ -230,7 +238,7 @@ int main(int argc, char **argv)
 	}
 
 	if (cfg.steer_enable) {
-		result = start_embedded_steering(argv[0], &cfg);
+		result = start_embedded_steering(argv[0], &cfg, resources.doca_device);
 		if (result != DOCA_SUCCESS)
 			goto destroy_pcc;
 		PRINT_INFO("Info: Embedded DOCA Flow egress steering active\n");
@@ -239,6 +247,7 @@ int main(int argc, char **argv)
 	host_stop = false;
 	PRINT_INFO("Info: Press ctrl + C to exit\n");
 	while (!host_stop) {
+#if DOCA_VERSION_MAJOR > 2 || (DOCA_VERSION_MAJOR == 2 && DOCA_VERSION_MINOR >= 8)
 		if (got_debug_sig) {
 			if (enable_debug == false) {
 				enable_debug = true;
@@ -254,6 +263,9 @@ int main(int argc, char **argv)
 			}
 			got_debug_sig = 0;
 		}
+#else
+		got_debug_sig = 0;
+#endif
 		result = doca_pcc_get_process_state(resources.doca_pcc, &process_status);
 		if (result != DOCA_SUCCESS) {
 			PRINT_ERROR("Error: Failed to query PCC\n");
@@ -267,6 +279,10 @@ int main(int argc, char **argv)
 
 		if (cfg.steer_enable) {
 			/* Drive the embedded steering decision + counters ~1/s. */
+			tmp_result = pcc_poll_rate_reports(&resources);
+			if (tmp_result != DOCA_SUCCESS)
+				PRINT_WARNING("Warning: failed to poll PCC rate reports: %s\n",
+				              doca_error_get_descr(tmp_result));
 			steer_poll();
 			sleep(1);
 		} else {

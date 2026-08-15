@@ -21,6 +21,7 @@
 #include <rte_ip.h>
 #include <rte_mbuf.h>
 #include <rte_udp.h>
+#include <errno.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -53,6 +54,9 @@ DOCA_LOG_REGISTER(FLOW_STEER);
 #define QP1_CLONE_QUEUE 0u
 #define QP1_RX_BURST 32u
 #define QP1_RX_MAX_BURSTS 16u
+#define QP1_MIRROR_ID 0u
+#define ARP_MIRROR_ID 1u
+#define LEGACY_SHARED_MIRRORS 2u
 #define IB_MGMT_CLASS_CM 0x07u
 #define IB_CM_ATTR_REQ 0x0010u
 #define IB_CM_ATTR_REP 0x0013u
@@ -201,7 +205,6 @@ doca_error_t steer_eal_init(int argc, char **argv, const char *file_prefix)
 	return DOCA_SUCCESS;
 }
 
-static uint32_t g_sf_num; /* used only on the DOCA 2.9 discovery path */
 static uint16_t g_dpdk_rx_port_id = UINT16_MAX;
 
 #if DOCA_VERSION_MAJOR >= 3
@@ -222,33 +225,53 @@ static void probe_device(struct doca_dev *dev, const char *devargs, struct doca_
 	crash_if_unsuccessful(err, "doca_dpdk_port_probe_with_representors");
 }
 
-#else /* DOCA 2.9 */
+#else /* DOCA 2.x */
 
-/* Open the Nth DOCA device and probe it into DPDK with caller-supplied args. */
-static struct doca_dev *open_and_probe_dev(uint32_t index, const char *probe_args)
+/* Open the PF selected by -r and probe its requested SF representors into DPDK. */
+static struct doca_dev *open_and_probe_dev(const char *device_pci_addr, const char *probe_args)
 {
 	struct doca_devinfo **devinfo_list;
 	uint32_t nb_devs;
-	struct doca_dev *dev;
+	struct doca_dev *dev = NULL;
 	doca_error_t err;
 
 	err = doca_devinfo_create_list(&devinfo_list, &nb_devs);
 	crash_if_unsuccessful(err, "doca_devinfo_create_list");
+	for (uint32_t i = 0; i < nb_devs; i++) {
+		uint8_t is_equal = 0;
 
-	if (index >= nb_devs) {
-		DOCA_LOG_CRIT("Device index %u out of range (%u devices found)", index, nb_devs);
+		if (doca_devinfo_is_equal_pci_addr(devinfo_list[i], device_pci_addr, &is_equal) != DOCA_SUCCESS ||
+		    !is_equal)
+			continue;
+		err = doca_dev_open(devinfo_list[i], &dev);
+		crash_if_unsuccessful(err, "doca_dev_open (%s)", device_pci_addr);
+		break;
+	}
+	doca_devinfo_destroy_list(devinfo_list);
+	if (dev == NULL) {
+		DOCA_LOG_CRIT("PCI device %s not found", device_pci_addr);
 		exit(EXIT_FAILURE);
 	}
 
-	err = doca_dev_open(devinfo_list[index], &dev);
-	crash_if_unsuccessful(err, "doca_dev_open");
-
-	doca_devinfo_destroy_list(devinfo_list);
-
 	err = doca_dpdk_port_probe(dev, probe_args);
-	crash_if_unsuccessful(err, "doca_dpdk_port_probe (index=%u)", index);
-
+	crash_if_unsuccessful(err, "doca_dpdk_port_probe (%s)", device_pci_addr);
 	return dev;
+}
+
+static void probe_open_dev(struct doca_dev *dev, const char *device_pci_addr, const char *probe_args)
+{
+	uint8_t is_equal = 0;
+	doca_error_t err = doca_devinfo_is_equal_pci_addr(doca_dev_as_devinfo(dev),
+	                                                   device_pci_addr, &is_equal);
+
+	crash_if_unsuccessful(err, "compare PCC device PCI address");
+	if (!is_equal) {
+		DOCA_LOG_CRIT("-r PF %s does not match the PCC --device", device_pci_addr);
+		exit(EXIT_FAILURE);
+	}
+	err = doca_dpdk_port_probe(dev, probe_args);
+
+	crash_if_unsuccessful(err, "doca_dpdk_port_probe (supplied PCC device)");
 }
 
 #endif
@@ -360,6 +383,11 @@ static void initialize_doca_flow(void)
 
 	err = doca_flow_cfg_set_nr_counters(cfg, NB_COUNTERS);
 	crash_if_unsuccessful(err, "doca_flow_cfg_set_nr_counters");
+#if DOCA_VERSION_MAJOR < 3
+	err = doca_flow_cfg_set_nr_shared_resource(cfg, LEGACY_SHARED_MIRRORS,
+	                                           DOCA_FLOW_SHARED_RESOURCE_MIRROR);
+	crash_if_unsuccessful(err, "doca_flow_cfg_set_nr_shared_resource (mirror)");
+#endif
 #endif
 
 	err = doca_flow_cfg_set_cb_entry_process(cfg, entry_process_cb);
@@ -413,27 +441,29 @@ static struct doca_flow_port *port_start(struct doca_dev *dev, uint16_t flow_por
 
 #if DOCA_VERSION_MAJOR < 3
 /* Find the DPDK port id of the SF representor (2.9: probed via "representor=sfN"). */
-static uint16_t find_sf_representor_port_id(void)
+static uint32_t find_sf_representor_port_ids(uint16_t ids[NB_PATHS], uint32_t needed)
 {
 	uint16_t port_id;
-	uint16_t nb_ports = 0;
+	uint32_t found = 0;
 
 	RTE_ETH_FOREACH_DEV(port_id)
 	{
 		struct rte_eth_dev_info dev_info = {0};
 
-		nb_ports++;
 		if (rte_eth_dev_info_get(port_id, &dev_info) < 0)
 			continue;
 		if (dev_info.dev_flags != NULL && (*dev_info.dev_flags & RTE_ETH_DEV_REPRESENTOR) != 0) {
-			DOCA_LOG_INFO("SF representor found on DPDK port %u", port_id);
-			return port_id;
+			if (found < needed)
+				ids[found] = port_id;
+			DOCA_LOG_INFO("SF representor %u found on DPDK port %u", found, port_id);
+			found++;
 		}
 	}
-
-	DOCA_LOG_CRIT("No SF representor ethdev found (%u DPDK port(s) probed).", nb_ports);
-	DOCA_LOG_CRIT("Probed 'representor=sf%u'; run 'sudo mlnx-sf -a show' and pass --sf-num <N>.", g_sf_num);
-	exit(EXIT_FAILURE);
+	if (found < needed) {
+		DOCA_LOG_CRIT("Expected %u SF representors, found %u", needed, found);
+		exit(EXIT_FAILURE);
+	}
+	return found;
 }
 #endif
 
@@ -1004,18 +1034,19 @@ static struct doca_flow_pipe *create_roce_check_pipe(struct doca_flow_port *port
 	doca_error_t err;
 
 	if (roce_target_is_random_hash) {
+#if STEER_HAS_HASH_FWD
 		fwd.type = DOCA_FLOW_FWD_HASH_PIPE;
 		fwd.hash_pipe.pipe = roce_target;
 		fwd.hash_pipe.algorithm = DOCA_FLOW_PIPE_HASH_MAP_ALGORITHM_RANDOM;
+#else
+		crash_if_unsuccessful(DOCA_ERROR_NOT_SUPPORTED, "random HASH forward on DOCA 2.x");
+#endif
 	} else {
 		fwd.type = DOCA_FLOW_FWD_PIPE;
 		fwd.next_pipe = roce_target;
 	}
 
-	match.outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;
-	match.outer.l4_type_ext = DOCA_FLOW_L4_TYPE_EXT_ROCE_V2;
-	match.outer.roce_v2.udp.l4_port.dst_port = RTE_BE16(ROCE_UDP_PORT_NATIVE);
-	match_mask.outer.roce_v2.udp.l4_port.dst_port = RTE_BE16(0xFFFF);
+	steer_set_roce_udp_match(&match, &match_mask, RTE_BE16(ROCE_UDP_PORT_NATIVE));
 
 	err = doca_flow_pipe_cfg_create(&cfg, port);
 	crash_if_unsuccessful(err, "pipe_cfg_create (RoCE check)");
@@ -1046,6 +1077,7 @@ static struct doca_flow_pipe *create_roce_check_pipe(struct doca_flow_port *port
 	return pipe;
 }
 
+#if DOCA_VERSION_MAJOR >= 3
 /* Shared terminal software target for QP1 clones from both directions. */
 static struct doca_flow_pipe *create_qp1_rss_pipe(struct doca_flow_port *port, const char *name,
 						  uint16_t queue)
@@ -1062,11 +1094,7 @@ static struct doca_flow_pipe *create_qp1_rss_pipe(struct doca_flow_port *port, c
 	match.outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;
 	match.outer.ip4.dscp_ecn = 0xFF;
 	match_mask.outer.ip4.dscp_ecn = 0;
-	fwd.type = DOCA_FLOW_FWD_RSS;
-	fwd.rss_type = DOCA_FLOW_RESOURCE_TYPE_NON_SHARED;
-	fwd.rss.queues_array = queues;
-	fwd.rss.nr_queues = 1;
-	fwd.rss.inner_flags = DOCA_FLOW_RSS_IPV4 | DOCA_FLOW_RSS_UDP;
+	steer_fwd_set_rss(&fwd, queues, 1, DOCA_FLOW_RSS_IPV4 | DOCA_FLOW_RSS_UDP);
 
 	err = doca_flow_pipe_cfg_create(&cfg, port);
 	crash_if_unsuccessful(err, "pipe_cfg_create (%s)", name);
@@ -1171,16 +1199,71 @@ static struct doca_flow_pipe *create_qp1_clone_check(struct doca_flow_port *port
 	return pipe;
 }
 
+#endif /* DOCA_VERSION_MAJOR >= 3 */
+
+#if DOCA_VERSION_MAJOR < 3
+static void configure_legacy_mirror(struct doca_flow_port *port, uint32_t mirror_id,
+                                    const struct doca_flow_fwd *clone_fwd)
+{
+	struct doca_flow_mirror_target target = {.fwd = *clone_fwd};
+	struct doca_flow_shared_resource_cfg cfg = {0};
+	doca_error_t err;
+
+	cfg.domain = DOCA_FLOW_PIPE_DOMAIN_DEFAULT;
+	cfg.mirror_cfg.nr_targets = 1;
+	cfg.mirror_cfg.target = &target;
+	err = steer_shared_resource_set_cfg(DOCA_FLOW_SHARED_RESOURCE_MIRROR, mirror_id, &cfg);
+	crash_if_unsuccessful(err, "doca_flow_shared_resource_set_cfg (mirror %u)", mirror_id);
+	err = doca_flow_shared_resources_bind(DOCA_FLOW_SHARED_RESOURCE_MIRROR, &mirror_id, 1, port);
+	crash_if_unsuccessful(err, "doca_flow_shared_resources_bind (mirror %u)", mirror_id);
+}
+
+static struct doca_flow_pipe *create_legacy_roce_mirror_pipe(
+	struct doca_flow_port *port, const char *name, struct doca_flow_pipe *normal_target,
+	uint32_t mirror_id)
+{
+	struct doca_flow_match match = {0}, match_mask = {0}, entry_match = {0};
+	struct doca_flow_monitor monitor = {.shared_mirror_id = mirror_id};
+	struct doca_flow_monitor entry_monitor = {0};
+	struct doca_flow_fwd fwd = {.type = DOCA_FLOW_FWD_PIPE, .next_pipe = normal_target};
+	struct doca_flow_pipe_cfg *cfg;
+	struct doca_flow_pipe *pipe;
+	struct doca_flow_pipe_entry *entry;
+	struct entry_batch_status status = {0};
+	doca_error_t err;
+
+	steer_set_roce_udp_match(&match, &match_mask, RTE_BE16(ROCE_UDP_PORT_NATIVE));
+	err = doca_flow_pipe_cfg_create(&cfg, port);
+	crash_if_unsuccessful(err, "pipe_cfg_create (%s)", name);
+	crash_if_unsuccessful(doca_flow_pipe_cfg_set_name(cfg, name), "pipe_cfg_set_name (%s)", name);
+	crash_if_unsuccessful(doca_flow_pipe_cfg_set_type(cfg, DOCA_FLOW_PIPE_BASIC), "pipe_cfg_set_type (%s)", name);
+	crash_if_unsuccessful(doca_flow_pipe_cfg_set_domain(cfg, DOCA_FLOW_PIPE_DOMAIN_DEFAULT), "pipe_cfg_set_domain (%s)", name);
+	crash_if_unsuccessful(doca_flow_pipe_cfg_set_is_root(cfg, false), "pipe_cfg_set_is_root (%s)", name);
+	crash_if_unsuccessful(doca_flow_pipe_cfg_set_nr_entries(cfg, 1), "pipe_cfg_set_nr_entries (%s)", name);
+	crash_if_unsuccessful(doca_flow_pipe_cfg_set_match(cfg, &match, &match_mask), "pipe_cfg_set_match (%s)", name);
+	crash_if_unsuccessful(doca_flow_pipe_cfg_set_monitor(cfg, &monitor), "pipe_cfg_set_monitor (%s)", name);
+	err = doca_flow_pipe_create(cfg, &fwd, &fwd, &pipe);
+	crash_if_unsuccessful(err, "pipe_create (%s)", name);
+	doca_flow_pipe_cfg_destroy(cfg);
+	err = steer_pipe_add_entry(0, pipe, &entry_match, 0, NULL, &entry_monitor, NULL, 0,
+	                           &status, &entry);
+	crash_if_unsuccessful(err, "pipe_add_entry (%s)", name);
+	process_entries(port, &status, 1, name);
+	return pipe;
+}
+#endif
+
 /* Install QP1 observation as one self-contained facility. Keep all cloning
  * mechanics behind this boundary: DOCA 3.x uses flooding hash pipes, while the
  * DOCA 2.9 backend can replace this body with shared mirror resources without
  * changing steer_start() or the ordinary ingress/egress pipelines. */
 static void install_qp1_clone_paths(struct doca_flow_port *port,
-				    struct doca_flow_pipe *deliver_sf,
-				    struct doca_flow_pipe *deliver_wire,
-				    struct doca_flow_pipe **wire_target,
-				    struct doca_flow_pipe **sf_target)
+                                    struct doca_flow_pipe *deliver_sf,
+                                    struct doca_flow_pipe *deliver_wire,
+                                    struct doca_flow_pipe **wire_target,
+                                    struct doca_flow_pipe **sf_target)
 {
+#if DOCA_VERSION_MAJOR >= 3
 	struct doca_flow_pipe *qp1_rss = create_qp1_rss_pipe(port, "QP1_RSS", QP1_CLONE_QUEUE);
 	struct doca_flow_pipe *wire_flood =
 		create_qp1_flood_pipe(port, "QP1_FLOOD_WIRE", deliver_sf, qp1_rss);
@@ -1189,8 +1272,24 @@ static void install_qp1_clone_paths(struct doca_flow_port *port,
 	struct doca_flow_pipe *sf_flood =
 		create_qp1_flood_pipe(port, "QP1_FLOOD_SF", deliver_wire, qp1_rss);
 	*sf_target = create_qp1_clone_check(port, "QP1_CHECK_SF", sf_flood, *sf_target);
+#else
+	uint16_t queues[1] = {QP1_CLONE_QUEUE};
+	struct doca_flow_fwd clone_fwd = {0};
+
+	(void)deliver_sf;
+	(void)deliver_wire;
+	steer_fwd_set_rss(&clone_fwd, queues, 1, DOCA_FLOW_RSS_IPV4 | DOCA_FLOW_RSS_UDP);
+	configure_legacy_mirror(port, QP1_MIRROR_ID, &clone_fwd);
+	*wire_target = create_legacy_roce_mirror_pipe(port, "QP1_MIRROR_WIRE",
+	                                                *wire_target, QP1_MIRROR_ID);
+	*sf_target = create_legacy_roce_mirror_pipe(port, "QP1_MIRROR_SF",
+	                                              *sf_target, QP1_MIRROR_ID);
+	DOCA_LOG_WARN("DOCA 2.x QP1 observation mirrors all IPv4 UDP 4791 packets; "
+	              "software accepts only QP1 RDMA-CM packets");
+#endif
 }
 
+#if DOCA_VERSION_MAJOR >= 3
 /* Explicit ARP handling: wire requests reach both receiver SFs and replies
  * from either SF reach wire, independent of IPv4/default-miss behavior. */
 static struct doca_flow_pipe *create_arp_flood_pipe(struct doca_flow_port *port)
@@ -1225,9 +1324,12 @@ static struct doca_flow_pipe *create_arp_flood_pipe(struct doca_flow_port *port)
 	return pipe;
 }
 
+#endif /* DOCA_VERSION_MAJOR >= 3 */
+
 static struct doca_flow_pipe *create_arp_check_pipe(struct doca_flow_port *port, const char *name,
 						     const struct doca_flow_fwd *arp_fwd,
-						     struct doca_flow_pipe *miss_target)
+                                                     struct doca_flow_pipe *miss_target,
+                                                     uint32_t mirror_id)
 {
 	struct doca_flow_match match = {0}, match_mask = {0}, entry_match = {0};
 	struct doca_flow_fwd fwd_miss = {.type = DOCA_FLOW_FWD_PIPE, .next_pipe = miss_target};
@@ -1235,6 +1337,10 @@ static struct doca_flow_pipe *create_arp_check_pipe(struct doca_flow_port *port,
 	struct doca_flow_pipe *pipe;
 	struct doca_flow_pipe_entry *entry;
 	struct entry_batch_status status = {0};
+#if DOCA_VERSION_MAJOR < 3
+	struct doca_flow_monitor monitor = {.shared_mirror_id = mirror_id};
+	struct doca_flow_monitor entry_monitor = {0};
+#endif
 	doca_error_t err;
 
 	match.outer.eth.type = UINT16_MAX;
@@ -1248,10 +1354,21 @@ static struct doca_flow_pipe *create_arp_check_pipe(struct doca_flow_port *port,
 	crash_if_unsuccessful(doca_flow_pipe_cfg_set_is_root(cfg, false), "pipe_cfg_set_is_root (%s)", name);
 	crash_if_unsuccessful(doca_flow_pipe_cfg_set_nr_entries(cfg, 1), "pipe_cfg_set_nr_entries (%s)", name);
 	crash_if_unsuccessful(doca_flow_pipe_cfg_set_match(cfg, &match, &match_mask), "pipe_cfg_set_match (%s)", name);
+#if DOCA_VERSION_MAJOR < 3
+	if (mirror_id != UINT32_MAX)
+		crash_if_unsuccessful(doca_flow_pipe_cfg_set_monitor(cfg, &monitor),
+		                      "pipe_cfg_set_monitor (%s)", name);
+#else
+	(void)mirror_id;
+#endif
 	err = doca_flow_pipe_create(cfg, arp_fwd, &fwd_miss, &pipe);
 	crash_if_unsuccessful(err, "pipe_create (%s)", name);
 	doca_flow_pipe_cfg_destroy(cfg);
+#if DOCA_VERSION_MAJOR < 3
+	err = steer_pipe_add_entry(0, pipe, &entry_match, 0, NULL, mirror_id == UINT32_MAX ? NULL : &entry_monitor, NULL, 0, &status, &entry);
+#else
 	err = steer_pipe_add_entry(0, pipe, &entry_match, 0, NULL, NULL, NULL, 0, &status, &entry);
+#endif
 	crash_if_unsuccessful(err, "pipe_add_entry (%s)", name);
 	process_entries(port, &status, 1, name);
 	return pipe;
@@ -1260,14 +1377,27 @@ static struct doca_flow_pipe *create_arp_check_pipe(struct doca_flow_port *port,
 static void install_arp_paths(struct doca_flow_port *port, struct doca_flow_pipe **wire_target,
 			      struct doca_flow_pipe **sf_target)
 {
+#if DOCA_VERSION_MAJOR >= 3
 	struct doca_flow_pipe *flood = create_arp_flood_pipe(port);
 	struct doca_flow_fwd wire_fwd = {.type = DOCA_FLOW_FWD_HASH_PIPE,
 		.hash_pipe = {.pipe = flood, .algorithm = DOCA_FLOW_PIPE_HASH_MAP_ALGORITHM_FLOODING}};
 	struct doca_flow_fwd sf_fwd = {.type = DOCA_FLOW_FWD_PORT, .port_id = WIRE_PORT_ID};
 
-	*wire_target = create_arp_check_pipe(port, "ARP_CHECK_WIRE", &wire_fwd, *wire_target);
-	*sf_target = create_arp_check_pipe(port, "ARP_CHECK_SF", &sf_fwd, *sf_target);
+	*wire_target = create_arp_check_pipe(port, "ARP_CHECK_WIRE", &wire_fwd, *wire_target, UINT32_MAX);
+	*sf_target = create_arp_check_pipe(port, "ARP_CHECK_SF", &sf_fwd, *sf_target, UINT32_MAX);
 	DOCA_LOG_INFO("ARP steering ready: wire -> SF0+SF1; SF replies -> wire");
+#else
+	struct doca_flow_fwd clone_fwd = {.type = DOCA_FLOW_FWD_PORT, .port_id = SF_PATH1_PORT_ID};
+	struct doca_flow_fwd path0_fwd = {.type = DOCA_FLOW_FWD_PORT, .port_id = SF_PORT_ID};
+	struct doca_flow_fwd wire_fwd = {.type = DOCA_FLOW_FWD_PORT, .port_id = WIRE_PORT_ID};
+
+	configure_legacy_mirror(port, ARP_MIRROR_ID, &clone_fwd);
+	*wire_target = create_arp_check_pipe(port, "ARP_CHECK_WIRE", &path0_fwd,
+	                                     *wire_target, ARP_MIRROR_ID);
+	*sf_target = create_arp_check_pipe(port, "ARP_CHECK_SF", &wire_fwd,
+	                                   *sf_target, UINT32_MAX);
+	DOCA_LOG_INFO("ARP steering ready: wire -> SF0+SF1 via shared mirror; SF replies -> wire");
+#endif
 }
 
 /*
@@ -1502,6 +1632,12 @@ static struct doca_flow_pipe *create_cnp_count_pipe(struct doca_flow_port *port,
 					     struct doca_flow_pipe *deliver_sf,
 					     struct doca_flow_pipe *miss_target)
 {
+#if !STEER_HAS_ROCE_MATCH
+	(void)port;
+	(void)deliver_sf;
+	DOCA_LOG_WARN("DOCA 2.x has no public BTH matcher; sender CNP Flow counters are disabled");
+	return miss_target;
+#else
 	struct doca_flow_match match = {0}, match_mask = {0};
 	struct doca_flow_monitor monitor = {.counter_type = DOCA_FLOW_RESOURCE_TYPE_NON_SHARED};
 	struct doca_flow_fwd fwd = {.type = DOCA_FLOW_FWD_PIPE, .next_pipe = deliver_sf};
@@ -1542,6 +1678,7 @@ static struct doca_flow_pipe *create_cnp_count_pipe(struct doca_flow_port *port,
 	doca_flow_pipe_cfg_destroy(cfg);
 	DOCA_LOG_INFO("EGRESS_CNP_COUNT ready: learned sender-QPN CNP diagnostics");
 	return pipe;
+#endif
 }
 
 /* Compensate for the unmarkable half of each path: the configured percentage
@@ -1638,6 +1775,38 @@ struct steer_state {
 
 static struct steer_state g_steer;
 
+doca_error_t steer_parse_rep_spec(const char *spec,
+                                  char pci_addr[DOCA_DEVINFO_PCI_ADDR_SIZE], uint32_t *sf_num)
+{
+	const char *bdf, *comma, *sf, *end;
+	char *number_end;
+	size_t bdf_len;
+	unsigned long value;
+
+	if (spec == NULL || pci_addr == NULL || sf_num == NULL || strncmp(spec, "pci/", 4) != 0)
+		return DOCA_ERROR_INVALID_VALUE;
+	bdf = spec + 4;
+	comma = strchr(bdf, ',');
+	if (comma == NULL)
+		return DOCA_ERROR_INVALID_VALUE;
+	bdf_len = (size_t)(comma - bdf);
+	if ((bdf_len != DOCA_DEVINFO_PCI_BDF_SIZE - 1 &&
+	     bdf_len != DOCA_DEVINFO_PCI_ADDR_SIZE - 1) || bdf_len >= DOCA_DEVINFO_PCI_ADDR_SIZE)
+		return DOCA_ERROR_INVALID_VALUE;
+	sf = strstr(comma + 1, "sf");
+	if (sf == NULL || sf[2] == '\0')
+		return DOCA_ERROR_INVALID_VALUE;
+	errno = 0;
+	value = strtoul(sf + 2, &number_end, 10);
+	end = number_end;
+	if (errno != 0 || *end != '\0' || value > UINT16_MAX)
+		return DOCA_ERROR_INVALID_VALUE;
+	memcpy(pci_addr, bdf, bdf_len);
+	pci_addr[bdf_len] = '\0';
+	*sf_num = (uint32_t)value;
+	return DOCA_SUCCESS;
+}
+
 void steer_default_opts(struct steer_opts *opts)
 {
 	memset(opts, 0, sizeof(*opts));
@@ -1666,9 +1835,13 @@ static void apply_path_share(uint32_t path0_share)
 
 		memset(&g_classify_batch, 0, sizeof(g_classify_batch));
 #if !STEER_USE_RANDOM_HASH_CLASSIFIER
+		struct doca_flow_actions actions = {0};
+
+		actions.outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;
+		actions.outer.ip4.dscp_ecn = PATH_DSCP_VAL(wanted_path);
 		doca_error_t err = steer_pipe_update_entry(0, g_steer.classify_pipe, wanted_path,
-							 NULL, NULL, NULL, STEER_NO_WAIT,
-							 g_steer.classify_entry[bucket]);
+		                                             &actions, NULL, NULL, STEER_NO_WAIT,
+		                                             g_steer.classify_entry[bucket]);
 #else
 		struct doca_flow_fwd fwd = {
 			.type = DOCA_FLOW_FWD_PIPE,
@@ -1708,7 +1881,6 @@ doca_error_t steer_start(const struct steer_opts *opts)
 		return DOCA_ERROR_BAD_STATE;
 
 	g_steer.opts = *opts;
-	g_sf_num = opts->sf_num;
 	atomic_flag_clear(&g_steer.rate_lock);
 
 #if DOCA_VERSION_MAJOR >= 3
@@ -1736,16 +1908,37 @@ doca_error_t steer_start(const struct steer_opts *opts)
 	if (probe_nb_sf_ports == NB_PATHS)
 		g_steer.sf_rep_port[1] = rep_port_start(SF_PATH1_PORT_ID, opts->dev_rep_path1);
 #else
-	char probe_args[128];
+	char probe_args[160];
+	const bool probe_do_ingress = (g_steer.opts.role != STEER_ROLE_EGRESS);
+	uint32_t probe_nb_sf_ports = probe_do_ingress ? NB_PATHS : 1;
 
-	snprintf(probe_args, sizeof(probe_args), "dv_flow_en=2,fdb_def_rule_en=1,representor=sf%u", opts->sf_num);
-	struct doca_dev *dev = open_and_probe_dev(0, probe_args);
+	if (probe_do_ingress) {
+		if (!opts->path1_sf_num_set) {
+			DOCA_LOG_CRIT("DOCA 2.x ingress requires -r and -R/--path1-rep");
+			return DOCA_ERROR_INVALID_VALUE;
+		}
+		snprintf(probe_args, sizeof(probe_args),
+		         "dv_flow_en=2,fdb_def_rule_en=1,representor=sf[%u,%u]",
+		         opts->sf_num, opts->path1_sf_num);
+	} else {
+		snprintf(probe_args, sizeof(probe_args),
+		         "dv_flow_en=2,fdb_def_rule_en=1,representor=sf%u", opts->sf_num);
+	}
+	struct doca_dev *dev = opts->dev;
+	if (dev != NULL)
+		probe_open_dev(dev, opts->device_pci_addr, probe_args);
+	else
+		dev = open_and_probe_dev(opts->device_pci_addr, probe_args);
 
 	configure_and_start_dpdk_port(dev);
 	initialize_doca_flow();
 
 	g_steer.port = port_start(dev, WIRE_PORT_ID);
-	g_steer.sf_rep_port[0] = rep_port_start(find_sf_representor_port_id());
+	uint16_t rep_ids[NB_PATHS] = {0};
+	find_sf_representor_port_ids(rep_ids, probe_nb_sf_ports);
+	g_steer.sf_rep_port[0] = rep_port_start(rep_ids[0]);
+	if (probe_nb_sf_ports == NB_PATHS)
+		g_steer.sf_rep_port[1] = rep_port_start(rep_ids[1]);
 #endif
 
 	/* Deliver pipes: fwd_miss cannot be a port on 3.x HWS, so port delivery is
@@ -1940,6 +2133,12 @@ static uint32_t read_be32(const uint8_t *p)
 
 static void install_sender_cnp_entry(uint32_t sender_qpn, uint32_t receiver_qpn, uint8_t path)
 {
+#if !STEER_HAS_ROCE_MATCH
+	(void)sender_qpn;
+	(void)receiver_qpn;
+	(void)path;
+	return;
+#else
 	if (g_steer.cnp_count_pipe == NULL)
 		return;
 	sender_qpn &= 0x00FFFFFFu;
@@ -1978,6 +2177,7 @@ static void install_sender_cnp_entry(uint32_t sender_qpn, uint32_t receiver_qpn,
 	g_steer.cnp_entry_count++;
 	DOCA_LOG_INFO("sender CNP counter installed: sender QPN 0x%06x -> receiver QPN "
 	              "0x%06x path%u", sender_qpn, receiver_qpn, path);
+#endif
 }
 
 static void remember_cm_request(uint32_t comm_id, uint32_t initiator_qpn, uint32_t receiver_ip)
@@ -2243,13 +2443,13 @@ void steer_poll(void)
 		apply_path_share(path0);
 	}
 
-	struct doca_flow_resource_query q;
+	struct steer_resource_query q;
 	if (g_steer.cnp_count_pipe != NULL) {
 		uint64_t cnp_by_path[NB_PATHS] = {0};
 		for (uint32_t i = 0; i < g_steer.cnp_entry_count; i++) {
 			if (g_steer.cnp_entry[i] != NULL &&
-			    doca_flow_resource_query_entry(g_steer.cnp_entry[i], &q) == DOCA_SUCCESS)
-				cnp_by_path[g_steer.cnp_path[i]] += q.counter.total_pkts;
+			    steer_query_entry(g_steer.cnp_entry[i], &q) == DOCA_SUCCESS)
+				cnp_by_path[g_steer.cnp_path[i]] += q.total_pkts;
 		}
 		uint64_t now_cycles = rte_get_timer_cycles();
 		if (g_steer.cnp_delta_ready && now_cycles > g_steer.cnp_prev_cycles) {
@@ -2276,13 +2476,13 @@ void steer_poll(void)
 	bool ingress_bytes_valid = true;
 	for (int i = 0; i < NB_PATHS; i++) {
 		if (g_steer.path_demux_entry[i] == NULL ||
-		    doca_flow_resource_query_entry(g_steer.path_demux_entry[i], &q) != DOCA_SUCCESS)
+		    steer_query_entry(g_steer.path_demux_entry[i], &q) != DOCA_SUCCESS)
 			ingress_bytes_valid = false;
 		else
-			ingress_bytes[i] = q.counter.total_bytes;
+			ingress_bytes[i] = q.total_bytes;
 		if (g_steer.mark_entry[i] &&
-		    doca_flow_resource_query_entry(g_steer.mark_entry[i], &q) == DOCA_SUCCESS)
-			ingress_mark_pkts[i] = q.counter.total_pkts;
+		    steer_query_entry(g_steer.mark_entry[i], &q) == DOCA_SUCCESS)
+			ingress_mark_pkts[i] = q.total_pkts;
 	}
 	if (ingress_bytes_valid) {
 		uint64_t now_cycles = rte_get_timer_cycles();

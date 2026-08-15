@@ -48,7 +48,7 @@ struct bytes_ts_t {
  * @smaller_num [in]: smaller int
  * @return: difference with wrap around
  */
-ALWAYS_INLINE uint32_t diff_with_wrap32(uint32_t greater_num, uint32_t smaller_num)
+FORCE_INLINE uint32_t diff_with_wrap32(uint32_t greater_num, uint32_t smaller_num)
 {
 	uint32_t diff_res;
 

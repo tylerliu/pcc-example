@@ -136,33 +136,32 @@ steering datapath needs:
 sudo ./build/doca_pcc --device mlx5_1 -r pci/0000:03:00.1,pf1sf0 <PCC args...>
 
 # receiver side runs the ingress half as a separate standalone instance, PF0:
-sudo ./build/doca_flow_steer -r pci/0000:03:00.0,pf0sf0 --role ingress
+sudo ./build/doca_flow_steer \
+  -r pci/0000:03:00.0,pf0sf0 -R pci/0000:03:00.0,pf0sf4 \
+  --path0-ip 10.0.0.1 --path1-ip 10.0.0.11 --role ingress
 ```
 
-(`--steer-sf <N>` remains for the DOCA 2.9 discovery path.) Drive traffic with two
-RoCE QPs (e.g. `ib_write_bw -q 2 ... -R`); the receiver hashes the complete destination QPN into one of two stable flow classes.
+DOCA 2.7/2.9 use the same `-r`/`-R` representor syntax. Their callbacks parse
+the BDF and SF numbers and translate them to legacy mlx5 probe devargs; complete
+commands are in [`steering/README.md`](steering/README.md).
 
-There is no rate file, polling IPC, or manual QPN-to-path configuration. Each PCC
-format-6 trace report calls `steer_update_pcc_rate(qpn, rate)` directly (a relaxed
-atomic store into the existing rate slots). Once per second `steer_poll()` prints
-the egress, QPN-hash, path-mark, and restore-class counters. The current random
-egress hash is fixed and is not live-updated by PCC rates.
+There is no rate file, external IPC, or manual QPN-to-path configuration. On DOCA
+3.x, each format-6 trace report calls `steer_update_pcc_rate(qpn, rate)` directly.
+On DOCA 2.x, the host retrieves the latest per-QPN rates from the PCC DPA mailbox
+once per second and feeds the same steering API. `steer_poll()` applies the calculated path share and prints the datapath counters.
 
-> **Marker mechanism.** The the selected virtual path is marked on the wire with an
+> **Marker mechanism.** The selected virtual path is marked on the wire with an
 > ICRC-exempt **DSCP bit** (masked modify), *not* a UDP-port rewrite — rewriting the
 > RoCEv2 UDP port breaks ICRC and drops rewritten traffic. See
 > [`steering/README.md`](steering/README.md).
 
-> **Status.** The standalone `doca_flow_steer` (two per-PF instances,
-> `--role egress`/`--role ingress`) is hardware-validated. The embedded egress path
-> (`-r`) is wired and builds, but **not yet run on hardware**. The main open risk is
-> **dual-open of the sender PF**: `doca_pcc` opens the PF for the PCC engine, and the
-> embedded steering then probes the same PF into DPDK via DOCA Flow — whether both
-> can coexist in one process is unverified. If the probe fails, the fallback is to
-> share a single `doca_dev` handle between the PCC context and the Flow datapath.
+> **Status.** The standalone ingress and embedded PCC egress paths are
+> hardware-validated on DOCA 3.1/3.4. The DOCA 2.7/2.9 backend is compile-tested
+> and is the current hardware-validation target. On 2.x, embedded steering reuses
+> the PCC context's open `doca_dev` handle before probing its sender SF.
 
-The existing host-side per-QPN PCC rate summary is still printed at most once per
-DPA-timer second and remains the primary visibility point for the trace feed:
+On 3.x, the host-side per-QPN PCC trace summary remains the primary rate-feed
+visibility point:
 
 ```text
 --- Per-flow rate averages (received=... total=...) ---
@@ -171,7 +170,7 @@ DPA-timer second and remains the primary visibility point for the trace feed:
 ---
 ```
 
-The steering pipeline, options, and the DOCA 2.9/3.x compatibility notes are
+The steering pipeline, options, and the DOCA 2.7/2.9/3.x compatibility notes are
 documented in [`steering/README.md`](steering/README.md). The same unified build
 also produces the standalone `doca_flow_steer` binary for testing.
 

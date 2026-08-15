@@ -111,13 +111,11 @@ To rebuild only the standalone executable:
 ninja -C build doca_flow_steer
 ```
 
-DOCA 3.x is built and hardware-tested on 3.4.0112. DOCA 3.1 source support uses
-the same device/representor setup and flooding-hash QP1 clone design, with
-`doca_flow_compat.h` adapting its older basic/hash entry signatures, entry
-flags, and global counter allocation. Compatibility wrappers also retain the
-DOCA 2.9 add/update and port-discovery API path;
-QP1 cloning is isolated in `install_qp1_clone_paths()` so its 2.9 backend can use
-mirror resources instead of the 3.x flooding hash pipe.
+The source is compile-tested with the official DOCA 2.7.0085, 2.9.5001, and
+3.1.0105 development images and with native DOCA 3.4.0112. The 3.x path is
+hardware-validated; the 2.x path is ready for its first hardware validation.
+`doca_flow_compat.h` contains the entry, update, query, RSS-forward, RoCE-match,
+and shared-resource ABI differences.
 
 The optional PCC DPA resources-file parser uses host APIs introduced in DOCA
 3.4. On DOCA 3.1, select execution units with the existing `--threads` option
@@ -142,37 +140,37 @@ Ingress installs explicit ARP steering before the IPv4/RoCE chains. ARP from
 wire is flooded to both receiver SFs, while ARP from either SF is forwarded to
 wire, so neighbor discovery does not depend on default-miss/FDB behavior.
 
-### Future DOCA 2.7/2.9 port
+### DOCA 2.7/2.9 compatibility
 
-The legacy branches are scaffolding, not a validated 2.7/2.9 implementation.
-Before using them on older SDKs, verify or replace the following:
+DOCA 2 uses the same logical pipeline and PCC path-share calculation, with these
+version-specific backends:
 
-- Representor discovery and switch-port startup (`open_and_probe_dev()`,
-  `find_sf_representor_port_id()`, and the DOCA-version port configuration).
-- Entry add/update semantics in `doca_flow_compat.h`. DOCA 3.x requires
-  `DOCA_FLOW_ENTRY_FLAGS_NO_WAIT` for a submitted single-entry update; the
-  current legacy wrapper assumes that omitting `DOCA_FLOW_WAIT_FOR_BATCH`
-  submits immediately.
-- QP1 cloning. DOCA 3.4 uses a two-entry flooding hash pipe; 2.7/2.9 should use
-  the available shared mirror resource behind `install_qp1_clone_paths()`.
-- Dual receiver-SF logical port ids and source-port metadata field widths.
-- Dynamic classifier updates and teardown. On DOCA 3.4.0112, updated
-  `EGRESS_CLASSIFY` entries can emit several
-  `entry remove completed with failure` messages during pipe flush even after
-  update completion and queue draining. Shutdown still completes. Re-test this
-  behavior on the older SDK rather than carrying a version-specific workaround
-  blindly.
-- Preserve the pre-HASH DOCA 3.1 classifier as a DOCA 2.x porting candidate:
-  one BASIC pipe masks the low six bits of `parser_meta.random`, declares the
-  field changeable in the non-NULL match template, and installs 64 exact bucket
-  entries. Each entry writes its path selection to `meta.u32[0]`; a following
-  COPY action transfers bit 0 to IPv4 `dscp_ecn` bit 2. This design caused
-  spurious CNPs on DOCA 3.1 and must not be re-enabled there, but older SDK HWS
-  implementations may require it when RANDOM HASH or HASH forwarding is absent.
+- The CLI remains identical to 3.x: `-r` and `-R` accept
+  `pci/<BDF>,pf<N>sf<N>`. The 2.x callback parses the PF BDF and SF numbers,
+  then probes them with the mlx5 `representor=sf...` devarg. Embedded PCC also
+  verifies that the `-r` PF matches its already-open `--device` handle.
+- The egress classifier uses the low six bits of `parser_meta.random` in a
+  64-entry BASIC pipe. Live updates supply the full rewrite action as required
+  by the 2.x entry-update API. The 3.x native RANDOM HASH plus metadata-dispatch
+  implementation remains unchanged.
+- QP1 observation uses shared mirror resource 0 and one DPDK RX queue. The
+  public 2.x Flow API cannot match BTH destination QPN, so the first-pass
+  backend mirrors all IPv4 UDP/4791 packets and rejects non-QP1 packets in the
+  software parser. This is functionally correct but may be expensive at line
+  rate; hardware validation should measure RX clone load before considering a
+  direct `rte_flow` IB-BTH rule.
+- Receiver ARP fan-out uses shared mirror resource 1 to deliver wire ARP to
+  both SFs.
+- Exact hardware CNP counters are disabled because the same public BTH matcher
+  is unavailable. PCC-side CNP statistics remain available.
+- DOCA 2 lacks the 3.x PCC binary trace callback used for per-QPN rate reports.
+  The DPA stores the newest rate per QPN and the host retrieves a mailbox
+  snapshot once per steering poll (one second), then feeds it to the unchanged
+  grouping calculation.
 
-Keep the application-level pipeline and PCC grouping unchanged while porting;
-the intended compatibility boundary is `doca_flow_compat.h`, device/port setup,
-and `install_qp1_clone_paths()`.
+The 2.x backend is compile-tested but not yet hardware-validated. In particular,
+validate shared-mirror behavior, dual-SF logical port ordering, classifier entry
+updates, QP1 clone CPU load, and teardown on both 2.7 and 2.9.5.
 
 ## Run
 
@@ -195,9 +193,14 @@ sudo ./build/doca_flow_steer \
   --role egress
 ```
 
-The normal sender deployment embeds the egress role in `doca_pcc`; its PCC
-trace handler calls `steer_update_pcc_rate()` and its host loop calls
-`steer_poll()` once per second.
+The same commands and representor syntax are used on DOCA 2.7, 2.9.5, 3.1,
+and 3.4. On 2.x only the internal conversion to mlx5 representor devargs is
+different.
+
+The normal sender deployment embeds the egress role in `doca_pcc`. On 3.x,
+the PCC trace handler calls `steer_update_pcc_rate()` directly. On 2.x, the
+once-per-second host poll fetches the DPA mailbox snapshot before calling
+`steer_poll()`.
 
 | Option | Meaning |
 |---|---|
@@ -206,7 +209,7 @@ trace handler calls `steer_update_pcc_rate()` and its host loop calls
 | `--path0-ip`, `--path1-ip` | destination IPs used for receiver delivery and PCC grouping |
 | `--role ingress\|egress\|both` | pipeline half to build |
 | `--path0-percent`, `--path1-percent` | intended per-path all-traffic CE percentages |
-| `--sf-num` | DOCA 2.9 representor discovery fallback |
+| `--device` | PCC RDMA device name; independent of the steering `-r` syntax |
 
 ## Shutdown
 

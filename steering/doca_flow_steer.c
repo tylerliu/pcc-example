@@ -37,18 +37,43 @@ static void on_signal(int s)
 		}                                                                          \
 	} while (0)
 
-static doca_error_t sf_num_cb(void *param, void *config)
+#if DOCA_VERSION_MAJOR < 3
+static doca_error_t legacy_rep_cb(void *param, void *config, uint32_t path)
 {
 	struct steer_opts *o = config;
-	long v = atol((const char *)param);
+	char pci_addr[DOCA_DEVINFO_PCI_ADDR_SIZE] = {0};
+	uint32_t sf_num;
+	doca_error_t err = steer_parse_rep_spec(param, pci_addr, &sf_num);
 
-	if (v < 0 || v > UINT16_MAX) {
-		DOCA_LOG_ERR("--sf-num must be in [0, %u]", UINT16_MAX);
+	if (err != DOCA_SUCCESS) {
+		DOCA_LOG_ERR("representor must use pci/<BDF>,pf<N>sf<N> syntax");
+		return err;
+	}
+	if (o->device_pci_addr[0] != '\0' && strcmp(o->device_pci_addr, pci_addr) != 0) {
+		DOCA_LOG_ERR("path0 and path1 representors must belong to the same PF device");
 		return DOCA_ERROR_INVALID_VALUE;
 	}
-	o->sf_num = (uint32_t)v;
+	if (o->device_pci_addr[0] == '\0')
+		memcpy(o->device_pci_addr, pci_addr, sizeof(o->device_pci_addr));
+	if (path == 0)
+		o->sf_num = sf_num;
+	else {
+		o->path1_sf_num = sf_num;
+		o->path1_sf_num_set = true;
+	}
 	return DOCA_SUCCESS;
 }
+
+static doca_error_t legacy_path0_rep_cb(void *param, void *config)
+{
+	return legacy_rep_cb(param, config, 0);
+}
+
+static doca_error_t legacy_path1_rep_cb(void *param, void *config)
+{
+	return legacy_rep_cb(param, config, 1);
+}
+#endif
 
 static doca_error_t role_cb(void *param, void *config)
 {
@@ -170,16 +195,23 @@ static void reg_dev(const char *shortn, const char *longn, const char *desc, doc
 }
 #endif
 
-static void reg(const char *name, const char *desc, doca_argp_param_cb_t cb)
+static void reg_short(const char *short_name, const char *name, const char *desc, doca_argp_param_cb_t cb)
 {
 	struct doca_argp_param *pm;
 
 	CRASH(doca_argp_param_create(&pm), "argp_param_create");
+	if (short_name != NULL)
+		doca_argp_param_set_short_name(pm, short_name);
 	doca_argp_param_set_long_name(pm, name);
 	doca_argp_param_set_description(pm, desc);
 	doca_argp_param_set_callback(pm, cb);
 	doca_argp_param_set_type(pm, DOCA_ARGP_TYPE_STRING);
-	CRASH(doca_argp_register_param(pm), "argp_register_param");
+	CRASH(doca_argp_register_param(pm), "doca_argp_register_param");
+}
+
+static void reg(const char *name, const char *desc, doca_argp_param_cb_t cb)
+{
+	reg_short(NULL, name, desc, cb);
 }
 
 static const char *g_eal_prefix = "pcc-steer";
@@ -226,7 +258,6 @@ int main(int argc, char **argv)
 	CRASH(steer_eal_init(1, eal_argv, g_eal_prefix), "steer_eal_init");
 
 	CRASH(doca_argp_init("doca_flow_steer", &opts), "doca_argp_init");
-	reg("sf-num", "Receiver SF number (en3f0pf0sf<N>). Default: 0", sf_num_cb);
 	reg("path0-percent", "Path 0 intended all-traffic CE percent [0,100]; selected-class sampling is 2x, capped at 100. Default: 100", p0pct_cb);
 	reg("path1-percent", "Path 1 intended all-traffic CE percent [0,100]; selected-class sampling is 2x, capped at 100. Default: 100", p1pct_cb);
 	reg("path0-ip", "IPv4 address delivered to the first -r receiver SF", p0ip_cb);
@@ -238,6 +269,11 @@ int main(int argc, char **argv)
 	        DOCA_ARGP_TYPE_DEVICE_REP);
 	reg_dev("R", "path1-rep", "Path-1 SF representor, e.g. pci/0000:03:00.0,pf0sf4", path1_rep_cb,
 	        DOCA_ARGP_TYPE_DEVICE_REP);
+#else
+	reg_short("r", "path0-rep", "Path-0 SF representor, e.g. pci/0000:03:00.0,pf0sf0",
+	          legacy_path0_rep_cb);
+	reg_short("R", "path1-rep", "Path-1 SF representor, e.g. pci/0000:03:00.0,pf0sf4",
+	          legacy_path1_rep_cb);
 #endif
 	CRASH(doca_argp_start(argc, argv), "doca_argp_start");
 
@@ -249,6 +285,15 @@ int main(int argc, char **argv)
 	if (opts.role != STEER_ROLE_EGRESS &&
 	    (opts.dev_rep_count != STEER_NB_PATHS || !opts.path_ip_set[0] || !opts.path_ip_set[1])) {
 		DOCA_LOG_CRIT("ingress requires -r, -R/--path1-rep, --path0-ip and --path1-ip");
+		return EXIT_FAILURE;
+	}
+#else
+	if (opts.device_pci_addr[0] == '\0') {
+		DOCA_LOG_CRIT("Specify the SF representor via -r (e.g. -r pci/0000:03:00.0,pf0sf0)");
+		return EXIT_FAILURE;
+	}
+	if (opts.role != STEER_ROLE_EGRESS && !opts.path1_sf_num_set) {
+		DOCA_LOG_CRIT("DOCA 2.x ingress requires -r and -R/--path1-rep");
 		return EXIT_FAILURE;
 	}
 #endif
