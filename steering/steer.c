@@ -1377,11 +1377,17 @@ static void install_qp1_clone_paths(struct doca_flow_port *port,
 		.port_id = WIRE_PORT_ID,
 	};
 
-	configure_legacy_mirror(port, QP1_WIRE_MIRROR_ID, &clone_fwd, &wire_original);
 	configure_legacy_mirror(port, QP1_SF_MIRROR_ID, &clone_fwd, &sf_original);
+#if DOCA_VERSION_MINOR < 9
+	configure_legacy_mirror(port, QP1_WIRE_MIRROR_ID, &clone_fwd, &wire_original);
 	*wire_target = create_legacy_roce_mirror_pipe(port, "QP1_MIRROR_WIRE",
 	                                                SF_PORT_ID, *wire_target,
 	                                                QP1_WIRE_MIRROR_ID);
+#else
+	(void)wire_original;
+	DOCA_LOG_WARN("DOCA 2.9 diagnostic: incoming QP1 mirror disabled; "
+	              "testing whether it blocks RDMA-CM REP delivery");
+#endif
 	*sf_target = create_legacy_roce_mirror_pipe(port, "QP1_MIRROR_SF",
 	                                              WIRE_PORT_ID, *sf_target,
 	                                              QP1_SF_MIRROR_ID);
