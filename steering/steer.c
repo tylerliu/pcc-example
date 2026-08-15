@@ -898,7 +898,10 @@ static struct doca_flow_pipe *create_path_rewrite_pipe(struct doca_flow_port *po
 	crash_if_unsuccessful(err, "pipe_create (%s)", name);
 	doca_flow_pipe_cfg_destroy(cfg);
 
-	struct doca_flow_match entry_match = {0};
+	/* DOCA 2.7 requires the entry to retain the template's IPv4 protocol
+	 * context for a dscp_ecn action; 2.9/3.x also accept this encoding. */
+	struct doca_flow_match entry_match = match;
+	entry_match.outer.ip4.dscp_ecn = 0;
 	struct doca_flow_actions entry_actions = {0};
 	entry_actions.outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;
 	entry_actions.outer.ip4.dscp_ecn = PATH_DSCP_VAL(path) | IP4_ECN_ECT0;
