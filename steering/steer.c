@@ -2658,6 +2658,14 @@ static void learn_ingress_feedback_qpn(uint32_t sender_qpn, uint32_t source_ip)
 		 * mapping from ingress feedback rather than an RDMA-CM REQ/REP pair. */
 		DOCA_LOG_INFO("RDMA-CM mapping: sender 0x%06x -> receiver unknown path%u "
 		              "(DOCA 2 ingress-feedback inference)", sender_qpn, path);
+#if DOCA_VERSION_MINOR < 9
+		/* DOCA 2.7 can feed a mirrored CNP back through PCC before the clone
+		 * reaches RSS. One valid packet is enough to learn this path; stop the
+		 * mirror immediately instead of waiting for the control interval. */
+		retire_legacy_qp1_mirror_entry(
+			g_steer.legacy_qp1_wire_entry, path,
+			"wire-ingress source-IP after first mapping");
+#endif
 	}
 }
 #endif
