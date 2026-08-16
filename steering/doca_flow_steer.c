@@ -115,6 +115,14 @@ static doca_error_t p1pct_cb(void *param, void *config)
 	return DOCA_SUCCESS;
 }
 
+static doca_error_t no_ecn_mark_cb(void *param, void *config)
+{
+	struct steer_opts *o = config;
+
+	o->no_ecn_mark = *((bool *)param);
+	return DOCA_SUCCESS;
+}
+
 static doca_error_t parse_path_ip(void *param, void *config, unsigned int path)
 {
 	struct steer_opts *o = config;
@@ -214,6 +222,18 @@ static void reg(const char *name, const char *desc, doca_argp_param_cb_t cb)
 	reg_short(NULL, name, desc, cb);
 }
 
+static void reg_bool(const char *name, const char *desc, doca_argp_param_cb_t cb)
+{
+	struct doca_argp_param *pm;
+
+	CRASH(doca_argp_param_create(&pm), "argp_param_create");
+	doca_argp_param_set_long_name(pm, name);
+	doca_argp_param_set_description(pm, desc);
+	doca_argp_param_set_callback(pm, cb);
+	doca_argp_param_set_type(pm, DOCA_ARGP_TYPE_BOOLEAN);
+	CRASH(doca_argp_register_param(pm), "doca_argp_register_param");
+}
+
 static const char *g_eal_prefix = "pcc-steer";
 
 int main(int argc, char **argv)
@@ -260,6 +280,7 @@ int main(int argc, char **argv)
 	CRASH(doca_argp_init("doca_flow_steer", &opts), "doca_argp_init");
 	reg("path0-percent", "Path 0 intended all-traffic CE percent [0,100]; selected-class sampling is 2x, capped at 100. Default: 100", p0pct_cb);
 	reg("path1-percent", "Path 1 intended all-traffic CE percent [0,100]; selected-class sampling is 2x, capped at 100. Default: 100", p1pct_cb);
+	reg_bool("no-ecn-mark", "Diagnostic: preserve forwarding but bypass both ingress CE markers", no_ecn_mark_cb);
 	reg("path0-ip", "IPv4 address delivered to the first -r receiver SF", p0ip_cb);
 	reg("path1-ip", "IPv4 address delivered to the second -r receiver SF", p1ip_cb);
 	reg("role", "Which half to build: egress (sender) | ingress (receiver) | both. Default: both", role_cb);

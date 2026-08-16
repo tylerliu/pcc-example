@@ -2215,6 +2215,11 @@ doca_error_t steer_start(const struct steer_opts *opts)
 #endif
 
 	if (do_ingress) {
+		if (g_steer.opts.no_ecn_mark) {
+			DOCA_LOG_WARN("ingress diagnostic: CE marking disabled; RoCE forwarded by receiver IP only");
+			wire_target = create_roce_check_pipe(g_steer.port, "INGRESS_ROCE_CHECK",
+			                                     receiver_target, receiver_target, false);
+		} else {
 		/* Ingress: choose the virtual path first, then run that path's
 		 * independent destination-IP ECN marker. */
 		struct doca_flow_pipe *clear_path =
@@ -2238,6 +2243,7 @@ doca_error_t steer_start(const struct steer_opts *opts)
 			                       g_steer.path_demux_entry);
 		wire_target = create_roce_check_pipe(g_steer.port, "INGRESS_ROCE_CHECK",
 		                                     path_demux, receiver_target, false);
+		}
 	}
 
 	if (do_egress) {
