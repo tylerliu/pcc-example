@@ -124,7 +124,7 @@ Non-RoCE traffic bypasses the random classifier.
 Path selection is per packet, while congestion control and QP identification remain per transport flow.
 The feedback and steering loop operates as follows:
 
-1. PCC calculates a congestion-derived value for each sender QP on the DPA.
+1. PCC calculates a congestion-derived value for each sender QP on the DPA using the same algorithm introduced in the DOCA PCC portion of the tutorial.
 2. PCC reports these values to the host through binary trace reports on DOCA 3.x or a periodically polled PCC mailbox on DOCA 2.9.
 3. The host averages reports over the interval and applies a persistent EWMA.
    Flows that have not yet been associated with a path are reported as `pending-map` and do not influence the ratio.
@@ -144,7 +144,7 @@ DOCA Flow applies that share by updating the bucket dispatch entries while traff
 Together, PCC provides the feedback signal and DOCA Flow enforces the resulting per-packet steering decision at line rate.
 The single-card loopback emulates the two paths for the tutorial, but the same control and steering design can target two real next hops.
 
-# Part B: Run the completed solution
+# Part B: Run and observe the completed solution
 
 Before writing any DOCA Flow code, run the completed implementation and observe the behavior that your implementation must reproduce.
 This gives you a known-good reference for the pipeline startup messages, initial path split, and hardware counters.
@@ -332,10 +332,11 @@ The rest of the steering pipeline therefore sees the same metadata contract on e
 The compatibility choice is selected at compile time through `STEER_USE_RANDOM_HASH_CLASSIFIER` and `DOCA_USES_LEGACY_FLOW_BACKEND` in [`steering/doca_flow_compat.h`](../steering/doca_flow_compat.h).
 The tutorial code should use the compatibility wrappers such as `steer_pipe_hash_add_entry()` instead of duplicating SDK-specific entry API calls.
 
-## C.4 What the completed solution demonstrated
+## C.4 Expected behavior
 
 In Part B, the completed solution created the random HASH pipe and reported traffic on both paths with an initial `32:32` bucket split.
 Your implementation should reproduce the same startup messages and counter behavior.
+For now, however, it will maintain a fixed `32:32` bucket-to-path split; you will add dynamic steering in the next section.
 
 <details>
 <summary><strong>Try it yourself!</strong></summary>
@@ -457,3 +458,14 @@ You are finished when traffic continues during a share change, the application p
 
 </details>
 
+# FAQ
+
+## Why not steer traffic dynamically with the HASH pipe itself?
+
+Many DOCA versions do not support updating HASH-pipe entries after they have been created.
+The tutorial therefore keeps the HASH pipe immutable and performs dynamic steering in a separate BASIC dispatch pipe whose entries can be updated while traffic is running.
+
+## Can I use a different number of buckets?
+
+Yes, but the supported HASH-pipe size depends on the DOCA version.
+You may change to a bucket count that stays within the limit of every DOCA version you intend to support, and update the initial split and related constants accordingly.
