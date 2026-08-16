@@ -1396,15 +1396,18 @@ static struct doca_flow_pipe *create_legacy_roce_mirror_pipe(
 	doca_error_t err;
 
 	steer_set_roce_udp_match(&match, &match_mask, RTE_BE16(ROCE_UDP_PORT_NATIVE));
-	(void)path_ip;
-	(void)match_src_ip;
+	if (match_src_ip) {
+		match.outer.ip4.src_ip = UINT32_MAX;
+		match_mask.outer.ip4.src_ip = UINT32_MAX;
+	}
 	err = doca_flow_pipe_cfg_create(&cfg, port);
 	crash_if_unsuccessful(err, "pipe_cfg_create (%s)", name);
 	crash_if_unsuccessful(doca_flow_pipe_cfg_set_name(cfg, name), "pipe_cfg_set_name (%s)", name);
 	crash_if_unsuccessful(doca_flow_pipe_cfg_set_type(cfg, DOCA_FLOW_PIPE_BASIC), "pipe_cfg_set_type (%s)", name);
 	crash_if_unsuccessful(doca_flow_pipe_cfg_set_domain(cfg, DOCA_FLOW_PIPE_DOMAIN_DEFAULT), "pipe_cfg_set_domain (%s)", name);
 	crash_if_unsuccessful(doca_flow_pipe_cfg_set_is_root(cfg, false), "pipe_cfg_set_is_root (%s)", name);
-	crash_if_unsuccessful(doca_flow_pipe_cfg_set_nr_entries(cfg, 1), "pipe_cfg_set_nr_entries (%s)", name);
+	crash_if_unsuccessful(doca_flow_pipe_cfg_set_nr_entries(
+		cfg, match_src_ip ? NB_PATHS : 1), "pipe_cfg_set_nr_entries (%s)", name);
 	crash_if_unsuccessful(doca_flow_pipe_cfg_set_match(
 		cfg, &match, steer_roce_udp_match_mask(&match_mask)), "pipe_cfg_set_match (%s)", name);
 	crash_if_unsuccessful(doca_flow_pipe_cfg_set_monitor(cfg, &monitor), "pipe_cfg_set_monitor (%s)", name);
@@ -1412,19 +1415,24 @@ static struct doca_flow_pipe *create_legacy_roce_mirror_pipe(
 	crash_if_unsuccessful(err, "pipe_create (%s)", name);
 	doca_flow_pipe_cfg_destroy(cfg);
 
-	{
+	uint8_t entry_count = match_src_ip ? NB_PATHS : 1;
+	for (uint8_t path = 0; path < entry_count; path++) {
 		struct doca_flow_match entry_match = {0};
 		struct doca_flow_monitor entry_monitor = monitor;
+		uint32_t flags = path + 1 < entry_count ? STEER_WAIT_FOR_BATCH : 0;
 #if !STEER_HAS_ROCE_MATCH
 		entry_match = match;
 #endif
+		if (match_src_ip)
+			entry_match.outer.ip4.src_ip = path_ip[path];
 		err = steer_pipe_add_entry(0, pipe, &entry_match, 0, NULL, &entry_monitor, NULL,
-			0, &status, &path_entry[0]);
-		crash_if_unsuccessful(err, "pipe_add_entry (%s)", name);
+			flags, &status, &path_entry[path]);
+		crash_if_unsuccessful(err, "pipe_add_entry (%s path%u)", name, path);
 	}
-	path_entry[1] = NULL;
-	process_entries(port, &status, 1, name);
-	DOCA_LOG_INFO("%s ready: all wire-ingress RoCEv2 packets cloned", name);
+	if (!match_src_ip)
+		path_entry[1] = NULL;
+	process_entries(port, &status, entry_count, name);
+	DOCA_LOG_INFO("%s ready: wire-ingress RoCEv2 cloned by source-path IP", name);
 	return pipe;
 }
 #endif
@@ -2824,11 +2832,22 @@ void steer_poll(void)
 		atomic_flag_clear_explicit(&g_steer.rate_lock, memory_order_release);
 
 #if DOCA_VERSION_MAJOR < 3
-		for (uint8_t path = 0; path < NB_PATHS; path++)
-			if (reduced[path] > 0)
-				retire_legacy_qp1_mirror_entry(
-					g_steer.legacy_qp1_filter_entry, path,
-					"post-clone path-IP filter");
+		for (uint8_t path = 0; path < NB_PATHS; path++) {
+			if (reduced[path] == 0)
+				continue;
+#if DOCA_VERSION_MINOR < 9
+			/* On 2.7, a mirrored CNP can be observed again by PCC before
+			 * the clone reaches the RSS filter. Retire the source-IP mirror
+			 * entry itself once this path has produced a reduced-rate flow. */
+			retire_legacy_qp1_mirror_entry(
+				g_steer.legacy_qp1_wire_entry, path,
+				"wire-ingress source-IP");
+#else
+			retire_legacy_qp1_mirror_entry(
+				g_steer.legacy_qp1_filter_entry, path,
+				"post-clone path-IP filter");
+#endif
+		}
 #endif
 
 		uint32_t path0 = PATH_SHARE_BUCKETS / 2;
