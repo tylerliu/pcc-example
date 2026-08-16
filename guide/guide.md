@@ -65,7 +65,7 @@ The colors identify QPs, not paths.
 Packets from either QP may be assigned to either virtual path by the sender-side multiplexer.
 At the receiver-side path emulator, however, each path marks only its designated probe QP:
 
-| Selected virtual path | QP eligible for ECN marking | PCC interpretation |
+| Selected virtual path | QP eligible for ECN marking | Interpretation |
 | --- | --- | --- |
 | Path 0 | Blue QP | Blue-QP congestion represents path 0 |
 | Path 1 | Green QP | Green-QP congestion represents path 1 |
@@ -117,22 +117,19 @@ For each outgoing RoCEv2 packet, the data plane performs the following steps:
 6. PF0 clears the private path bit and uses the destination IP to deliver blue traffic to receiver SF0 and green traffic to receiver SF1.
 
 Non-RoCE traffic bypasses the random classifier.
-ARP has an explicit forwarding path so neighbor discovery does not depend on the IPv4/RoCE rules.
 
 ## A.5 Feedback and steering loop
 
 Path selection is per packet, while congestion control and QP identification remain per transport flow.
-The host connects these two levels as follows:
+The feedback and steering loop operates as follows:
 
-1. QP1 RDMA-CM packets are cloned to a DPDK receive queue.
-   Parsing CM REQ messages associates each sender QPN with the receiver destination IP, and therefore with the blue/path-0 or green/path-1 probe group.
-2. PCC calculates a congestion-derived value for each sender QP on the DPA.
-3. On DOCA 3.x, PCC binary trace reports deliver those per-QPN values directly to the host callback.
+1. PCC calculates a congestion-derived value for each sender QP on the DPA.
+2. On DOCA 3.x, PCC binary trace reports deliver those per-QPN values directly to the host callback.
    On DOCA 2.7/2.9, the host retrieves the latest values from the PCC mailbox once per steering interval.
-4. The host averages reports over the interval and applies a persistent EWMA.
+3. The host averages reports over the interval and applies a persistent EWMA.
    Flows that have not yet been associated with a path are reported as `pending-map` and do not influence the ratio.
-5. The controller compares the aggregate reduced-rate signals for the two path groups and converts the result into a number of path-0 buckets out of 64.
-6. Only dispatch entries whose assignment crosses the old/new boundary are updated.
+4. The controller compares the aggregate reduced-rate signals for the two path groups and converts the result into a number of path-0 buckets out of 64.
+5. Only dispatch entries whose assignment crosses the old/new boundary are updated.
    No HASH entries are added or removed while traffic is running.
 
 At startup, 32 buckets are assigned to each path.
@@ -141,14 +138,11 @@ The 64-bucket representation gives a steering granularity of 1/64, or approximat
 
 ## A.6 What the experiment demonstrates
 
-The resulting system has three deliberately separate pieces of state:
-
-- **QP identity** distinguishes the two congestion probes.
-- **Destination IP** associates a QP with its probe group and receiver SF.
-- **DSCP path bit** records the path selected for one packet across the physical loopback.
-
-Keeping these labels separate allows PCC to supply path-specific congestion signals while DOCA Flow performs fast, per-packet steering.
-It also makes the example useful beyond the single-card topology: on a system with two real network paths, the private loopback marker and receiver-side path emulator could be replaced by actual next-hop selection and real path congestion.
+This experiment demonstrates how PCC and DOCA Flow can form a closed-loop traffic-steering system.
+PCC measures congestion for the probe QPs, and the host converts those measurements into a desired path share.
+DOCA Flow applies that share by updating the bucket dispatch entries while traffic continues, without rebuilding the random HASH pipe.
+Together, PCC provides the feedback signal and DOCA Flow enforces the resulting per-packet steering decision at line rate.
+The single-card loopback emulates the two paths for the tutorial, but the same control and steering design can target two real next hops.
 
 # Part B. Randomly assifying packets
 
