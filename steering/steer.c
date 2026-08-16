@@ -2200,12 +2200,18 @@ doca_error_t steer_start(const struct steer_opts *opts)
 	struct doca_flow_pipe *wire_target = receiver_target; /* wire-ingress fate */
 	struct doca_flow_pipe *sf_target = deliver_wire;  /* SF-egress fate */
 #if DOCA_VERSION_MAJOR < 3
-	if (do_egress)
+	if (do_egress) {
+#if DOCA_VERSION_MINOR < 9
+		DOCA_LOG_WARN("DOCA 2.7 diagnostic: wire-ingress feedback mirror disabled; "
+		              "automatic QPN/path learning unavailable");
+#else
 		install_qp1_clone_paths(g_steer.port, receiver_target, deliver_wire,
 		                        &wire_target, &sf_target, g_steer.opts.path_ip,
 		                        g_steer.legacy_qp1_wire_entry,
 		                        g_steer.legacy_qp1_sf_entry,
 		                        g_steer.legacy_qp1_filter_entry);
+#endif
+	}
 #endif
 
 	if (do_ingress) {
