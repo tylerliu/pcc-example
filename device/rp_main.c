@@ -329,6 +329,15 @@ void doca_pcc_dev_user_algo(doca_pcc_dev_algo_ctxt_t *algo_ctxt,
 skip_flow_summary:
 	;
 
+#if DOCA_VERSION_MAJOR == 2 && DOCA_VERSION_MINOR < 9
+	/* Passive 2.7 probe: the Flow pipelines have already been bypassed. Do not
+	 * execute the CC algorithm or publish rate state; merely expose the raw
+	 * events above and always leave hardware at maximum rate. */
+	results->rate = DOCA_PCC_DEV_MAX_RATE;
+	results->rtt_req = 0;
+	return;
+#endif
+
 #ifdef DOCA_PCC_SAMPLE_TX_BYTES
 	thread0_calc_ports_utilization();
 #endif
