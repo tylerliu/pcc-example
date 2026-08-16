@@ -24,6 +24,8 @@
  */
 
 #include <stdlib.h>
+#include <stdio.h>
+#include <stdint.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <string.h>
@@ -42,6 +44,55 @@ static const char *status_str[DOCA_PCC_PS_ERROR + 1] = {"Active", "Standby", "De
 static volatile sig_atomic_t host_stop;
 int log_level;
 static volatile sig_atomic_t got_debug_sig;
+
+static bool read_mlx5_hw_counter(const char *device, const char *counter, uint64_t *value)
+{
+	char path[256];
+	FILE *file;
+	unsigned long long parsed;
+
+	if (snprintf(path, sizeof(path),
+	             "/sys/class/infiniband/%s/ports/1/hw_counters/%s",
+	             device, counter) >= (int)sizeof(path))
+		return false;
+	file = fopen(path, "r");
+	if (file == NULL)
+		return false;
+	bool ok = fscanf(file, "%llu", &parsed) == 1;
+	fclose(file);
+	if (ok)
+		*value = (uint64_t)parsed;
+	return ok;
+}
+
+static void report_mlx5_cnp_counters(const char *device)
+{
+	static const char *const names[] = {
+		"rp_cnp_handled", "rp_cnp_ignored", "np_cnp_sent", "np_ecn_marked_roce_packets",
+	};
+	static uint64_t previous[sizeof(names) / sizeof(names[0])];
+	static bool valid[sizeof(names) / sizeof(names[0])];
+	bool any = false;
+
+	for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+		uint64_t value;
+		if (!read_mlx5_hw_counter(device, names[i], &value))
+			continue;
+		uint64_t delta = valid[i] ? value - previous[i] : 0;
+		PRINT_INFO("Info: mlx5 counter %s=%llu (+%llu)\n", names[i],
+		           (unsigned long long)value, (unsigned long long)delta);
+		previous[i] = value;
+		valid[i] = true;
+		any = true;
+	}
+	if (!any) {
+		static bool warned;
+		if (!warned) {
+			PRINT_WARNING("Warning: mlx5 CNP hardware counters unavailable for %s\n", device);
+			warned = true;
+		}
+	}
+}
 
 /*
  * Signal sigusr1 handler
@@ -274,6 +325,9 @@ int main(int argc, char **argv)
 		}
 
 		PRINT_INFO("Info: PCC host status %s\n", status_str[process_status]);
+#if DOCA_VERSION_MAJOR == 2 && DOCA_VERSION_MINOR < 9
+		report_mlx5_cnp_counters(cfg.device_name);
+#endif
 
 		if (process_status == DOCA_PCC_PS_DEACTIVATED || process_status == DOCA_PCC_PS_ERROR)
 			break;
