@@ -132,6 +132,8 @@ int main(int argc, char **argv)
 	doca_pcc_process_state_t process_status;
 	doca_error_t result, tmp_result;
 	int exit_status = EXIT_FAILURE;
+	bool pcc_started = false;
+	bool steering_started = false;
 #if DOCA_VERSION_MAJOR > 2 || (DOCA_VERSION_MAJOR == 2 && DOCA_VERSION_MINOR >= 8)
 	bool enable_debug = false;
 #endif
@@ -236,11 +238,13 @@ int main(int argc, char **argv)
 		PRINT_ERROR("Error: Failed to start PCC\n");
 		goto destroy_pcc;
 	}
+	pcc_started = true;
 
 	if (cfg.steer_enable) {
 		result = start_embedded_steering(argv[0], &cfg, resources.doca_device);
 		if (result != DOCA_SUCCESS)
 			goto destroy_pcc;
+		steering_started = true;
 		PRINT_INFO("Info: Embedded DOCA Flow egress steering active\n");
 	}
 
@@ -300,33 +304,38 @@ int main(int argc, char **argv)
 
 	PRINT_INFO("Info: Finished waiting on DOCA PCC\n");
 
-	/* Quiesce PCC before destroying the DOCA Flow hash profile consulted by
-	 * asynchronous rate-report callbacks. The shared doca_dev remains open until
-	 * pcc_destroy(), after steering has released its ports. */
-	tmp_result = doca_pcc_stop(resources.doca_pcc);
-	if (tmp_result != DOCA_SUCCESS) {
-		PRINT_ERROR("Error: Failed to stop DOCA PCC before steering cleanup: %s\n",
-		            doca_error_get_descr(tmp_result));
-		DOCA_ERROR_PROPAGATE(result, tmp_result);
-	}
-
-	if (cfg.steer_enable)
-		steer_stop();
-
 	exit_status = EXIT_SUCCESS;
 
 destroy_pcc:
+	/* Quiesce PCC before destroying Flow objects referenced by its asynchronous
+	 * callbacks, then release steering before closing the shared DOCA device. */
+	if (pcc_started) {
+		tmp_result = doca_pcc_stop(resources.doca_pcc);
+		if (tmp_result != DOCA_SUCCESS) {
+			PRINT_ERROR("Error: Failed to stop DOCA PCC before steering cleanup: %s\n",
+			            doca_error_get_descr(tmp_result));
+			DOCA_ERROR_PROPAGATE(result, tmp_result);
+			exit_status = EXIT_FAILURE;
+		}
+		pcc_started = false;
+	}
+	if (steering_started) {
+		steer_stop();
+		steering_started = false;
+	}
 	tmp_result = pcc_destroy(&resources);
 	if (tmp_result != DOCA_SUCCESS) {
 		PRINT_ERROR("Error: Failed to destroy DOCA PCC application resources: %s\n",
 			    doca_error_get_descr(tmp_result));
 		DOCA_ERROR_PROPAGATE(result, tmp_result);
+		exit_status = EXIT_FAILURE;
 	}
 argp_cleanup:
 	tmp_result = doca_argp_destroy();
 	if (tmp_result != DOCA_SUCCESS) {
 		PRINT_ERROR("Error: Failed to destroy ARGP: %s\n", doca_error_get_descr(tmp_result));
 		DOCA_ERROR_PROPAGATE(result, tmp_result);
+		exit_status = EXIT_FAILURE;
 	}
 	return exit_status;
 }

@@ -17,10 +17,8 @@
  *     device/representor and parser-port APIs. Hash-entry action_idx also only
  *     becomes an explicit argument in 3.4.
  *
- * These distinctions are kept here rather than at pipeline call sites. The
- * DOCA 2.x branch is porting
- * scaffolding only; see README.md "Future DOCA 2.7/2.9 port" before relying on
- * it with an older SDK.
+ * These distinctions stay here rather than leaking into pipeline call sites.
+ * The supported build matrix is DOCA 2.7, 2.9, 3.1, and 3.4.
  */
 
 #ifndef DOCA_FLOW_COMPAT_H_

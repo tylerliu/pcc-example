@@ -1991,26 +1991,47 @@ doca_error_t steer_start(const struct steer_opts *opts)
 {
 	if (g_steer.started)
 		return DOCA_ERROR_BAD_STATE;
+	if (opts == NULL)
+		return DOCA_ERROR_INVALID_VALUE;
+	if ((opts->role != STEER_ROLE_INGRESS && opts->role != STEER_ROLE_EGRESS &&
+	     opts->role != STEER_ROLE_BOTH) ||
+	    opts->force_path < -1 || opts->force_path >= NB_PATHS) {
+		DOCA_LOG_CRIT("invalid steering role or forced path");
+		return DOCA_ERROR_INVALID_VALUE;
+	}
+
+	const bool do_ingress = (opts->role != STEER_ROLE_EGRESS);
+	const bool do_egress = (opts->role != STEER_ROLE_INGRESS);
+	if (!opts->path_ip_set[0] || !opts->path_ip_set[1]) {
+		DOCA_LOG_CRIT("both path0-ip and path1-ip are required");
+		return DOCA_ERROR_INVALID_VALUE;
+	}
+#if DOCA_VERSION_MAJOR >= 3
+	if (opts->dev == NULL || opts->dev_rep == NULL) {
+		DOCA_LOG_CRIT("steer_start: opts->dev and opts->dev_rep are required on DOCA 3.x "
+		              "(open them via --device/--rep or DOCA device APIs)");
+		return DOCA_ERROR_INVALID_VALUE;
+	}
+	if (do_ingress && opts->dev_rep_path1 == NULL) {
+		DOCA_LOG_CRIT("ingress requires two receiver SF representors");
+		return DOCA_ERROR_INVALID_VALUE;
+	}
+#else
+	if (do_ingress && !opts->path1_sf_num_set) {
+		DOCA_LOG_CRIT("DOCA 2.x ingress requires -r and -R/--path1-rep");
+		return DOCA_ERROR_INVALID_VALUE;
+	}
+#endif
 
 	g_steer.opts = *opts;
 	atomic_flag_clear(&g_steer.rate_lock);
 
 #if DOCA_VERSION_MAJOR >= 3
-	if (opts->dev == NULL || opts->dev_rep == NULL) {
-		DOCA_LOG_CRIT("steer_start: opts->dev and opts->dev_rep are required on DOCA 3.x "
-			      "(open them via --device/--rep or DOCA device APIs)");
-		return DOCA_ERROR_INVALID_VALUE;
-	}
 	struct doca_dev *dev = opts->dev;
-	const bool probe_do_ingress = (g_steer.opts.role != STEER_ROLE_EGRESS);
+	const bool probe_do_ingress = do_ingress;
 	uint32_t probe_nb_sf_ports = probe_do_ingress ? NB_PATHS : 1;
 	struct doca_dev_rep *dev_reps[NB_PATHS] = {opts->dev_rep, opts->dev_rep_path1};
 
-	if (probe_do_ingress &&
-	    (opts->dev_rep_path1 == NULL || !opts->path_ip_set[0] || !opts->path_ip_set[1])) {
-		DOCA_LOG_CRIT("ingress requires two receiver SF representors and both path IPs");
-		return DOCA_ERROR_INVALID_VALUE;
-	}
 	probe_device(dev, opts->devargs, dev_reps, probe_nb_sf_ports);
 	configure_and_start_dpdk_port(dev);
 	initialize_doca_flow();
@@ -2021,14 +2042,10 @@ doca_error_t steer_start(const struct steer_opts *opts)
 		g_steer.sf_rep_port[1] = rep_port_start(SF_PATH1_PORT_ID, opts->dev_rep_path1);
 #else
 	char probe_args[160];
-	const bool probe_do_ingress = (g_steer.opts.role != STEER_ROLE_EGRESS);
+	const bool probe_do_ingress = do_ingress;
 	uint32_t probe_nb_sf_ports = probe_do_ingress ? NB_PATHS : 1;
 
 	if (probe_do_ingress) {
-		if (!opts->path1_sf_num_set) {
-			DOCA_LOG_CRIT("DOCA 2.x ingress requires -r and -R/--path1-rep");
-			return DOCA_ERROR_INVALID_VALUE;
-		}
 		snprintf(probe_args, sizeof(probe_args),
 		         "dv_flow_en=2,fdb_def_rule_en=1,repr_matching_en=0,representor=sf[%u,%u]",
 		         opts->sf_num, opts->path1_sf_num);
@@ -2059,13 +2076,6 @@ doca_error_t steer_start(const struct steer_opts *opts)
 	deliver_sf[0] = create_deliver_pipe(g_steer.port, "DELIVER_SF0", SF_PORT_ID);
 	struct doca_flow_pipe *deliver_wire = create_deliver_pipe(g_steer.port, "DELIVER_WIRE", WIRE_PORT_ID);
 
-	const bool do_ingress = (g_steer.opts.role != STEER_ROLE_EGRESS);
-	const bool do_egress = (g_steer.opts.role != STEER_ROLE_INGRESS);
-	if ((!g_steer.opts.path_ip_set[0] || !g_steer.opts.path_ip_set[1]) &&
-	    (do_ingress || do_egress)) {
-		DOCA_LOG_CRIT("both path0-ip and path1-ip are required");
-		return DOCA_ERROR_INVALID_VALUE;
-	}
 	DOCA_LOG_INFO("Configured path grouping: path0 IP=0x%08x path1 IP=0x%08x",
 	              rte_be_to_cpu_32(g_steer.opts.path_ip[0]),
 	              rte_be_to_cpu_32(g_steer.opts.path_ip[1]));
