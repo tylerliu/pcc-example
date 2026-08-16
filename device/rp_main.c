@@ -285,6 +285,30 @@ void doca_pcc_dev_user_algo(doca_pcc_dev_algo_ctxt_t *algo_ctxt,
 		else if (ev_type == DOCA_PCC_DEV_EVNT_ROCE_CNP) {
 			cnp_count[flow_bucket]++;
 			cnp_window_count[flow_bucket]++;
+#if DOCA_VERSION_MAJOR == 2 && DOCA_VERSION_MINOR < 9
+			/* Distinguish real/coalesced CNP traffic from an event replay or
+			 * association bug in the 2.7 PCC runtime. Keep this deliberately
+			 * sparse so the DPA trace itself cannot become the bottleneck. */
+			{
+				static uint32_t cnp27_diag_count;
+				uint32_t diag_count = ++cnp27_diag_count;
+				if (diag_count <= 16 || (diag_count & 0x3ff) == 0) {
+					doca_pcc_dev_ack_nack_cnp_extra_t extra =
+						doca_pcc_dev_get_ack_nack_cnp_extra(event);
+					doca_pcc_dev_printf(
+						"CNP27_DIAG n=%u flowtag=0x%x sn=%u ts=%u first_sn=%u "
+						"first_ts=%u coalesced=%u port=%u subtype=%u flags=0x%x\n",
+						diag_count, doca_pcc_dev_get_flowtag(event),
+						doca_pcc_dev_get_sn(event), doca_pcc_dev_get_timestamp(event),
+						doca_pcc_dev_get_roce_ack_first_sn(event),
+						doca_pcc_dev_get_roce_first_timestamp(event),
+						extra.num_coalesced, port_num,
+						doca_pcc_dev_get_ev_attr(event).ev_subtype,
+						doca_pcc_dev_get_ev_attr(event).flags);
+					doca_pcc_dev_trace_flush();
+				}
+			}
+#endif
 		}
 
 		if (now - last_print_ts[flow_bucket] > 1000000) {
