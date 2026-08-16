@@ -36,8 +36,8 @@
 /* Basic/hash entry APIs gained an explicit action_idx in DOCA 3.4. */
 #define STEER_HAS_EXPLICIT_ACTION_IDX STEER_DOCA_VERSION_GE(3, 4)
 
-/* 3.x has the native RANDOM HASH algorithm used by EGRESS_CLASSIFY. Keep the
- * old parser_meta.random BASIC implementation compiled for the 2.7/2.9 backend. */
+/* 3.x exposes the native RANDOM HASH configuration used by EGRESS_CLASSIFY.
+ * DOCA 2.x uses its older immutable HASH API for the same bucket classifier. */
 #define STEER_USE_RANDOM_HASH_CLASSIFIER (DOCA_VERSION_MAJOR >= 3)
 
 /* Native RoCEv2/BTH items and HASH forwarding were added in DOCA Flow 3.x. */
