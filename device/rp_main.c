@@ -26,6 +26,8 @@
 #include <doca_pcc_dev.h>
 #include <doca_pcc_dev_event.h>
 #include <doca_pcc_dev_algo_access.h>
+#include <doca_pcc_dev_services.h>
+#include <doca_version.h>
 #include "pcc_common_dev.h"
 #include "rtt_template.h"
 #include "rtt_template_ctxt.h"
@@ -36,6 +38,17 @@
 #define COUNTERS_SAMPLE_WINDOW_IN_MICROSEC (10)
 #define EVENT_SUMMARY_FLOW_BUCKETS (256)
 #define PCC_TRACE_MAX_WORKERS (1024)
+
+FORCE_INLINE uint32_t pcc_event_flow_qpn(doca_pcc_dev_event_t *event)
+{
+#if DOCA_VERSION_MAJOR > 2 || (DOCA_VERSION_MAJOR == 2 && DOCA_VERSION_MINOR >= 8)
+	return doca_pcc_dev_get_flow_qpn(event);
+#else
+	uint32_t value = __builtin_bswap32(*(uint32_t *)((uint8_t *)&event->ev_spec_attr.roce_tx + 8));
+
+	return value & 0x00FFFFFFu;
+#endif
+}
 #define PCC_TRACE_FLUSH_INTERVAL_US (1000000)
 /**< Counters IDs to configure and read from */
 uint32_t counter_ids[DOCA_PCC_DEV_MAX_NUM_PORTS] = {0};
@@ -51,6 +64,55 @@ uint32_t ports_bw[DOCA_PCC_DEV_MAX_NUM_PORTS];
 uint32_t ports_num = 0;
 /**< Percentage of the current active ports utilized bandwidth. Saved in FXP 16 format */
 uint32_t g_utilized_bw[DOCA_PCC_DEV_MAX_NUM_PORTS];
+
+#if DOCA_VERSION_MAJOR < 3
+static volatile uint32_t rate_mailbox_qpn[PCC_RATE_MAILBOX_MAX_FLOWS];
+static volatile uint32_t rate_mailbox_value[PCC_RATE_MAILBOX_MAX_FLOWS];
+static volatile uint32_t rate_mailbox_dropped;
+
+static void rate_mailbox_store(uint32_t qpn, uint32_t rate)
+{
+	uint32_t start = qpn % PCC_RATE_MAILBOX_MAX_FLOWS;
+
+	for (uint32_t probe = 0; probe < PCC_RATE_MAILBOX_MAX_FLOWS; probe++) {
+		uint32_t slot = (start + probe) % PCC_RATE_MAILBOX_MAX_FLOWS;
+		uint32_t owner = rate_mailbox_qpn[slot];
+
+		if (owner == 0 || owner == qpn) {
+			rate_mailbox_qpn[slot] = qpn;
+			rate_mailbox_value[slot] = rate;
+			return;
+		}
+	}
+	rate_mailbox_dropped++;
+}
+
+doca_pcc_dev_error_t doca_pcc_dev_user_mailbox_handle(void *request, uint32_t request_size,
+                                                        uint32_t max_response_size, void *response,
+                                                        uint32_t *response_size)
+{
+	struct pcc_rate_mailbox_response *out = response;
+	const struct pcc_rate_mailbox_request *in = request;
+
+	if (request_size != sizeof(*in) || in->version != PCC_RATE_MAILBOX_VERSION ||
+	    max_response_size < sizeof(*out))
+		return DOCA_PCC_DEV_STATUS_FAIL;
+	out->version = PCC_RATE_MAILBOX_VERSION;
+	out->count = 0;
+	out->dropped = rate_mailbox_dropped;
+	for (uint32_t i = 0; i < PCC_RATE_MAILBOX_MAX_FLOWS; i++) {
+		uint32_t qpn = rate_mailbox_qpn[i];
+
+		if (qpn == 0)
+			continue;
+		out->flow[out->count].qpn = qpn;
+		out->flow[out->count].rate = rate_mailbox_value[i];
+		out->count++;
+	}
+	*response_size = sizeof(*out);
+	return DOCA_PCC_DEV_STATUS_OK;
+}
+#endif /* DOCA_VERSION_MAJOR < 3 */
 /**< Flag to indicate that the counters have been initiated */
 uint32_t counters_started = 0;
 
@@ -180,7 +242,7 @@ void doca_pcc_dev_user_algo(doca_pcc_dev_algo_ctxt_t *algo_ctxt,
 	 * this QP on every event, including CNP, so retain the identity as an
 	 * explicit member of that per-QP context. */
 	if (ev_type == DOCA_PCC_DEV_EVNT_ROCE_TX) {
-		qpn = doca_pcc_dev_get_flow_qpn(event);
+		qpn = pcc_event_flow_qpn(event);
 		qpn_known = 1;
 		first_observed_flow = rtt_ctxt->flow_qpn == 0;
 		if (!first_observed_flow && rtt_ctxt->flow_qpn != qpn) {
@@ -249,7 +311,9 @@ skip_flow_summary:
 
 	/* Both rate state and its QPN identity live in the PCC-provided per-QP
 	 * algorithm context. */
+#if DOCA_VERSION_MAJOR >= 3
 	uint32_t prev_rate = rtt_ctxt->cur_rate;
+#endif
 
 	switch (attr->algo_slot) {
 	case 0: {
@@ -272,6 +336,11 @@ skip_flow_summary:
 	 * event and for host steering. Hardware enforcement is disabled below. */
 	uint32_t steering_rate = results->rate;
 
+#if DOCA_VERSION_MAJOR < 3
+	if (qpn_known)
+		rate_mailbox_store(qpn, steering_rate);
+#endif
+
 	/* TX establishes the QPN in this per-QP context. Every later event for the
 	 * same context, including CNP, can therefore publish its rate immediately. */
 	if (qpn_known) {
@@ -283,12 +352,15 @@ skip_flow_summary:
 		 * each QP's initial rate reaches the host even when its worker receives
 		 * no later PCC event. Subsequent changes use the per-worker cadence below.
 		 */
+#if DOCA_VERSION_MAJOR >= 3
 		uint32_t is_startup_report = first_observed_flow || prev_rate == 0;
 		doca_pcc_dev_trace_5(PCC_RATE_REPORT_FORMAT_ID, qpn, steering_rate,
 				     ev_type, rtt_ctxt->rtt, now);
-		rtt_ctxt->last_reported_rate = steering_rate;
 		if (is_startup_report)
 			doca_pcc_dev_trace_flush();
+#endif
+		/* DOCA 2.x has already published this update through rate_mailbox_store(). */
+		rtt_ctxt->last_reported_rate = steering_rate;
 	}
 
 skip_rate_report:
@@ -344,9 +416,10 @@ void doca_pcc_dev_user_init(uint32_t *disable_event_bitmask)
 
 	/* disable events of below type */
 	*disable_event_bitmask = DOCA_PCC_DEV_EVNT_ROCE_ACK_MASK;
-	if (DOCA_PCC_DEV_ACK_NACK_TX_EVENT_DISABLED_SUPPORTED == 1) {
+#ifdef DOCA_PCC_DEV_ACK_NACK_TX_EVENT_DISABLED_SUPPORTED
+	if (DOCA_PCC_DEV_ACK_NACK_TX_EVENT_DISABLED_SUPPORTED == 1)
 		*disable_event_bitmask |= (1 << DOCA_PCC_DEV_EVNT_ROCE_TX_FOR_ACK_NACK);
-	}
+#endif
 
 	doca_pcc_dev_printf("%s, disable_event_bitmask=0x%x\n", __func__, *disable_event_bitmask);
 	doca_pcc_dev_printf("DEBUG: user_init complete, waiting for events\n");

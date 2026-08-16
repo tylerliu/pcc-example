@@ -65,7 +65,9 @@ struct flow_rate_entry {
 
 static struct flow_rate_entry flow_rate_table[MAX_TRACKED_FLOWS];
 static uint32_t flow_rate_table_size = 0;
+#if DOCA_HAS_PCC_TRACE_REPORTS
 static uint32_t last_rate_print_ts = 0;
+#endif
 static uint64_t rate_reports_total = 0;
 static uint64_t rate_reports_since_print = 0;
 
@@ -86,10 +88,11 @@ static struct flow_rate_entry *find_or_create_flow(uint32_t qpn)
 	return NULL;
 }
 
+#if DOCA_HAS_PCC_TRACE_REPORTS
 /* doca_pcc_bin_report is intentionally opaque and changed layout while keeping
  * its 64-byte size. DOCA 3.1 uses the legacy FlexIO report (args at byte 16),
  * while DOCA 3.4 inserts an internal timestamp (args at byte 24). */
-#if DOCA_VERSION_MAJOR > 3 || (DOCA_VERSION_MAJOR == 3 && DOCA_VERSION_MINOR >= 4)
+#if DOCA_HAS_TIMESTAMPED_PCC_TRACE_LAYOUT
 struct pcc_trace_report {
 	uint32_t msg_number;
 	uint32_t seq_number;
@@ -165,6 +168,8 @@ static int rate_report_trace_handler(void *ctx, struct doca_pcc_bin_report *reps
 	return 0;
 }
 
+#endif /* DOCA_HAS_PCC_TRACE_REPORTS */
+
 /* Default PCC RP threads */
 const uint32_t default_pcc_rp_threads_list[PCC_RP_THREADS_NUM_DEFAULT_VALUE] = {
 	176, 177, 178, 179, 180, 181, 182, 183, 184, 185, 186, 187, 192, 193, 194, 195, 196,
@@ -185,7 +190,7 @@ static bool use_dpa_resources = false;
  */
 static bool use_dpa_application_key = false;
 
-#if DOCA_VERSION_MAJOR > 3 || (DOCA_VERSION_MAJOR == 3 && DOCA_VERSION_MINOR >= 4)
+#if DOCA_HAS_DPA_RESOURCES_FILE
 /**
  * @brief Get the size of a file
  *
@@ -349,7 +354,7 @@ static doca_error_t open_pcc_device(const char *device_name, struct doca_dev **d
 
 static doca_error_t create_dpa_resources(struct pcc_config *cfg)
 {
-#if DOCA_VERSION_MAJOR > 3 || (DOCA_VERSION_MAJOR == 3 && DOCA_VERSION_MINOR >= 4)
+#if DOCA_HAS_DPA_RESOURCES_FILE
 	char *file_buffer;
 	size_t bytes_read;
 	struct doca_pcc_resources *doca_pcc_resources;
@@ -436,14 +441,14 @@ doca_error_t pcc_init(struct pcc_config *cfg, struct pcc_resources *resources)
 	if (use_dpa_resources && use_threads_list) {
 		PRINT_ERROR(
 			"Error: Cannot specify both threads list and DPA resources. Use either threads list or DPA resources (with application key).\n");
-		return DOCA_ERROR_BAD_CONFIG;
+		return DOCA_ERROR_INVALID_VALUE;
 	}
 
 	/* If DPA resources are specified, read the DPA resources file */
 	if (use_dpa_resources) {
 		if (!use_dpa_application_key) {
 			PRINT_ERROR("Error: when using DPA resources file, DPA application key must be provided\n");
-			return DOCA_ERROR_BAD_CONFIG;
+			return DOCA_ERROR_INVALID_VALUE;
 		}
 		result = create_dpa_resources(cfg);
 		if (result != DOCA_SUCCESS) {
@@ -534,12 +539,24 @@ doca_error_t pcc_init(struct pcc_config *cfg, struct pcc_resources *resources)
 		goto destroy_pcc;
 	}
 
+#if DOCA_HAS_PCC_TRACE_REPORTS
 	/* Register trace handler for per-flow rate reports */
 	result = doca_pcc_register_trace_handler(resources->doca_pcc, rate_report_trace_handler, NULL);
 	if (result != DOCA_SUCCESS) {
 		PRINT_ERROR("Error: Failed to register trace handler for rate reports\n");
 		goto destroy_pcc;
 	}
+#endif
+
+#if !DOCA_HAS_PCC_TRACE_REPORTS
+	result = doca_pcc_set_mailbox(resources->doca_pcc,
+	                              sizeof(struct pcc_rate_mailbox_request),
+	                              sizeof(struct pcc_rate_mailbox_response));
+	if (result != DOCA_SUCCESS) {
+		PRINT_ERROR("Error: Failed to configure PCC rate mailbox\n");
+		goto destroy_pcc;
+	}
+#endif
 
 	/* Set DOCA PCC coredump file pathname */
 	result = doca_pcc_set_dev_coredump_file(resources->doca_pcc, cfg->coredump_file);
@@ -564,6 +581,62 @@ close_doca_dev:
 	}
 
 	return result;
+}
+
+doca_error_t pcc_poll_rate_reports(struct pcc_resources *resources)
+{
+#if !DOCA_HAS_PCC_TRACE_REPORTS
+	struct pcc_rate_mailbox_request *request;
+	struct pcc_rate_mailbox_response *response;
+	uint32_t response_size = 0;
+	uint32_t cb_ret = 0;
+	doca_error_t result;
+
+	result = doca_pcc_mailbox_get_request_buffer(resources->doca_pcc, (void **)&request);
+	if (result != DOCA_SUCCESS)
+		return result;
+	request->version = PCC_RATE_MAILBOX_VERSION;
+	result = doca_pcc_mailbox_send(resources->doca_pcc, sizeof(*request), &response_size, &cb_ret);
+	if (result != DOCA_SUCCESS)
+		return result;
+	if (cb_ret != 0 || response_size != sizeof(*response))
+		return DOCA_ERROR_BAD_STATE;
+	result = doca_pcc_mailbox_get_response_buffer(resources->doca_pcc, (void **)&response);
+	if (result != DOCA_SUCCESS)
+		return result;
+	if (response->version != PCC_RATE_MAILBOX_VERSION ||
+	    response->count > PCC_RATE_MAILBOX_MAX_FLOWS)
+		return DOCA_ERROR_BAD_STATE;
+
+	for (uint32_t i = 0; i < response->count; i++) {
+		struct flow_rate_entry *entry = find_or_create_flow(response->flow[i].qpn);
+
+		if (entry != NULL) {
+			entry->rate_sum += response->flow[i].rate;
+			entry->count++;
+			entry->last_rate = response->flow[i].rate;
+		}
+		steer_update_pcc_rate(response->flow[i].qpn, response->flow[i].rate);
+	}
+	rate_reports_since_print += response->count;
+	rate_reports_total += response->count;
+	printf("--- Per-flow rate averages (received=%llu total=%llu) ---\n",
+	       (unsigned long long)rate_reports_since_print,
+	       (unsigned long long)rate_reports_total);
+	for (uint32_t i = 0; i < flow_rate_table_size; i++) {
+		const struct flow_rate_entry *entry = &flow_rate_table[i];
+		uint32_t avg = (uint32_t)(entry->rate_sum / entry->count);
+
+		printf("  QPN 0x%x: avg_rate=%u last_rate=%u updates=%u\n",
+		       entry->qpn, avg, entry->last_rate, entry->count);
+	}
+	printf("---\n");
+	fflush(stdout);
+	rate_reports_since_print = 0;
+#else
+	(void)resources;
+#endif
+	return DOCA_SUCCESS;
 }
 
 doca_error_t pcc_destroy(struct pcc_resources *resources)
@@ -736,23 +809,6 @@ static doca_error_t coredump_file_callback(void *param, void *config)
 	return DOCA_SUCCESS;
 }
 
-/*
- * ARGP Callback - Enable embedded DOCA Flow path steering and set the receiver SF number.
- */
-static doca_error_t steer_sf_callback(void *param, void *config)
-{
-	struct pcc_config *pcc_cfg = (struct pcc_config *)config;
-	long v = atol((const char *)param);
-
-	if (v < 0 || v > UINT16_MAX) {
-		PRINT_ERROR("Error: --steer-sf must be in [0, %u]\n", UINT16_MAX);
-		return DOCA_ERROR_INVALID_VALUE;
-	}
-	pcc_cfg->steer_enable = true;
-	pcc_cfg->steer_sf_num = (uint32_t)v;
-	return DOCA_SUCCESS;
-}
-
 static doca_error_t steer_path_ip_callback(void *param, void *config, unsigned int path)
 {
 	struct pcc_config *cfg = config;
@@ -786,7 +842,7 @@ static doca_error_t steer_force_path_callback(void *param, void *config)
 	return DOCA_SUCCESS;
 }
 
-#if DOCA_VERSION_MAJOR >= 3
+#if DOCA_HAS_DEVICE_REPRESENTORS
 /*
  * ARGP Callback - PF device for embedded steering (DOCA 3.x, -a/--steer-dev).
  * Also enables steering. Usually the same PF the PCC RP runs on.
@@ -818,6 +874,20 @@ static doca_error_t steer_rep_callback(void *param, void *config)
 	pcc_cfg->steer_dev_rep = rep_ctx->dev_rep;
 	if (rep_ctx->dev_ctx.devargs)
 		pcc_cfg->steer_devargs = rep_ctx->dev_ctx.devargs;
+	return DOCA_SUCCESS;
+}
+#else
+static doca_error_t steer_rep_callback(void *param, void *config)
+{
+	struct pcc_config *pcc_cfg = config;
+	doca_error_t err = steer_parse_rep_spec(param, pcc_cfg->steer_pci_addr,
+	                                        &pcc_cfg->steer_sf_num);
+
+	if (err != DOCA_SUCCESS) {
+		PRINT_ERROR("Error: -r must use pci/<BDF>,pf<N>sf<N> syntax\n");
+		return err;
+	}
+	pcc_cfg->steer_enable = true;
 	return DOCA_SUCCESS;
 }
 #endif
@@ -887,7 +957,6 @@ doca_error_t register_pcc_params(void)
 	struct doca_argp_param *wait_time_param;
 	struct doca_argp_param *remote_sw_handler_param;
 	struct doca_argp_param *coredump_file_param;
-	struct doca_argp_param *steer_sf_param;
 	struct doca_argp_param *dpa_resources_file;
 	struct doca_argp_param *dpa_application_key;
 
@@ -990,25 +1059,6 @@ doca_error_t register_pcc_params(void)
 		return result;
 	}
 
-	/* Create and register embedded steering enable + receiver SF number parameter */
-	result = doca_argp_param_create(&steer_sf_param);
-	if (result != DOCA_SUCCESS) {
-		PRINT_ERROR("Error: Failed to create ARGP param: %s\n", doca_error_get_descr(result));
-		return result;
-	}
-	doca_argp_param_set_long_name(steer_sf_param, "steer-sf");
-	doca_argp_param_set_arguments(steer_sf_param, "<sf-num>");
-	doca_argp_param_set_description(
-		steer_sf_param,
-		"Enable embedded DOCA Flow path steering on the given receiver SF number (optional).");
-	doca_argp_param_set_callback(steer_sf_param, steer_sf_callback);
-	doca_argp_param_set_type(steer_sf_param, DOCA_ARGP_TYPE_STRING);
-	result = doca_argp_register_param(steer_sf_param);
-	if (result != DOCA_SUCCESS) {
-		PRINT_ERROR("Error: Failed to register program param: %s\n", doca_error_get_descr(result));
-		return result;
-	}
-
 	struct doca_argp_param *path0_ip_param, *path1_ip_param, *force_path_param;
 	result = doca_argp_param_create(&path0_ip_param);
 	if (result != DOCA_SUCCESS)
@@ -1047,50 +1097,42 @@ doca_error_t register_pcc_params(void)
 	if (result != DOCA_SUCCESS)
 		return result;
 
-#if DOCA_VERSION_MAJOR >= 3
-	/* Create and register the sender SF representor param for embedded steering.
-	 * Opens the PF dev + SF rep that steer_start() needs (DOCA 3.x). */
 	struct doca_argp_param *steer_rep_param;
 
 	result = doca_argp_param_create(&steer_rep_param);
-	if (result != DOCA_SUCCESS) {
-		PRINT_ERROR("Error: Failed to create ARGP param: %s\n", doca_error_get_descr(result));
+	if (result != DOCA_SUCCESS)
 		return result;
-	}
 	doca_argp_param_set_short_name(steer_rep_param, "r");
 	doca_argp_param_set_long_name(steer_rep_param, "steer-rep");
-	doca_argp_param_set_arguments(steer_rep_param, "<pci/bdf,sf>");
-	doca_argp_param_set_description(
-		steer_rep_param,
-		"Enable embedded DOCA Flow egress steering on the given sender SF representor, e.g. pci/0000:03:00.1,pf1sf0 (optional, DOCA 3.x).");
+	doca_argp_param_set_arguments(steer_rep_param, "<pci/bdf,pfNsfN>");
+	doca_argp_param_set_description(steer_rep_param,
+		"Enable embedded DOCA Flow egress steering on the sender SF representor.");
 	doca_argp_param_set_callback(steer_rep_param, steer_rep_callback);
+#if DOCA_HAS_DEVICE_REPRESENTORS
 	doca_argp_param_set_type(steer_rep_param, DOCA_ARGP_TYPE_DEVICE_REP);
+#else
+	doca_argp_param_set_type(steer_rep_param, DOCA_ARGP_TYPE_STRING);
+#endif
 	result = doca_argp_register_param(steer_rep_param);
-	if (result != DOCA_SUCCESS) {
-		PRINT_ERROR("Error: Failed to register program param: %s\n", doca_error_get_descr(result));
+	if (result != DOCA_SUCCESS)
 		return result;
-	}
 
-	/* Optional explicit PF device for steering (defaults to the -r device). */
+#if DOCA_HAS_DEVICE_REPRESENTORS
 	struct doca_argp_param *steer_dev_param;
 
 	result = doca_argp_param_create(&steer_dev_param);
-	if (result != DOCA_SUCCESS) {
-		PRINT_ERROR("Error: Failed to create ARGP param: %s\n", doca_error_get_descr(result));
+	if (result != DOCA_SUCCESS)
 		return result;
-	}
 	doca_argp_param_set_short_name(steer_dev_param, "a");
 	doca_argp_param_set_long_name(steer_dev_param, "steer-dev");
 	doca_argp_param_set_arguments(steer_dev_param, "<pci/bdf>");
 	doca_argp_param_set_description(steer_dev_param,
-				       "Explicit PF device for embedded steering (optional, DOCA 3.x).");
+		"Explicit PF device for embedded steering (optional, DOCA 3.x).");
 	doca_argp_param_set_callback(steer_dev_param, steer_device_callback);
 	doca_argp_param_set_type(steer_dev_param, DOCA_ARGP_TYPE_DEVICE);
 	result = doca_argp_register_param(steer_dev_param);
-	if (result != DOCA_SUCCESS) {
-		PRINT_ERROR("Error: Failed to register program param: %s\n", doca_error_get_descr(result));
+	if (result != DOCA_SUCCESS)
 		return result;
-	}
 #endif
 
 	/* Create and register DPA resources file parameter */

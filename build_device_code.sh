@@ -68,6 +68,9 @@ APPLICATION_DPA_ATTRIBUTES_BLOB="${APPLICATION_DEVICE_BUILD_DIR}/${PCC_APP_NAME}
 if [ "${PCC_APP_NAME}" = "pcc_rp_rtt_template_app" ]
 then
         DOCA_PCC_DEV_LIB_NAME="doca_pcc_dev"
+        if [ -f "${DOCA_LIB_DIR}/libdoca_pcc_dev_bf3.a" ]; then
+                DOCA_PCC_DEV_LIB_NAME="doca_pcc_dev_bf3"
+        fi
         PCC_APP_DEVICE_SRCS=`ls ${PCC_APP_DEVICE_SRC_DIR}/*.c`
         PCC_APP_DEVICE_ALGO_SRCS=`ls ${PCC_APP_DEVICE_SRC_DIR}/algo/*.c`
         PCC_DEVICE_SRC_FILES="${PCC_APP_DEVICE_SRCS} ${PCC_APP_DEVICE_ALGO_SRCS}"
@@ -146,12 +149,19 @@ else
 	DPACC_MCPU_FLAG="${DPACC_MCPU_FLAG%%,*}"
 fi
 
+# DOCA 2.7 dpacc predates -mcpu; later compilers require it.
+DPACC_MCPU_OPTION=""
+if "${DPACC}" --help 2>&1 | grep -q -- "-mcpu"
+then
+	DPACC_MCPU_OPTION="-mcpu=${DPACC_MCPU_FLAG}"
+fi
+
 # Compile the DPA (kernel) device source code using the DPACC
 $DPACC \
 -flto \
 $PCC_DEVICE_SRC_FILES \
 -o ${APPLICATION_DEVICE_BUILD_DIR}/${PCC_APP_NAME}.a \
--mcpu=${DPACC_MCPU_FLAG} \
+${DPACC_MCPU_OPTION} \
 -hostcc=gcc \
 -hostcc-options="${HOST_CC_FLAGS}" \
 --devicecc-options="${DEVICE_CC_FLAGS}, ${APP_FLAGS}, ${APP_INC_LIST}" \

@@ -46,10 +46,13 @@ enum steer_role {
 };
 
 struct steer_opts {
-	uint32_t sf_num;			      /* receiver SF number (DOCA 2.9 discovery only) */
+	uint32_t sf_num;			      /* path-0/sender SF parsed from -r on DOCA 2.x */
+	uint32_t path1_sf_num;			      /* second receiver SF (DOCA 2.x ingress) */
+	bool path1_sf_num_set;
 	int role;				      /* enum steer_role */
 	double path_percent[STEER_NB_PATHS];	      /* per-path CE-mark percentage [0,100] */
-	/* DOCA 3.x device discovery: caller opens these (argp --device/--rep or DOCA APIs). */
+	char device_pci_addr[DOCA_DEVINFO_PCI_ADDR_SIZE]; /* DOCA 2.x PF parsed from -r */
+	/* Device handle is supplied directly by embedded PCC on 2.x and by argp on 3.x. */
 	struct doca_dev *dev;			      /* PF device */
 	struct doca_dev_rep *dev_rep;		      /* SF representor */
 	struct doca_dev_rep *dev_rep_path1;	      /* second receiver SF representor (ingress role) */
@@ -59,6 +62,10 @@ struct steer_opts {
 	int force_path;                           /* diagnostic: -1 dynamic; 3.x bypasses classifier for 0/1 */
 	const char *devargs;			      /* optional probe devargs (default dv_flow_en=2,fdb_def_rule_en=1) */
 };
+
+/* Parse pci/<BDF>,pf<PF>sf<SF> representor syntax used by -r/-R. */
+doca_error_t steer_parse_rep_spec(const char *spec,
+                                  char pci_addr[DOCA_DEVINFO_PCI_ADDR_SIZE], uint32_t *sf_num);
 
 /* Fill opts with defaults (100% CE on both paths). */
 void steer_default_opts(struct steer_opts *opts);
@@ -83,6 +90,9 @@ doca_error_t steer_start(const struct steer_opts *opts);
  * RDMA-CM grouping associates the sender QPN with its destination-IP path.
  */
 void steer_update_pcc_rate(uint32_t qpn, uint32_t rate);
+
+/* Drain cloned packets without running the one-second control/statistics work. */
+void steer_poll_rx(void);
 
 /* Calculate/apply the PCC path share and log counters. */
 void steer_poll(void);

@@ -17,32 +17,29 @@
  *     device/representor and parser-port APIs. Hash-entry action_idx also only
  *     becomes an explicit argument in 3.4.
  *
- * These distinctions are kept here rather than at pipeline call sites. The
- * DOCA 2.x branch is porting
- * scaffolding only; see README.md "Future DOCA 2.7/2.9 port" before relying on
- * it with an older SDK.
+ * These distinctions stay here rather than leaking into pipeline call sites.
+ * The supported build matrix is DOCA 2.7, 2.9, 3.1, and 3.4.
  */
 
 #ifndef DOCA_FLOW_COMPAT_H_
 #define DOCA_FLOW_COMPAT_H_
 
 #include <doca_flow.h>
-#include <doca_version.h>
-
-#define STEER_DOCA_VERSION_GE(major, minor) \
-	((DOCA_VERSION_MAJOR > (major)) || \
-	 (DOCA_VERSION_MAJOR == (major) && DOCA_VERSION_MINOR >= (minor)))
+#include "pcc_doca_compat.h"
 
 /* Basic/hash entry APIs gained an explicit action_idx in DOCA 3.4. */
-#define STEER_HAS_EXPLICIT_ACTION_IDX STEER_DOCA_VERSION_GE(3, 4)
+#define STEER_HAS_EXPLICIT_ACTION_IDX DOCA_HAS_EXPLICIT_FLOW_ACTION_INDEX
 
-/* 3.x has the native RANDOM HASH algorithm used by EGRESS_CLASSIFY. Keep the
- * old parser_meta.random BASIC implementation compiled only for the future
- * 2.7/2.9 port. */
-#define STEER_USE_RANDOM_HASH_CLASSIFIER (DOCA_VERSION_MAJOR >= 3)
+/* 3.x exposes the native RANDOM HASH configuration used by EGRESS_CLASSIFY.
+ * DOCA 2.x uses its older immutable HASH API for the same bucket classifier. */
+#define STEER_USE_RANDOM_HASH_CLASSIFIER DOCA_HAS_NATIVE_FLOW_HASH
+
+/* Native RoCEv2/BTH items and HASH forwarding were added in DOCA Flow 3.x. */
+#define STEER_HAS_ROCE_MATCH DOCA_HAS_NATIVE_FLOW_HASH
+#define STEER_HAS_HASH_FWD DOCA_HAS_NATIVE_FLOW_HASH
 
 /* Counter allocation moved from the global Flow cfg to individual ports in 3.2. */
-#define STEER_HAS_PORT_RESOURCE_MODE STEER_DOCA_VERSION_GE(3, 2)
+#define STEER_HAS_PORT_RESOURCE_MODE DOCA_HAS_PORT_FLOW_RESOURCES
 
 #if STEER_HAS_EXPLICIT_ACTION_IDX
 
@@ -53,7 +50,7 @@
 #define STEER_NO_WAIT DOCA_FLOW_NO_WAIT
 #endif
 
-#if DOCA_VERSION_MAJOR >= 3
+#if DOCA_HAS_NATIVE_FLOW_HASH
 /* parser_meta source-port field name (used as .parser_meta.STEER_PARSER_PORT). */
 #define STEER_PARSER_PORT port_id
 /* All-ones wildcard sized to the source-port field (uint16_t on 3.x). */
@@ -64,7 +61,7 @@ static inline doca_error_t steer_port_cfg_set_port_id(struct doca_flow_port_cfg 
 	return doca_flow_port_cfg_set_port_id(cfg, port_id);
 }
 
-#else /* DOCA 2.9 */
+#else /* DOCA 2.x */
 
 #define STEER_PARSER_PORT port_meta
 /* All-ones wildcard sized to the source-port field (uint32_t on 2.9). */
@@ -80,6 +77,112 @@ static inline doca_error_t steer_port_cfg_set_port_id(struct doca_flow_port_cfg 
 }
 
 #endif
+
+/* RSS forwarding was flattened in 2.x and moved below an rss member in 3.x. */
+static inline void steer_fwd_set_rss(struct doca_flow_fwd *fwd, uint16_t *queues,
+                                      uint16_t nr_queues, uint32_t flags)
+{
+	fwd->type = DOCA_FLOW_FWD_RSS;
+#if DOCA_HAS_NATIVE_FLOW_HASH
+	fwd->rss_type = DOCA_FLOW_RESOURCE_TYPE_NON_SHARED;
+	fwd->rss.queues_array = queues;
+	fwd->rss.nr_queues = nr_queues;
+	fwd->rss.inner_flags = flags;
+#else
+	fwd->rss_queues = queues;
+	fwd->num_of_queues = nr_queues;
+	fwd->rss_outer_flags = flags;
+#endif
+}
+
+/* RoCEv2 is ordinary IPv4/UDP 4791 to the 2.x public Flow parser. */
+static inline void steer_set_roce_udp_match(struct doca_flow_match *match,
+                                             struct doca_flow_match *mask,
+                                             doca_be16_t dst_port)
+{
+#if STEER_HAS_ROCE_MATCH
+	match->outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;
+	match->outer.l4_type_ext = DOCA_FLOW_L4_TYPE_EXT_ROCE_V2;
+	match->outer.roce_v2.udp.l4_port.dst_port = dst_port;
+	mask->outer.roce_v2.udp.l4_port.dst_port = UINT16_MAX;
+#else
+	/* DOCA 2.x selects IPv4/UDP through parser metadata. Keep UDP 4791
+	 * fixed in the template; marking it changeable with only a mask creates
+	 * an invalid protocol-only HWS item. */
+	match->parser_meta.outer_l3_type = DOCA_FLOW_L3_META_IPV4;
+	match->parser_meta.outer_l4_type = DOCA_FLOW_L4_META_UDP;
+	match->outer.l4_type_ext = DOCA_FLOW_L4_TYPE_EXT_UDP;
+	match->outer.udp.l4_port.dst_port = dst_port;
+	(void)mask;
+#endif
+}
+
+/* DOCA 2.x treats even an all-zero parser-meta mask as an explicit ptype
+ * mask, which HWS does not support. Protocol and UDP-port values are fixed in
+ * the pipe template there, so no mask is required. */
+static inline struct doca_flow_match *steer_roce_udp_match_mask(
+	struct doca_flow_match *mask)
+{
+#if STEER_HAS_ROCE_MATCH
+	return mask;
+#else
+	(void)mask;
+	return NULL;
+#endif
+}
+
+#if DOCA_USES_LEGACY_FLOW_BACKEND
+/* DOCA 2.7 requires the mirror resource to carry the original-packet
+ * destination. DOCA 2.9 rejects that field and falls back to the pipe entry
+ * forwarding instead. */
+static inline void steer_mirror_set_original_fwd(
+	struct doca_flow_shared_resource_cfg *cfg,
+	const struct doca_flow_fwd *original_fwd)
+{
+#if DOCA_HAS_MIRROR_ORIGINAL_FWD
+	cfg->mirror_cfg.fwd = *original_fwd;
+#else
+	(void)cfg;
+	(void)original_fwd;
+#endif
+}
+#endif
+
+struct steer_resource_query {
+	uint64_t total_bytes;
+	uint64_t total_pkts;
+};
+
+static inline doca_error_t steer_shared_resource_set_cfg(
+	enum doca_flow_shared_resource_type type, uint32_t id,
+	struct doca_flow_shared_resource_cfg *cfg)
+{
+#if DOCA_HAS_FLOW_SHARED_RESOURCE_SET_CFG
+	return doca_flow_shared_resource_set_cfg(type, id, cfg);
+#else
+	return doca_flow_shared_resource_cfg(type, id, cfg);
+#endif
+}
+
+static inline doca_error_t steer_query_entry(struct doca_flow_pipe_entry *entry,
+                                              struct steer_resource_query *query)
+{
+#if DOCA_HAS_FLOW_SHARED_RESOURCE_SET_CFG
+	struct doca_flow_resource_query sdk_query = {0};
+	doca_error_t err = doca_flow_resource_query_entry(entry, &sdk_query);
+
+	query->total_bytes = sdk_query.counter.total_bytes;
+	query->total_pkts = sdk_query.counter.total_pkts;
+	return err;
+#else
+	struct doca_flow_query sdk_query = {0};
+	doca_error_t err = doca_flow_query_entry(entry, &sdk_query);
+
+	query->total_bytes = sdk_query.total_bytes;
+	query->total_pkts = sdk_query.total_pkts;
+	return err;
+#endif
+}
 
 /*
  * Unified add-entry. action_idx selects the action template slot provided at pipe
@@ -145,6 +248,16 @@ static inline doca_error_t steer_pipe_hash_add_entry(uint16_t queue, struct doca
 	return doca_flow_pipe_hash_add_entry(queue, pipe, entry_index, actions,
 					     (struct doca_flow_monitor *)monitor, (struct doca_flow_fwd *)fwd,
 					     flags, usr_ctx, entry);
+#endif
+}
+
+static inline doca_error_t steer_pipe_remove_entry(uint16_t queue, uint32_t flags,
+                                                   struct doca_flow_pipe_entry *entry)
+{
+#if DOCA_USES_LEGACY_PIPE_RM_API
+	return doca_flow_pipe_rm_entry(queue, flags, entry);
+#else
+	return doca_flow_pipe_remove_entry(queue, flags, entry);
 #endif
 }
 

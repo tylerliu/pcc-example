@@ -74,12 +74,16 @@ static void sigint_handler(int dummy)
  * on the receiver's PF. EAL is initialized with a minimal argv; the device and
  * SF representor are opened by DOCA argp (-a/-r) and passed in via cfg.
  */
-static doca_error_t start_embedded_steering(char *prog_name, const struct pcc_config *cfg)
+static doca_error_t start_embedded_steering(char *prog_name, const struct pcc_config *cfg,
+                                                   struct doca_dev *pcc_dev)
 {
 	struct steer_opts sopts;
 	doca_error_t result;
 
-	(void)prog_name; /* used only on the DOCA 2.9 EAL-init path below */
+	(void)prog_name; /* used only on the DOCA 2.x EAL-init path below */
+#if DOCA_HAS_DEVICE_REPRESENTORS
+	(void)pcc_dev;
+#endif
 	steer_default_opts(&sopts);
 	sopts.role = STEER_ROLE_EGRESS;
 	sopts.sf_num = cfg->steer_sf_num;
@@ -88,7 +92,7 @@ static doca_error_t start_embedded_steering(char *prog_name, const struct pcc_co
 		sopts.path_ip[path] = cfg->steer_path_ip[path];
 		sopts.path_ip_set[path] = cfg->steer_path_ip_set[path];
 	}
-#if DOCA_VERSION_MAJOR >= 3
+#if DOCA_HAS_DEVICE_REPRESENTORS
 	sopts.dev = cfg->steer_dev;
 	sopts.dev_rep = cfg->steer_dev_rep;
 	sopts.devargs = cfg->steer_devargs;
@@ -98,6 +102,8 @@ static doca_error_t start_embedded_steering(char *prog_name, const struct pcc_co
 	}
 	/* EAL was already initialized in main() (before argp opened the -r device). */
 #else
+	sopts.dev = pcc_dev;
+	memcpy(sopts.device_pci_addr, cfg->steer_pci_addr, sizeof(sopts.device_pci_addr));
 	char *eal_argv[1] = {prog_name};
 
 	result = steer_eal_init(1, eal_argv, steer_eal_prefix_for_role(sopts.role));
@@ -126,7 +132,11 @@ int main(int argc, char **argv)
 	doca_pcc_process_state_t process_status;
 	doca_error_t result, tmp_result;
 	int exit_status = EXIT_FAILURE;
+	bool pcc_started = false;
+	bool steering_started = false;
+#if DOCA_HAS_PCC_DEBUG_API
 	bool enable_debug = false;
+#endif
 	struct doca_log_backend *sdk_log;
 
 	/* Set the default configuration values (Example values) */
@@ -169,7 +179,7 @@ int main(int argc, char **argv)
 	 * Probe again" error. Pre-scan argv and init EAL here; start_embedded_steering()
 	 * then only builds the pipeline. (Embedded steering is always the egress role.)
 	 */
-#if DOCA_VERSION_MAJOR >= 3
+#if DOCA_HAS_DEVICE_REPRESENTORS
 	for (int i = 1; i < argc; i++) {
 		if (strcmp(argv[i], "-r") != 0 && strcmp(argv[i], "--steer-rep") != 0)
 			continue;
@@ -185,7 +195,7 @@ int main(int argc, char **argv)
 #endif
 
 	/* Initialize argparser */
-	result = doca_argp_init(NULL, &cfg);
+	result = doca_argp_init("doca_pcc", &cfg);
 	if (result != DOCA_SUCCESS) {
 		PRINT_ERROR("Error: Failed to init ARGP resources: %s\n", doca_error_get_descr(result));
 		return EXIT_FAILURE;
@@ -228,17 +238,20 @@ int main(int argc, char **argv)
 		PRINT_ERROR("Error: Failed to start PCC\n");
 		goto destroy_pcc;
 	}
+	pcc_started = true;
 
 	if (cfg.steer_enable) {
-		result = start_embedded_steering(argv[0], &cfg);
+		result = start_embedded_steering(argv[0], &cfg, resources.doca_device);
 		if (result != DOCA_SUCCESS)
 			goto destroy_pcc;
+		steering_started = true;
 		PRINT_INFO("Info: Embedded DOCA Flow egress steering active\n");
 	}
 
 	host_stop = false;
 	PRINT_INFO("Info: Press ctrl + C to exit\n");
 	while (!host_stop) {
+#if DOCA_HAS_PCC_DEBUG_API
 		if (got_debug_sig) {
 			if (enable_debug == false) {
 				enable_debug = true;
@@ -254,6 +267,9 @@ int main(int argc, char **argv)
 			}
 			got_debug_sig = 0;
 		}
+#else
+		got_debug_sig = 0;
+#endif
 		result = doca_pcc_get_process_state(resources.doca_pcc, &process_status);
 		if (result != DOCA_SUCCESS) {
 			PRINT_ERROR("Error: Failed to query PCC\n");
@@ -267,8 +283,15 @@ int main(int argc, char **argv)
 
 		if (cfg.steer_enable) {
 			/* Drive the embedded steering decision + counters ~1/s. */
+			tmp_result = pcc_poll_rate_reports(&resources);
+			if (tmp_result != DOCA_SUCCESS)
+				PRINT_WARNING("Warning: failed to poll PCC rate reports: %s\n",
+				              doca_error_get_descr(tmp_result));
 			steer_poll();
-			sleep(1);
+			for (uint32_t i = 0; i < 100 && !host_stop; i++) {
+				steer_poll_rx();
+				usleep(10000);
+			}
 		} else {
 			PRINT_INFO("Info: Waiting on DOCA PCC\n");
 			result = doca_pcc_wait(resources.doca_pcc, cfg.wait_time);
@@ -281,33 +304,38 @@ int main(int argc, char **argv)
 
 	PRINT_INFO("Info: Finished waiting on DOCA PCC\n");
 
-	/* Quiesce PCC before destroying the DOCA Flow hash profile consulted by
-	 * asynchronous rate-report callbacks. The shared doca_dev remains open until
-	 * pcc_destroy(), after steering has released its ports. */
-	tmp_result = doca_pcc_stop(resources.doca_pcc);
-	if (tmp_result != DOCA_SUCCESS) {
-		PRINT_ERROR("Error: Failed to stop DOCA PCC before steering cleanup: %s\n",
-		            doca_error_get_descr(tmp_result));
-		DOCA_ERROR_PROPAGATE(result, tmp_result);
-	}
-
-	if (cfg.steer_enable)
-		steer_stop();
-
 	exit_status = EXIT_SUCCESS;
 
 destroy_pcc:
+	/* Quiesce PCC before destroying Flow objects referenced by its asynchronous
+	 * callbacks, then release steering before closing the shared DOCA device. */
+	if (pcc_started) {
+		tmp_result = doca_pcc_stop(resources.doca_pcc);
+		if (tmp_result != DOCA_SUCCESS) {
+			PRINT_ERROR("Error: Failed to stop DOCA PCC before steering cleanup: %s\n",
+			            doca_error_get_descr(tmp_result));
+			DOCA_ERROR_PROPAGATE(result, tmp_result);
+			exit_status = EXIT_FAILURE;
+		}
+		pcc_started = false;
+	}
+	if (steering_started) {
+		steer_stop();
+		steering_started = false;
+	}
 	tmp_result = pcc_destroy(&resources);
 	if (tmp_result != DOCA_SUCCESS) {
 		PRINT_ERROR("Error: Failed to destroy DOCA PCC application resources: %s\n",
 			    doca_error_get_descr(tmp_result));
 		DOCA_ERROR_PROPAGATE(result, tmp_result);
+		exit_status = EXIT_FAILURE;
 	}
 argp_cleanup:
 	tmp_result = doca_argp_destroy();
 	if (tmp_result != DOCA_SUCCESS) {
 		PRINT_ERROR("Error: Failed to destroy ARGP: %s\n", doca_error_get_descr(tmp_result));
 		DOCA_ERROR_PROPAGATE(result, tmp_result);
+		exit_status = EXIT_FAILURE;
 	}
 	return exit_status;
 }

@@ -27,6 +27,7 @@
 #define PCC_CORE_H_
 
 #include <doca_pcc.h>
+#include "pcc_doca_compat.h"
 #include <doca_dev.h>
 #include <doca_error.h>
 #include <stdbool.h>
@@ -96,7 +97,8 @@ struct pcc_config {
 	bool remote_sw_handler;				 /* CCMAD probe type remote SW handler flag */
 	char coredump_file[MAX_ARG_SIZE];		 /* Coredump file pathname */
 	bool steer_enable;			 /* Enable embedded DOCA Flow path steering */
-	uint32_t steer_sf_num;			 /* Receiver SF number for embedded steering (DOCA 2.9) */
+	uint32_t steer_sf_num;			 /* Sender SF parsed from -r on DOCA 2.x */
+	char steer_pci_addr[DOCA_DEVINFO_PCI_ADDR_SIZE]; /* Sender PF parsed from -r on DOCA 2.x */
 	struct doca_dev *steer_dev;		 /* Sender PF device for steering (DOCA 3.x, from -a/-r) */
 	struct doca_dev_rep *steer_dev_rep;	 /* Sender SF representor for steering (DOCA 3.x, from -r) */
 	const char *steer_devargs;		 /* Optional probe devargs for steering (DOCA 3.x) */
@@ -128,6 +130,8 @@ doca_error_t pcc_init(struct pcc_config *cfg, struct pcc_resources *resources);
  * @resources [in]: PCC resources
  * @return: DOCA_SUCCESS on success and DOCA_ERROR otherwise
  */
+doca_error_t pcc_poll_rate_reports(struct pcc_resources *resources);
+
 doca_error_t pcc_destroy(struct pcc_resources *resources);
 
 /*
