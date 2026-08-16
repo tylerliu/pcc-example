@@ -1,0 +1,186 @@
+digraph end_to_end_data_path {
+  /* Use render-end-to-end-data-path-dual-flow.sh to regenerate SVG and PNG. */
+  rankdir=LR;
+  newrank=true;
+  compound=true;
+  splines=spline;
+  fontname="Helvetica";
+  labelloc="t";
+  fontsize=16;
+  label="DOCA Flow + DOCA PCC — Dual RoCE Data Flows";
+  nodesep=0.58;
+  ranksep=0.82;
+  node [fontname="Helvetica", fontsize=10, shape=box,
+        style="rounded,filled", fillcolor="#f5f5f5"];
+  edge [fontname="Helvetica", fontsize=9];
+
+  subgraph cluster_arm {
+    label="ARM cores";
+    style="rounded";
+    color="#666666";
+    fontsize=13;
+
+    receiver [label="Receiver", fillcolor="#eeeeee"];
+    sender [label="Sender", fillcolor="#eeeeee"];
+    pcc_host [label="PCC host", fillcolor="#eeeeee"];
+    { rank=same; receiver; sender; pcc_host; }
+  }
+
+  subgraph cluster_asic {
+    label="NIC ASIC";
+    style="rounded";
+    color="#444444";
+    fontsize=13;
+
+    subgraph cluster_dpa {
+      label="DPA";
+      labeljust="l";
+      style="rounded";
+      color="#2e7d32";
+      fontsize=11;
+      pcc [label="PCC", fillcolor="#d5f5d5"];
+    }
+
+    subgraph cluster_sf {
+      label="RDMA devices";
+      style="rounded";
+      color="#888888";
+      fontsize=11;
+      mlx5_2 [label="mlx5_2\nSF0", fillcolor="#dbe9ff"];
+      mlx5_4 [label="mlx5_4\nSF4", fillcolor="#dff3e9"];
+      mlx5_3 [label="mlx5_3\nsender SF", fillcolor="#e7e5f4"];
+      { rank=same; mlx5_2; mlx5_4; mlx5_3; }
+      mlx5_3 -> mlx5_4 [style=invis, weight=100];
+      mlx5_4 -> mlx5_2 [style=invis, weight=100];
+    }
+
+    subgraph cluster_eswitch {
+      label="eSwitch";
+      style="rounded";
+      color="#888888";
+      fontsize=11;
+
+      subgraph cluster_pf0 {
+        label="PF0 domain";
+        style="rounded";
+        color="#9a82b8";
+        fontsize=10;
+
+        rx_path_demux [label="INGRESS_PATH_DEMUX\n(DSCP path bit)",
+                       fillcolor="#eeeaf7"];
+        rx_path0_match [label="PATH0_IP_MATCH", fillcolor="#e7f1ff"];
+        rx_path1_match [label="PATH1_IP_MATCH", fillcolor="#e8f7ef"];
+        rx_path0_action [label="PATH0_SAMPLE/CE_MARK", fillcolor="#dbe9ff"];
+        rx_path1_action [label="PATH1_SAMPLE/CE_MARK", fillcolor="#dff3e9"];
+        rx_clear_demux [label="INGRESS_CLEAR_PATH/\nRECEIVER_IP_DEMUX",
+                        fillcolor="#eeeaf7"];
+
+        { rank=same; rx_path0_match; rx_path1_match; }
+        { rank=same; rx_path0_action; rx_path1_action; }
+        rx_path0_match -> rx_path1_match [style=invis, weight=100];
+        rx_path0_action -> rx_path1_action [style=invis, weight=100];
+      }
+
+      subgraph cluster_pf1 {
+        label="PF1 domain";
+        style="rounded";
+        color="#9a82b8";
+        fontsize=10;
+
+        tx_classify [label="EGRESS_CLASSIFY\n(64 random buckets)",
+                     fillcolor="#e7e5f4"];
+        tx_deliver_wire_a [label="DELIVER_WIRE A", fillcolor="#e7f1ff"];
+        tx_deliver_wire_b [label="DELIVER_WIRE B", fillcolor="#e8f7ef"];
+        { rank=same; tx_deliver_wire_a; tx_deliver_wire_b; }
+        tx_deliver_wire_a -> tx_deliver_wire_b [style=invis, weight=100];
+      }
+
+      { rank=same; rx_clear_demux; tx_deliver_wire_a; tx_deliver_wire_b; }
+    }
+
+    subgraph cluster_ports {
+      label="Physical ports";
+      style="rounded";
+      color="#888888";
+      fontsize=11;
+      p0 [label="p0", fillcolor="#ffe8d1"];
+      p1 [label="p1", fillcolor="#ffe8d1"];
+      { rank=same; p0; p1; }
+    }
+  }
+
+  /* Sender application and sender SF. */
+  sender -> mlx5_3 [label="A1. WRITE issued", color="#1a6fbf",
+                    fontcolor="#1a6fbf"];
+  sender -> mlx5_3 [label="B1. WRITE issued", color="#16845b",
+                    fontcolor="#16845b"];
+
+  /* PF1 egress: sender SF to wire. */
+  mlx5_3 -> tx_classify [label="A2. blue-flow", color="#1a6fbf",
+                         fontcolor="#1a6fbf"];
+  mlx5_3 -> tx_classify [label="B2. green-flow", color="#16845b",
+                         fontcolor="#16845b"];
+  tx_classify -> tx_deliver_wire_a [label="path bit = 0", color="#1a6fbf",
+                                    fontcolor="#1a6fbf"];
+  tx_classify -> tx_deliver_wire_a [style=dotted, color="#16845b"];
+  tx_classify -> tx_deliver_wire_b [label="path bit = 1", color="#16845b",
+                                    fontcolor="#16845b"];
+  tx_classify -> tx_deliver_wire_b [style=dotted, color="#1a6fbf"];
+  tx_deliver_wire_a -> p1 [label="A3. to wire", color="cornflowerblue",
+                           fontcolor="cornflowerblue"];
+  tx_deliver_wire_b -> p1 [label="B3. to wire", color="springgreen",
+                           fontcolor="springgreen"];
+
+  /* One physical cable carries both flows. */
+  p1 -> p0 [color="black", penwidth=2, arrowhead="none",
+            tailport="ne", headport="se", constraint=false,
+            label="200G\ncable\n(Flows A + B)"];
+
+  /* PF0 ingress: wire to path processing. */
+  rx_path_demux -> p0 [label="A4. wire ingress", color="cornflowerblue",
+                       fontcolor="cornflowerblue", dir=back];
+  rx_path_demux -> p0 [label="B4. wire ingress", color="springgreen",
+                       fontcolor="springgreen", dir=back];
+
+  rx_path0_match -> rx_path_demux [label="path0", color="cornflowerblue",
+                                   fontcolor="cornflowerblue", dir=back];
+  rx_path1_match -> rx_path_demux [label="path1", color="springgreen",
+                                   fontcolor="springgreen", dir=back];
+  rx_path0_action -> rx_path0_match [label="match", color="#1a6fbf",
+                                     fontcolor="#1a6fbf", dir=back];
+  rx_clear_demux -> rx_path0_action [color="#1a6fbf", dir=back];
+  rx_clear_demux -> rx_path0_match [label="miss", style=dashed,
+                                    color="#1a6fbf", fontcolor="#1a6fbf",
+                                    dir=back, constraint=false];
+  rx_path1_action -> rx_path1_match [label="match", color="#16845b",
+                                     fontcolor="#16845b", dir=back];
+  rx_clear_demux -> rx_path1_action [color="#16845b", dir=back];
+  rx_clear_demux -> rx_path1_match [label="miss", style=dashed,
+                                    color="#16845b", fontcolor="#16845b",
+                                    dir=back, constraint=false];
+
+  /* Receiver destination-IP demux: blue to SF0, green to SF4. */
+  mlx5_2 -> rx_clear_demux [label="Flow to SF0", color="#1a6fbf",
+                            fontcolor="#1a6fbf", dir=back];
+  mlx5_4 -> rx_clear_demux [label="Flow to SF4", color="#16845b",
+                            fontcolor="#16845b", dir=back];
+  receiver -> mlx5_2 [label="A6. delivered", color="#1a6fbf",
+                      fontcolor="#1a6fbf", dir=back, constraint=false];
+  receiver -> mlx5_4 [label="B6. delivered", color="#16845b",
+                      fontcolor="#16845b", dir=back, constraint=false];
+
+  /* PCC control loop. */
+  pcc -> pcc_host [label="rate update", style=dashed,
+                   color="#555555", fontcolor="#555555",
+                   tailport="w", headport="e", constraint=false];
+  pcc_host -> tx_classify [label="ratios", style=dashed,
+                           color="#555555", fontcolor="#555555",
+                           tailport="e", headport="w"];
+
+  /* Layout constraints. */
+  { rank=same; rx_clear_demux; tx_deliver_wire_a; tx_deliver_wire_b; }
+  { rank=same; mlx5_3; pcc; }
+  pcc_host -> sender [style=invis, weight=100];
+  sender -> receiver [style=invis, weight=100];
+  p0 -> p1 [style=invis, weight=100];
+}

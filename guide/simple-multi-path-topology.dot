@@ -1,0 +1,46 @@
+digraph simple_multi_path_topology {
+  graph [
+    rankdir=BT,
+    bgcolor="transparent",
+    pad=0.22,
+    nodesep=0.8,
+    ranksep=0.72,
+    splines=polyline
+  ];
+
+  node [
+    shape=box,
+    style="rounded,filled",
+    fontname="Helvetica",
+    fontsize=12,
+    color="#555555",
+    fillcolor="#eeeeee",
+    margin="0.18,0.11"
+  ];
+
+  edge [
+    fontname="Helvetica",
+    fontsize=10,
+    color="#555555",
+    penwidth=1.8,
+    arrowsize=0.8
+  ];
+
+  sender   [label="Sender"];
+  mux      [label="Path Multiplex"];
+  path1    [label="Path 0", shape=plain, style="", fontcolor="#666666",
+            fontsize=10];
+  path2    [label="Path 1", shape=plain, style="", fontcolor="#666666",
+            fontsize=10];
+  receiver [label="Receiver"];
+
+  { rank=same; path1; path2; }
+
+  sender -> mux [color="#666666"];
+  mux -> path1 [color="#666666"];
+  mux -> path2 [color="#666666"];
+  path1 -> receiver [color="#666666"];
+  path2 -> receiver [color="#666666"];
+
+  path1 -> path2 [style=invis, weight=10];
+}

@@ -1,0 +1,62 @@
+digraph paired_multi_path_topology {
+  graph [
+    rankdir=BT,
+    bgcolor="transparent",
+    pad=0.22,
+    nodesep=0.72,
+    ranksep=0.68,
+    splines=polyline
+  ];
+
+  node [
+    shape=box,
+    style="rounded,filled",
+    fontname="Helvetica",
+    fontsize=12,
+    color="#666666",
+    fillcolor="#eeeeee",
+    margin="0.18,0.11"
+  ];
+
+  edge [
+    fontname="Helvetica",
+    fontsize=10,
+    penwidth=1.9,
+    arrowsize=0.8
+  ];
+
+  sender         [label="Sender"];
+  mux            [label="Path Multiplex"];
+  path0          [label="path0", shape=plain, style="", fontsize=10,
+                  fontcolor="#777777"];
+  path1          [label="path1", shape=plain, style="", fontsize=10,
+                  fontcolor="#777777"];
+  receivers [
+    shape=plain,
+    label=<<TABLE BORDER="1" CELLBORDER="0" CELLSPACING="0" CELLPADDING="4"
+                  COLOR="#666666" BGCOLOR="#eeeeee" STYLE="ROUNDED">
+             <TR>
+               <TD PORT="blue">Receiver</TD>
+               <TD WIDTH="1"><FONT COLOR="#888888" POINT-SIZE="16">┊</FONT></TD>
+               <TD PORT="green">Receiver′</TD>
+             </TR>
+           </TABLE>>
+  ];
+
+  { rank=same; path0; path1; }
+
+  sender -> mux [color="cornflowerblue"];
+  sender -> mux [color="springgreen"];
+
+  mux -> path0 [color="cornflowerblue"];
+  mux -> path0 [color="springgreen", style=dashed];
+  mux -> path1 [color="cornflowerblue", style=dashed];
+  mux -> path1 [color="springgreen"];
+
+  path0 -> receivers:blue [color="cornflowerblue"];
+  path1 -> receivers:blue [color="cornflowerblue", style=dashed];
+  path0 -> receivers:green [color="springgreen", style=dashed];
+  path1 -> receivers:green [color="springgreen"];
+
+  path0 -> path1 [style=invis, weight=20];
+}
