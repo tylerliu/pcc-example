@@ -25,25 +25,21 @@
 #define DOCA_FLOW_COMPAT_H_
 
 #include <doca_flow.h>
-#include <doca_version.h>
-
-#define STEER_DOCA_VERSION_GE(major, minor) \
-	((DOCA_VERSION_MAJOR > (major)) || \
-	 (DOCA_VERSION_MAJOR == (major) && DOCA_VERSION_MINOR >= (minor)))
+#include "pcc_doca_compat.h"
 
 /* Basic/hash entry APIs gained an explicit action_idx in DOCA 3.4. */
-#define STEER_HAS_EXPLICIT_ACTION_IDX STEER_DOCA_VERSION_GE(3, 4)
+#define STEER_HAS_EXPLICIT_ACTION_IDX DOCA_HAS_EXPLICIT_FLOW_ACTION_INDEX
 
 /* 3.x exposes the native RANDOM HASH configuration used by EGRESS_CLASSIFY.
  * DOCA 2.x uses its older immutable HASH API for the same bucket classifier. */
-#define STEER_USE_RANDOM_HASH_CLASSIFIER (DOCA_VERSION_MAJOR >= 3)
+#define STEER_USE_RANDOM_HASH_CLASSIFIER DOCA_HAS_NATIVE_FLOW_HASH
 
 /* Native RoCEv2/BTH items and HASH forwarding were added in DOCA Flow 3.x. */
-#define STEER_HAS_ROCE_MATCH (DOCA_VERSION_MAJOR >= 3)
-#define STEER_HAS_HASH_FWD (DOCA_VERSION_MAJOR >= 3)
+#define STEER_HAS_ROCE_MATCH DOCA_HAS_NATIVE_FLOW_HASH
+#define STEER_HAS_HASH_FWD DOCA_HAS_NATIVE_FLOW_HASH
 
 /* Counter allocation moved from the global Flow cfg to individual ports in 3.2. */
-#define STEER_HAS_PORT_RESOURCE_MODE STEER_DOCA_VERSION_GE(3, 2)
+#define STEER_HAS_PORT_RESOURCE_MODE DOCA_HAS_PORT_FLOW_RESOURCES
 
 #if STEER_HAS_EXPLICIT_ACTION_IDX
 
@@ -54,7 +50,7 @@
 #define STEER_NO_WAIT DOCA_FLOW_NO_WAIT
 #endif
 
-#if DOCA_VERSION_MAJOR >= 3
+#if DOCA_HAS_NATIVE_FLOW_HASH
 /* parser_meta source-port field name (used as .parser_meta.STEER_PARSER_PORT). */
 #define STEER_PARSER_PORT port_id
 /* All-ones wildcard sized to the source-port field (uint16_t on 3.x). */
@@ -87,7 +83,7 @@ static inline void steer_fwd_set_rss(struct doca_flow_fwd *fwd, uint16_t *queues
                                       uint16_t nr_queues, uint32_t flags)
 {
 	fwd->type = DOCA_FLOW_FWD_RSS;
-#if DOCA_VERSION_MAJOR >= 3
+#if DOCA_HAS_NATIVE_FLOW_HASH
 	fwd->rss_type = DOCA_FLOW_RESOURCE_TYPE_NON_SHARED;
 	fwd->rss.queues_array = queues;
 	fwd->rss.nr_queues = nr_queues;
@@ -135,7 +131,7 @@ static inline struct doca_flow_match *steer_roce_udp_match_mask(
 #endif
 }
 
-#if DOCA_VERSION_MAJOR < 3
+#if DOCA_USES_LEGACY_FLOW_BACKEND
 /* DOCA 2.7 requires the mirror resource to carry the original-packet
  * destination. DOCA 2.9 rejects that field and falls back to the pipe entry
  * forwarding instead. */
@@ -143,7 +139,7 @@ static inline void steer_mirror_set_original_fwd(
 	struct doca_flow_shared_resource_cfg *cfg,
 	const struct doca_flow_fwd *original_fwd)
 {
-#if DOCA_VERSION_MINOR < 9
+#if DOCA_HAS_MIRROR_ORIGINAL_FWD
 	cfg->mirror_cfg.fwd = *original_fwd;
 #else
 	(void)cfg;
@@ -161,7 +157,7 @@ static inline doca_error_t steer_shared_resource_set_cfg(
 	enum doca_flow_shared_resource_type type, uint32_t id,
 	struct doca_flow_shared_resource_cfg *cfg)
 {
-#if STEER_DOCA_VERSION_GE(2, 8)
+#if DOCA_HAS_FLOW_SHARED_RESOURCE_SET_CFG
 	return doca_flow_shared_resource_set_cfg(type, id, cfg);
 #else
 	return doca_flow_shared_resource_cfg(type, id, cfg);
@@ -171,7 +167,7 @@ static inline doca_error_t steer_shared_resource_set_cfg(
 static inline doca_error_t steer_query_entry(struct doca_flow_pipe_entry *entry,
                                               struct steer_resource_query *query)
 {
-#if STEER_DOCA_VERSION_GE(2, 8)
+#if DOCA_HAS_FLOW_SHARED_RESOURCE_SET_CFG
 	struct doca_flow_resource_query sdk_query = {0};
 	doca_error_t err = doca_flow_resource_query_entry(entry, &sdk_query);
 
@@ -258,7 +254,7 @@ static inline doca_error_t steer_pipe_hash_add_entry(uint16_t queue, struct doca
 static inline doca_error_t steer_pipe_remove_entry(uint16_t queue, uint32_t flags,
                                                    struct doca_flow_pipe_entry *entry)
 {
-#if DOCA_VERSION_MAJOR < 3 && DOCA_VERSION_MINOR < 9
+#if DOCA_USES_LEGACY_PIPE_RM_API
 	return doca_flow_pipe_rm_entry(queue, flags, entry);
 #else
 	return doca_flow_pipe_remove_entry(queue, flags, entry);

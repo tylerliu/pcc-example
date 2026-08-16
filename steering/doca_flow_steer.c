@@ -8,6 +8,7 @@
 #include <doca_argp.h>
 #include <doca_error.h>
 #include <doca_log.h>
+#include "pcc_doca_compat.h"
 #include "steer.h"
 
 #include <arpa/inet.h>
@@ -37,7 +38,7 @@ static void on_signal(int s)
 		}                                                                          \
 	} while (0)
 
-#if DOCA_VERSION_MAJOR < 3
+#if DOCA_USES_LEGACY_FLOW_BACKEND
 static doca_error_t legacy_rep_cb(void *param, void *config, uint32_t path)
 {
 	struct steer_opts *o = config;
@@ -139,7 +140,7 @@ static doca_error_t p1ip_cb(void *param, void *config)
 	return parse_path_ip(param, config, 1);
 }
 
-#if DOCA_VERSION_MAJOR >= 3
+#if DOCA_HAS_DEVICE_REPRESENTORS
 static doca_error_t device_cb(void *param, void *config)
 {
 	struct steer_opts *o = config;
@@ -263,7 +264,7 @@ int main(int argc, char **argv)
 	reg("path0-ip", "IPv4 address delivered to the first -r receiver SF", p0ip_cb);
 	reg("path1-ip", "IPv4 address delivered to the second -r receiver SF", p1ip_cb);
 	reg("role", "Which half to build: egress (sender) | ingress (receiver) | both. Default: both", role_cb);
-#if DOCA_VERSION_MAJOR >= 3
+#if DOCA_HAS_DEVICE_REPRESENTORS
 	reg_dev("a", "device", "DOCA device, e.g. pci/0000:03:00.0,dv_flow_en=2", device_cb, DOCA_ARGP_TYPE_DEVICE);
 	reg_dev("r", "path0-rep", "Path-0 SF representor, e.g. pci/0000:03:00.0,pf0sf0", rep_cb,
 	        DOCA_ARGP_TYPE_DEVICE_REP);
@@ -277,7 +278,7 @@ int main(int argc, char **argv)
 #endif
 	CRASH(doca_argp_start(argc, argv), "doca_argp_start");
 
-#if DOCA_VERSION_MAJOR >= 3
+#if DOCA_HAS_DEVICE_REPRESENTORS
 	if (opts.dev == NULL || opts.dev_rep == NULL) {
 		DOCA_LOG_CRIT("Specify the SF representor via -r (e.g. -r pci/0000:03:00.0,sf0,dv_flow_en=2)");
 		return EXIT_FAILURE;

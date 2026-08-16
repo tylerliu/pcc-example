@@ -65,7 +65,7 @@ struct flow_rate_entry {
 
 static struct flow_rate_entry flow_rate_table[MAX_TRACKED_FLOWS];
 static uint32_t flow_rate_table_size = 0;
-#if DOCA_VERSION_MAJOR >= 3
+#if DOCA_HAS_PCC_TRACE_REPORTS
 static uint32_t last_rate_print_ts = 0;
 #endif
 static uint64_t rate_reports_total = 0;
@@ -88,11 +88,11 @@ static struct flow_rate_entry *find_or_create_flow(uint32_t qpn)
 	return NULL;
 }
 
-#if DOCA_VERSION_MAJOR >= 3
+#if DOCA_HAS_PCC_TRACE_REPORTS
 /* doca_pcc_bin_report is intentionally opaque and changed layout while keeping
  * its 64-byte size. DOCA 3.1 uses the legacy FlexIO report (args at byte 16),
  * while DOCA 3.4 inserts an internal timestamp (args at byte 24). */
-#if DOCA_VERSION_MAJOR > 3 || (DOCA_VERSION_MAJOR == 3 && DOCA_VERSION_MINOR >= 4)
+#if DOCA_HAS_TIMESTAMPED_PCC_TRACE_LAYOUT
 struct pcc_trace_report {
 	uint32_t msg_number;
 	uint32_t seq_number;
@@ -168,7 +168,7 @@ static int rate_report_trace_handler(void *ctx, struct doca_pcc_bin_report *reps
 	return 0;
 }
 
-#endif /* DOCA_VERSION_MAJOR >= 3 */
+#endif /* DOCA_HAS_PCC_TRACE_REPORTS */
 
 /* Default PCC RP threads */
 const uint32_t default_pcc_rp_threads_list[PCC_RP_THREADS_NUM_DEFAULT_VALUE] = {
@@ -190,7 +190,7 @@ static bool use_dpa_resources = false;
  */
 static bool use_dpa_application_key = false;
 
-#if DOCA_VERSION_MAJOR > 3 || (DOCA_VERSION_MAJOR == 3 && DOCA_VERSION_MINOR >= 4)
+#if DOCA_HAS_DPA_RESOURCES_FILE
 /**
  * @brief Get the size of a file
  *
@@ -354,7 +354,7 @@ static doca_error_t open_pcc_device(const char *device_name, struct doca_dev **d
 
 static doca_error_t create_dpa_resources(struct pcc_config *cfg)
 {
-#if DOCA_VERSION_MAJOR > 3 || (DOCA_VERSION_MAJOR == 3 && DOCA_VERSION_MINOR >= 4)
+#if DOCA_HAS_DPA_RESOURCES_FILE
 	char *file_buffer;
 	size_t bytes_read;
 	struct doca_pcc_resources *doca_pcc_resources;
@@ -539,7 +539,7 @@ doca_error_t pcc_init(struct pcc_config *cfg, struct pcc_resources *resources)
 		goto destroy_pcc;
 	}
 
-#if DOCA_VERSION_MAJOR >= 3
+#if DOCA_HAS_PCC_TRACE_REPORTS
 	/* Register trace handler for per-flow rate reports */
 	result = doca_pcc_register_trace_handler(resources->doca_pcc, rate_report_trace_handler, NULL);
 	if (result != DOCA_SUCCESS) {
@@ -548,7 +548,7 @@ doca_error_t pcc_init(struct pcc_config *cfg, struct pcc_resources *resources)
 	}
 #endif
 
-#if DOCA_VERSION_MAJOR < 3
+#if !DOCA_HAS_PCC_TRACE_REPORTS
 	result = doca_pcc_set_mailbox(resources->doca_pcc,
 	                              sizeof(struct pcc_rate_mailbox_request),
 	                              sizeof(struct pcc_rate_mailbox_response));
@@ -585,7 +585,7 @@ close_doca_dev:
 
 doca_error_t pcc_poll_rate_reports(struct pcc_resources *resources)
 {
-#if DOCA_VERSION_MAJOR < 3
+#if !DOCA_HAS_PCC_TRACE_REPORTS
 	struct pcc_rate_mailbox_request *request;
 	struct pcc_rate_mailbox_response *response;
 	uint32_t response_size = 0;
@@ -842,7 +842,7 @@ static doca_error_t steer_force_path_callback(void *param, void *config)
 	return DOCA_SUCCESS;
 }
 
-#if DOCA_VERSION_MAJOR >= 3
+#if DOCA_HAS_DEVICE_REPRESENTORS
 /*
  * ARGP Callback - PF device for embedded steering (DOCA 3.x, -a/--steer-dev).
  * Also enables steering. Usually the same PF the PCC RP runs on.
@@ -1097,9 +1097,7 @@ doca_error_t register_pcc_params(void)
 	if (result != DOCA_SUCCESS)
 		return result;
 
-#if DOCA_VERSION_MAJOR >= 3
 	struct doca_argp_param *steer_rep_param;
-	struct doca_argp_param *steer_dev_param;
 
 	result = doca_argp_param_create(&steer_rep_param);
 	if (result != DOCA_SUCCESS)
@@ -1110,10 +1108,17 @@ doca_error_t register_pcc_params(void)
 	doca_argp_param_set_description(steer_rep_param,
 		"Enable embedded DOCA Flow egress steering on the sender SF representor.");
 	doca_argp_param_set_callback(steer_rep_param, steer_rep_callback);
+#if DOCA_HAS_DEVICE_REPRESENTORS
 	doca_argp_param_set_type(steer_rep_param, DOCA_ARGP_TYPE_DEVICE_REP);
+#else
+	doca_argp_param_set_type(steer_rep_param, DOCA_ARGP_TYPE_STRING);
+#endif
 	result = doca_argp_register_param(steer_rep_param);
 	if (result != DOCA_SUCCESS)
 		return result;
+
+#if DOCA_HAS_DEVICE_REPRESENTORS
+	struct doca_argp_param *steer_dev_param;
 
 	result = doca_argp_param_create(&steer_dev_param);
 	if (result != DOCA_SUCCESS)
@@ -1126,22 +1131,6 @@ doca_error_t register_pcc_params(void)
 	doca_argp_param_set_callback(steer_dev_param, steer_device_callback);
 	doca_argp_param_set_type(steer_dev_param, DOCA_ARGP_TYPE_DEVICE);
 	result = doca_argp_register_param(steer_dev_param);
-	if (result != DOCA_SUCCESS)
-		return result;
-#else
-	struct doca_argp_param *steer_rep_param;
-
-	result = doca_argp_param_create(&steer_rep_param);
-	if (result != DOCA_SUCCESS)
-		return result;
-	doca_argp_param_set_short_name(steer_rep_param, "r");
-	doca_argp_param_set_long_name(steer_rep_param, "steer-rep");
-	doca_argp_param_set_arguments(steer_rep_param, "<pci/bdf,pfNsfN>");
-	doca_argp_param_set_description(steer_rep_param,
-		"Enable embedded DOCA Flow egress steering on the sender SF representor.");
-	doca_argp_param_set_callback(steer_rep_param, steer_rep_callback);
-	doca_argp_param_set_type(steer_rep_param, DOCA_ARGP_TYPE_STRING);
-	result = doca_argp_register_param(steer_rep_param);
 	if (result != DOCA_SUCCESS)
 		return result;
 #endif

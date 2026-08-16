@@ -210,7 +210,7 @@ doca_error_t steer_eal_init(int argc, char **argv, const char *file_prefix)
 
 static uint16_t g_dpdk_rx_port_id = UINT16_MAX;
 
-#if DOCA_VERSION_MAJOR >= 3
+#if DOCA_HAS_DEVICE_REPRESENTORS
 
 /*
  * DOCA 3.x: the PF doca_dev and SF doca_dev_rep are opened by the caller (DOCA
@@ -279,7 +279,7 @@ static void probe_open_dev(struct doca_dev *dev, const char *device_pci_addr, co
 
 #endif
 
-#if DOCA_VERSION_MAJOR < 3
+#if DOCA_USES_LEGACY_FLOW_BACKEND
 static uint16_t find_pf_dpdk_port_id(void)
 {
 	uint16_t port_id;
@@ -306,7 +306,7 @@ static uint16_t find_pf_dpdk_port_id(void)
 static void configure_and_start_dpdk_port(struct doca_dev *dev)
 {
 	uint16_t first_port_id;
-#if DOCA_VERSION_MAJOR < 3
+#if DOCA_USES_LEGACY_FLOW_BACKEND
 	(void)dev;
 	first_port_id = find_pf_dpdk_port_id();
 #else
@@ -360,7 +360,7 @@ static void configure_and_start_dpdk_port(struct doca_dev *dev)
 			}
 		}
 
-#if DOCA_VERSION_MAJOR < 3
+#if DOCA_USES_LEGACY_FLOW_BACKEND
 		/* 2.9 used "switch,hws,isolated,disable_switch_rss"; isolated mode must
 		 * be set before start. 3.x uses plain "switch,hws" and does not isolate. */
 		struct rte_flow_error flow_err = {0};
@@ -401,7 +401,7 @@ static void initialize_doca_flow(void)
 #else
 	/* DOCA 3.1 and 2.x allocate counters globally. DOCA 3.1 otherwise uses
 	 * the normal 3.x switch mode and must not enable the old isolated mode. */
-#if DOCA_VERSION_MAJOR >= 3
+#if DOCA_HAS_DEVICE_REPRESENTORS
 	err = doca_flow_cfg_set_mode_args(cfg, "switch,hws");
 #else
 	err = doca_flow_cfg_set_mode_args(cfg, "switch,hws,isolated,disable_switch_rss");
@@ -410,7 +410,7 @@ static void initialize_doca_flow(void)
 
 	err = doca_flow_cfg_set_nr_counters(cfg, NB_COUNTERS);
 	crash_if_unsuccessful(err, "doca_flow_cfg_set_nr_counters");
-#if DOCA_VERSION_MAJOR < 3
+#if DOCA_USES_LEGACY_FLOW_BACKEND
 	err = doca_flow_cfg_set_nr_shared_resource(cfg, LEGACY_SHARED_MIRRORS,
 	                                           DOCA_FLOW_SHARED_RESOURCE_MIRROR);
 	crash_if_unsuccessful(err, "doca_flow_cfg_set_nr_shared_resource (mirror)");
@@ -440,7 +440,7 @@ static struct doca_flow_port *port_start(struct doca_dev *dev, uint16_t flow_por
 	err = steer_port_cfg_set_port_id(cfg, flow_port_id);
 	crash_if_unsuccessful(err, "steer_port_cfg_set_port_id (uplink %u)", flow_port_id);
 
-#if DOCA_VERSION_MAJOR >= 3
+#if DOCA_HAS_DEVICE_REPRESENTORS
 	err = doca_flow_port_cfg_set_actions_mem_size(cfg, 256 * DOCA_FLOW_MAX_ENTRY_ACTIONS_MEM_SIZE);
 	crash_if_unsuccessful(err, "doca_flow_port_cfg_set_actions_mem_size");
 #if STEER_HAS_PORT_RESOURCE_MODE
@@ -466,7 +466,7 @@ static struct doca_flow_port *port_start(struct doca_dev *dev, uint16_t flow_por
 	return port;
 }
 
-#if DOCA_VERSION_MAJOR < 3
+#if DOCA_USES_LEGACY_FLOW_BACKEND
 /* Find the DPDK port id of the SF representor (2.9: probed via "representor=sfN"). */
 static uint32_t find_sf_representor_port_ids(uint16_t ids[NB_PATHS], uint32_t needed)
 {
@@ -494,7 +494,7 @@ static uint32_t find_sf_representor_port_ids(uint16_t ids[NB_PATHS], uint32_t ne
 }
 #endif
 
-#if DOCA_VERSION_MAJOR >= 3
+#if DOCA_HAS_DEVICE_REPRESENTORS
 /* 3.x: start the SF representor as a DOCA Flow port (logical id 1) via its doca_dev_rep. */
 static struct doca_flow_port *rep_port_start(uint16_t flow_port_id, struct doca_dev_rep *dev_rep)
 {
@@ -725,7 +725,7 @@ static struct doca_flow_pipe *create_random_sample_pipe(struct doca_flow_port *p
 	return pipe;
 }
 
-#if DOCA_VERSION_MAJOR < 3
+#if DOCA_USES_LEGACY_FLOW_BACKEND
 /* DOCA 2.x random HASH is immutable after creation. Each bucket writes its
  * index to scratch metadata; a downstream BASIC dispatch pipe owns the
  * changeable path forwarding. */
@@ -1087,7 +1087,7 @@ static struct doca_flow_pipe *create_roce_check_pipe(struct doca_flow_port *port
 	return pipe;
 }
 
-#if DOCA_VERSION_MAJOR >= 3
+#if DOCA_HAS_DEVICE_REPRESENTORS
 /* Shared terminal software target for QP1 clones from both directions. */
 static struct doca_flow_pipe *create_qp1_rss_pipe(struct doca_flow_port *port, const char *name,
 						  uint16_t queue)
@@ -1209,9 +1209,9 @@ static struct doca_flow_pipe *create_qp1_clone_check(struct doca_flow_port *port
 	return pipe;
 }
 
-#endif /* DOCA_VERSION_MAJOR >= 3 */
+#endif /* DOCA_HAS_DEVICE_REPRESENTORS */
 
-#if DOCA_VERSION_MAJOR < 3
+#if DOCA_USES_LEGACY_FLOW_BACKEND
 /* A DOCA 2 shared mirror cannot target RSS directly. Its clone first enters
  * this BASIC source-IP filter; matching path feedback reaches RSS queue 0 and
  * misses drop only the clone. */
@@ -1288,7 +1288,6 @@ static void configure_legacy_mirror(struct doca_flow_port *port, uint32_t mirror
 static struct doca_flow_pipe *create_legacy_roce_mirror_pipe(
 	struct doca_flow_port *port, const char *name, uint16_t original_port,
 	struct doca_flow_pipe *miss_target, uint32_t mirror_id,
-	const uint32_t path_ip[NB_PATHS], bool match_src_ip,
 	struct doca_flow_pipe_entry *path_entry[NB_PATHS])
 {
 	struct doca_flow_match match = {0}, match_mask = {0};
@@ -1301,8 +1300,6 @@ static struct doca_flow_pipe *create_legacy_roce_mirror_pipe(
 	doca_error_t err;
 
 	steer_set_roce_udp_match(&match, &match_mask, RTE_BE16(ROCE_UDP_PORT_NATIVE));
-	(void)path_ip;
-	(void)match_src_ip;
 	err = doca_flow_pipe_cfg_create(&cfg, port);
 	crash_if_unsuccessful(err, "pipe_cfg_create (%s)", name);
 	crash_if_unsuccessful(doca_flow_pipe_cfg_set_name(cfg, name), "pipe_cfg_set_name (%s)", name);
@@ -1334,25 +1331,15 @@ static struct doca_flow_pipe *create_legacy_roce_mirror_pipe(
 }
 #endif
 
-/* Install QP1 observation as one self-contained facility. Keep all cloning
- * mechanics behind this boundary: DOCA 3.x uses flooding hash pipes, while the
- * DOCA 2.9 backend can replace this body with shared mirror resources without
- * changing steer_start() or the ordinary ingress/egress pipelines. */
-static void install_qp1_clone_paths(struct doca_flow_port *port,
-                                    struct doca_flow_pipe *deliver_sf,
-                                    struct doca_flow_pipe *deliver_wire,
-                                    struct doca_flow_pipe **wire_target,
-                                    struct doca_flow_pipe **sf_target,
-                                    const uint32_t path_ip[NB_PATHS],
-                                    struct doca_flow_pipe_entry *wire_entry[NB_PATHS],
-                                    struct doca_flow_pipe_entry *sf_entry[NB_PATHS],
-                                    struct doca_flow_pipe_entry *filter_entry[NB_PATHS])
+/* Install QP1 observation through backend-specific interfaces so each path
+ * receives only the Flow objects and state it owns. */
+#if DOCA_HAS_DEVICE_REPRESENTORS
+static void install_native_qp1_clone_paths(struct doca_flow_port *port,
+                                            struct doca_flow_pipe *deliver_sf,
+                                            struct doca_flow_pipe *deliver_wire,
+                                            struct doca_flow_pipe **wire_target,
+                                            struct doca_flow_pipe **sf_target)
 {
-#if DOCA_VERSION_MAJOR >= 3
-	(void)path_ip;
-	(void)wire_entry;
-	(void)sf_entry;
-	(void)filter_entry;
 	struct doca_flow_pipe *qp1_rss = create_qp1_rss_pipe(port, "QP1_RSS", QP1_CLONE_QUEUE);
 	struct doca_flow_pipe *wire_flood =
 		create_qp1_flood_pipe(port, "QP1_FLOOD_WIRE", deliver_sf, qp1_rss);
@@ -1361,42 +1348,38 @@ static void install_qp1_clone_paths(struct doca_flow_port *port,
 	struct doca_flow_pipe *sf_flood =
 		create_qp1_flood_pipe(port, "QP1_FLOOD_SF", deliver_wire, qp1_rss);
 	*sf_target = create_qp1_clone_check(port, "QP1_CHECK_SF", sf_flood, *sf_target);
+}
 #else
+static void install_legacy_qp1_clone_path(
+	struct doca_flow_port *port, struct doca_flow_pipe **wire_target,
+	const uint32_t path_ip[NB_PATHS],
+	struct doca_flow_pipe_entry *wire_entry[NB_PATHS],
+	struct doca_flow_pipe_entry *filter_entry[NB_PATHS])
+{
 	struct doca_flow_pipe *qp1_rss =
 		create_legacy_qp1_rss_pipe(port, path_ip, filter_entry);
 	struct doca_flow_fwd clone_fwd = {
 		.type = DOCA_FLOW_FWD_PIPE,
 		.next_pipe = qp1_rss,
 	};
-
-	(void)deliver_sf;
-	(void)deliver_wire;
 	/* DOCA 2.7 requires an explicit original destination on the shared
-	 * mirror. Use terminal ports here: QP1 management packets must not depend
-	 * on the egress rewrite chain in order to establish the RDMA connection. */
+	 * mirror. QP1 management packets use the terminal SF port so connection
+	 * establishment does not depend on the egress rewrite chain. */
 	struct doca_flow_fwd wire_original = {
 		.type = DOCA_FLOW_FWD_PORT,
 		.port_id = SF_PORT_ID,
 	};
-	struct doca_flow_fwd sf_original = {
-		.type = DOCA_FLOW_FWD_PORT,
-		.port_id = WIRE_PORT_ID,
-	};
-
 
 	configure_legacy_mirror(port, QP1_WIRE_MIRROR_ID, &clone_fwd, &wire_original);
-	*wire_target = create_legacy_roce_mirror_pipe(port, "QP1_MIRROR_WIRE",
-	                                                SF_PORT_ID, *wire_target,
-	                                                QP1_WIRE_MIRROR_ID, path_ip, true, wire_entry);
-	(void)sf_original;
-	(void)sf_target;
-	(void)sf_entry;
+	*wire_target = create_legacy_roce_mirror_pipe(
+		port, "QP1_MIRROR_WIRE", SF_PORT_ID, *wire_target,
+		QP1_WIRE_MIRROR_ID, wire_entry);
 	DOCA_LOG_WARN("DOCA 2.x clones all wire-ingress UDP 4791; "
 	              "ACK/CNP destination QPN and source IP identify sender QPN and path");
-#endif
 }
+#endif
 
-#if DOCA_VERSION_MAJOR >= 3
+#if DOCA_HAS_DEVICE_REPRESENTORS
 /* Explicit ARP handling: wire requests reach both receiver SFs and replies
  * from either SF reach wire, independent of IPv4/default-miss behavior. */
 static struct doca_flow_pipe *create_arp_flood_pipe(struct doca_flow_port *port)
@@ -1431,7 +1414,7 @@ static struct doca_flow_pipe *create_arp_flood_pipe(struct doca_flow_port *port)
 	return pipe;
 }
 
-#endif /* DOCA_VERSION_MAJOR >= 3 */
+#endif /* DOCA_HAS_DEVICE_REPRESENTORS */
 
 static struct doca_flow_pipe *create_arp_check_pipe(struct doca_flow_port *port, const char *name,
 						     const struct doca_flow_fwd *arp_fwd,
@@ -1444,7 +1427,7 @@ static struct doca_flow_pipe *create_arp_check_pipe(struct doca_flow_port *port,
 	struct doca_flow_pipe *pipe;
 	struct doca_flow_pipe_entry *entry;
 	struct entry_batch_status status = {0};
-#if DOCA_VERSION_MAJOR < 3
+#if DOCA_USES_LEGACY_FLOW_BACKEND
 	struct doca_flow_monitor monitor = {.shared_mirror_id = mirror_id};
 	struct doca_flow_monitor entry_monitor = monitor;
 #endif
@@ -1461,7 +1444,7 @@ static struct doca_flow_pipe *create_arp_check_pipe(struct doca_flow_port *port,
 	crash_if_unsuccessful(doca_flow_pipe_cfg_set_is_root(cfg, false), "pipe_cfg_set_is_root (%s)", name);
 	crash_if_unsuccessful(doca_flow_pipe_cfg_set_nr_entries(cfg, 1), "pipe_cfg_set_nr_entries (%s)", name);
 	crash_if_unsuccessful(doca_flow_pipe_cfg_set_match(cfg, &match, &match_mask), "pipe_cfg_set_match (%s)", name);
-#if DOCA_VERSION_MAJOR < 3
+#if DOCA_USES_LEGACY_FLOW_BACKEND
 	if (mirror_id != UINT32_MAX)
 		crash_if_unsuccessful(doca_flow_pipe_cfg_set_monitor(cfg, &monitor),
 		                      "pipe_cfg_set_monitor (%s)", name);
@@ -1471,7 +1454,7 @@ static struct doca_flow_pipe *create_arp_check_pipe(struct doca_flow_port *port,
 	err = doca_flow_pipe_create(cfg, arp_fwd, &fwd_miss, &pipe);
 	crash_if_unsuccessful(err, "pipe_create (%s)", name);
 	doca_flow_pipe_cfg_destroy(cfg);
-#if DOCA_VERSION_MAJOR < 3
+#if DOCA_USES_LEGACY_FLOW_BACKEND
 	err = steer_pipe_add_entry(0, pipe, &entry_match, 0, NULL, mirror_id == UINT32_MAX ? NULL : &entry_monitor, NULL, 0, &status, &entry);
 #else
 	err = steer_pipe_add_entry(0, pipe, &entry_match, 0, NULL, NULL, NULL, 0, &status, &entry);
@@ -1484,7 +1467,7 @@ static struct doca_flow_pipe *create_arp_check_pipe(struct doca_flow_port *port,
 static void install_arp_paths(struct doca_flow_port *port, struct doca_flow_pipe **wire_target,
 			      struct doca_flow_pipe **sf_target)
 {
-#if DOCA_VERSION_MAJOR >= 3
+#if DOCA_HAS_DEVICE_REPRESENTORS
 	struct doca_flow_pipe *flood = create_arp_flood_pipe(port);
 	struct doca_flow_fwd wire_fwd = {.type = DOCA_FLOW_FWD_HASH_PIPE,
 		.hash_pipe = {.pipe = flood, .algorithm = DOCA_FLOW_PIPE_HASH_MAP_ALGORITHM_FLOODING}};
@@ -1854,7 +1837,6 @@ struct steer_state {
 	struct doca_flow_pipe_entry *path_rewrite_entry[NB_PATHS];
 	struct doca_flow_pipe_entry *legacy_random_entry[LEGACY_RANDOM_BUCKETS];
 	struct doca_flow_pipe_entry *legacy_qp1_wire_entry[NB_PATHS];
-	struct doca_flow_pipe_entry *legacy_qp1_sf_entry[NB_PATHS];
 	struct doca_flow_pipe_entry *legacy_qp1_filter_entry[NB_PATHS];
 	struct doca_flow_pipe *cnp_count_pipe;
 	bool grouping_enabled;
@@ -2006,7 +1988,7 @@ doca_error_t steer_start(const struct steer_opts *opts)
 		DOCA_LOG_CRIT("both path0-ip and path1-ip are required");
 		return DOCA_ERROR_INVALID_VALUE;
 	}
-#if DOCA_VERSION_MAJOR >= 3
+#if DOCA_HAS_DEVICE_REPRESENTORS
 	if (opts->dev == NULL || opts->dev_rep == NULL) {
 		DOCA_LOG_CRIT("steer_start: opts->dev and opts->dev_rep are required on DOCA 3.x "
 		              "(open them via --device/--rep or DOCA device APIs)");
@@ -2026,7 +2008,7 @@ doca_error_t steer_start(const struct steer_opts *opts)
 	g_steer.opts = *opts;
 	atomic_flag_clear(&g_steer.rate_lock);
 
-#if DOCA_VERSION_MAJOR >= 3
+#if DOCA_HAS_DEVICE_REPRESENTORS
 	struct doca_dev *dev = opts->dev;
 	const bool probe_do_ingress = do_ingress;
 	uint32_t probe_nb_sf_ports = probe_do_ingress ? NB_PATHS : 1;
@@ -2089,13 +2071,11 @@ doca_error_t steer_start(const struct steer_opts *opts)
 	/* PORT_DEMUX targets default to plain delivery; the active role overrides. */
 	struct doca_flow_pipe *wire_target = receiver_target; /* wire-ingress fate */
 	struct doca_flow_pipe *sf_target = deliver_wire;  /* SF-egress fate */
-#if DOCA_VERSION_MAJOR < 3
+#if DOCA_USES_LEGACY_FLOW_BACKEND
 	if (do_egress)
-		install_qp1_clone_paths(g_steer.port, receiver_target, deliver_wire,
-		                        &wire_target, &sf_target, g_steer.opts.path_ip,
-		                        g_steer.legacy_qp1_wire_entry,
-		                        g_steer.legacy_qp1_sf_entry,
-		                        g_steer.legacy_qp1_filter_entry);
+		install_legacy_qp1_clone_path(g_steer.port, &wire_target, g_steer.opts.path_ip,
+		                               g_steer.legacy_qp1_wire_entry,
+		                               g_steer.legacy_qp1_filter_entry);
 #endif
 
 	if (do_ingress) {
@@ -2189,12 +2169,9 @@ doca_error_t steer_start(const struct steer_opts *opts)
 	}
 
 	/* Sender/receiver pairing is consumed only by egress path grouping. */
-#if DOCA_VERSION_MAJOR >= 3
-	install_qp1_clone_paths(g_steer.port, receiver_target, deliver_wire,
-	                        &wire_target, &sf_target, g_steer.opts.path_ip,
-		                        g_steer.legacy_qp1_wire_entry,
-		                        g_steer.legacy_qp1_sf_entry,
-		                        g_steer.legacy_qp1_filter_entry);
+#if DOCA_HAS_DEVICE_REPRESENTORS
+	install_native_qp1_clone_paths(g_steer.port, receiver_target, deliver_wire,
+	                                &wire_target, &sf_target);
 #endif
 	if (do_ingress)
 		install_arp_paths(g_steer.port, &wire_target, &sf_target);
@@ -2327,10 +2304,10 @@ static void install_sender_cnp_entry(uint32_t sender_qpn, uint32_t receiver_qpn,
 #endif
 }
 
+#if DOCA_USES_LEGACY_FLOW_BACKEND
 static void retire_legacy_qp1_mirror_entry(
 	struct doca_flow_pipe_entry *entries[NB_PATHS], uint8_t path, const char *direction)
 {
-#if DOCA_VERSION_MAJOR < 3
 	if (path >= NB_PATHS || entries[path] == NULL)
 		return;
 	doca_error_t err = steer_pipe_remove_entry(0, STEER_NO_WAIT, entries[path]);
@@ -2343,12 +2320,8 @@ static void retire_legacy_qp1_mirror_entry(
 	}
 	entries[path] = NULL;
 	DOCA_LOG_INFO("retired path%u %s QP1 mirror entry", path, direction);
-#else
-	(void)entries;
-	(void)path;
-	(void)direction;
-#endif
 }
+#endif
 
 static void remember_cm_request(uint32_t comm_id, uint32_t initiator_qpn, uint32_t receiver_ip)
 {
@@ -2398,8 +2371,6 @@ static void remember_cm_request(uint32_t comm_id, uint32_t initiator_qpn, uint32
 	if (path_known)
 		DOCA_LOG_INFO("RDMA-CM REQ grouping: sender QPN 0x%06x receiver IP=0x%08x -> path%u",
 		              initiator_qpn, receiver_ip, path);
-	if (path_known)
-		retire_legacy_qp1_mirror_entry(g_steer.legacy_qp1_sf_entry, path, "SF-egress");
 	else
 		DOCA_LOG_WARN("RDMA-CM REQ sender QPN 0x%06x receiver IP=0x%08x is not configured",
 		              initiator_qpn, receiver_ip);
@@ -2461,11 +2432,13 @@ static void complete_cm_mapping(uint32_t remote_comm_id, uint32_t responder_qpn)
 		              initiator_qpn, responder_qpn, path);
 	if (initiator_qpn != 0 && path_known)
 		install_sender_cnp_entry(initiator_qpn, responder_qpn, path);
+#if DOCA_USES_LEGACY_FLOW_BACKEND
 	if (initiator_qpn != 0 && path_known)
 		retire_legacy_qp1_mirror_entry(g_steer.legacy_qp1_wire_entry, path, "wire-ingress");
+#endif
 }
 
-#if DOCA_VERSION_MAJOR < 3
+#if DOCA_USES_LEGACY_FLOW_BACKEND
 static void learn_ingress_feedback_qpn(uint32_t sender_qpn, uint32_t source_ip)
 {
 	uint8_t path = 0;
@@ -2564,7 +2537,7 @@ static void parse_qp1_clone(struct rte_mbuf *mbuf)
 	const uint8_t *bth = udp + sizeof(struct rte_udp_hdr);
 	uint32_t destination_qpn = ((uint32_t)bth[5] << 16) | ((uint32_t)bth[6] << 8) | bth[7];
 	if (destination_qpn != QP1_QPN) {
-#if DOCA_VERSION_MAJOR < 3
+#if DOCA_USES_LEGACY_FLOW_BACKEND
 		g_steer.dpdk_feedback_pkts++;
 		learn_ingress_feedback_qpn(destination_qpn, read_be32(ip + 12));
 #endif
@@ -2572,7 +2545,7 @@ static void parse_qp1_clone(struct rte_mbuf *mbuf)
 	}
 	g_steer.dpdk_qp1_pkts++;
 
-#if DOCA_VERSION_MAJOR < 3
+#if DOCA_USES_LEGACY_FLOW_BACKEND
 	/* QP1 is unnecessary on 2.x: wait for an ACK/CNP carrying the sender QPN. */
 	return;
 #endif
@@ -2638,7 +2611,7 @@ void steer_poll(void)
 		return;
 	steer_poll_rx();
 
-#if DOCA_VERSION_MAJOR < 3
+#if DOCA_USES_LEGACY_FLOW_BACKEND
 	if (g_steer.dpdk_rx_pkts != 0) {
 		DOCA_LOG_INFO("DPDK ingress clones: rx=%lu freed=%lu outstanding=%lu bursts=%lu full=%lu "
 		              "roce=%lu feedback=%lu path0=%lu path1=%lu qp1=%lu unknown-path=%lu learned-qpn=%lu",
@@ -2703,7 +2676,7 @@ void steer_poll(void)
 		}
 		atomic_flag_clear_explicit(&g_steer.rate_lock, memory_order_release);
 
-#if DOCA_VERSION_MAJOR < 3
+#if DOCA_USES_LEGACY_FLOW_BACKEND
 		for (uint8_t path = 0; path < NB_PATHS; path++)
 			if (reduced[path] > 0)
 				retire_legacy_qp1_mirror_entry(

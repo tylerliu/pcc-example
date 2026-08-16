@@ -81,7 +81,7 @@ static doca_error_t start_embedded_steering(char *prog_name, const struct pcc_co
 	doca_error_t result;
 
 	(void)prog_name; /* used only on the DOCA 2.x EAL-init path below */
-#if DOCA_VERSION_MAJOR >= 3
+#if DOCA_HAS_DEVICE_REPRESENTORS
 	(void)pcc_dev;
 #endif
 	steer_default_opts(&sopts);
@@ -92,7 +92,7 @@ static doca_error_t start_embedded_steering(char *prog_name, const struct pcc_co
 		sopts.path_ip[path] = cfg->steer_path_ip[path];
 		sopts.path_ip_set[path] = cfg->steer_path_ip_set[path];
 	}
-#if DOCA_VERSION_MAJOR >= 3
+#if DOCA_HAS_DEVICE_REPRESENTORS
 	sopts.dev = cfg->steer_dev;
 	sopts.dev_rep = cfg->steer_dev_rep;
 	sopts.devargs = cfg->steer_devargs;
@@ -134,7 +134,7 @@ int main(int argc, char **argv)
 	int exit_status = EXIT_FAILURE;
 	bool pcc_started = false;
 	bool steering_started = false;
-#if DOCA_VERSION_MAJOR > 2 || (DOCA_VERSION_MAJOR == 2 && DOCA_VERSION_MINOR >= 8)
+#if DOCA_HAS_PCC_DEBUG_API
 	bool enable_debug = false;
 #endif
 	struct doca_log_backend *sdk_log;
@@ -179,7 +179,7 @@ int main(int argc, char **argv)
 	 * Probe again" error. Pre-scan argv and init EAL here; start_embedded_steering()
 	 * then only builds the pipeline. (Embedded steering is always the egress role.)
 	 */
-#if DOCA_VERSION_MAJOR >= 3
+#if DOCA_HAS_DEVICE_REPRESENTORS
 	for (int i = 1; i < argc; i++) {
 		if (strcmp(argv[i], "-r") != 0 && strcmp(argv[i], "--steer-rep") != 0)
 			continue;
@@ -251,7 +251,7 @@ int main(int argc, char **argv)
 	host_stop = false;
 	PRINT_INFO("Info: Press ctrl + C to exit\n");
 	while (!host_stop) {
-#if DOCA_VERSION_MAJOR > 2 || (DOCA_VERSION_MAJOR == 2 && DOCA_VERSION_MINOR >= 8)
+#if DOCA_HAS_PCC_DEBUG_API
 		if (got_debug_sig) {
 			if (enable_debug == false) {
 				enable_debug = true;

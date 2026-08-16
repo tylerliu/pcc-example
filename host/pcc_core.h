@@ -27,6 +27,7 @@
 #define PCC_CORE_H_
 
 #include <doca_pcc.h>
+#include "pcc_doca_compat.h"
 #include <doca_dev.h>
 #include <doca_error.h>
 #include <stdbool.h>
