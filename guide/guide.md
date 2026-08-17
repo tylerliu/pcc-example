@@ -302,12 +302,13 @@ The HASH entries never need to change after they are installed.
 This is important because the random assignment mechanism and the path policy have different lifetimes.
 The HASH pipe supplies a persistent set of buckets, while the following dispatch pipe decides which path currently owns each bucket.
 
-Application metadata word `u32[4]` is used intentionally.
+The per-packet application metadata word `meta.u32[4]` is used intentionally to carry the selected bucket index to the dispatch pipe.
 DOCA Flow HASH pipes use part of `u32[3]` internally, so the application stores its bucket number outside that region.
 
 ## C.2 DOCA 3.x implementation
 
-On DOCA 3.x, `create_classify_pipe()` creates a native HASH pipe and selects `DOCA_FLOW_PIPE_HASH_MAP_ALGORITHM_RANDOM`.
+DOCA 3.x provides a native HASH-pipe RANDOM map algorithm.
+`create_classify_pipe()` selects it with `DOCA_FLOW_PIPE_HASH_MAP_ALGORITHM_RANDOM`, so the pipe assigns each packet to one of its HASH entries without requiring a packet field as the hash key.
 The action template allows each HASH entry to write a value to `meta.u32[4]`.
 The pipe's fixed forward sends every selected entry to the dispatch pipe.
 
@@ -325,8 +326,10 @@ The first 63 entries use `STEER_WAIT_FOR_BATCH`, and the final entry submits the
 
 ## C.3 DOCA 2.9 implementation
 
-DOCA 2.x uses `create_legacy_small_random_table()` because its public Flow API does not provide the DOCA 3.x native random-map configuration.
-The compatibility implementation still creates a 64-entry HASH pipe, writes the selected bucket to `meta.u32[4]`, and forwards to the same dispatch pipe.
+DOCA 2.x does not provide the native RANDOM map algorithm used on DOCA 3.x.
+Instead, the packet parser supplies a per-packet random value in `parser_meta.random`, and `create_legacy_small_random_table()` configures a HASH pipe to hash that value.
+The match mask sets all 16 bits of `parser_meta.random`, allowing the HASH pipe to distribute packets across its 64 entries.
+Each entry writes its bucket index to `meta.u32[4]` and forwards to the same dispatch pipe used by the DOCA 3.x implementation.
 The rest of the steering pipeline therefore sees the same metadata contract on every supported DOCA version.
 
 The compatibility choice is selected at compile time through `STEER_USE_RANDOM_HASH_CLASSIFIER` and `DOCA_USES_LEGACY_FLOW_BACKEND` in [`steering/doca_flow_compat.h`](../steering/doca_flow_compat.h).
